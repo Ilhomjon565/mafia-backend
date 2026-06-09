@@ -889,6 +889,11 @@ io.on('connection', (socket) => {
           socket.emit('game_state', { ...g, players: publicPlayers(g.players) });
           socket.emit('your_role', { role: existing.role });
           socket.emit('your_items', { items: existing.items || { shield: 0, lupa: 0, life: 0 } });
+          // reconnectda ham mafiyaga sheriklarini qayta yuboramiz (socketId yangilangan bo'lishi mumkin)
+          if (existing.role === 'mafia') {
+            const mafiaList = g.players.filter(p => p.role === 'mafia').map(p => ({ socketId: p.socketId, username: p.username }));
+            socket.emit('mafia_team', { mates: mafiaList });
+          }
           if (g.phaseEndsAt && g.status === 'playing') {
             socket.emit('phase_change', {
               phase: g.phase, endsAt: g.phaseEndsAt,
@@ -961,9 +966,12 @@ io.on('connection', (socket) => {
       logEvent(g, '🎭', 'O\'yin boshlandi — rollar tarqatildi');
       await saveG(gameId, g);
       prisma.game.update({ where: { id: gameId }, data: { status: 'playing', startedAt: new Date() } }).catch(() => {});
+      const mafiaList = g.players.filter(p => p.role === 'mafia').map(p => ({ socketId: p.socketId, username: p.username }));
       g.players.forEach(p => {
         io.to(p.socketId).emit('your_role', { role: p.role });
         io.to(p.socketId).emit('your_items', { items: p.items });
+        // mafiyalar bir-birini ko'rsin
+        if (p.role === 'mafia') io.to(p.socketId).emit('mafia_team', { mates: mafiaList });
       });
       io.to(`game:${gameId}`).emit('game_starting', {});
       setTimeout(() => startPhase(gameId, 'day_discussion'), 5000);

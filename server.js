@@ -664,12 +664,29 @@ async function adjustUserItems(userId, deltas) {
 }
 
 function assignRoles(players, mafiaCount, sheriffCount, doctorCount) {
+  // MUHIM: rollar HAQIQIY o'yinchilar soniga qarab hisoblanadi (xona konfiguratsiyasiga emas).
+  // Aks holda kam odam qo'shilsa hammasi mafiya bo'lib qolardi.
+  const n = players.length;
+  const ratio = 0.3; // mafiya taxminan 30%
+  // mafiya har doim ozchilik: konfiguratsiyadan oshmaydi, ~30% dan oshmaydi, va qat'iy ozchilik
+  let mafia = Math.max(1, Math.min(
+    parseInt(mafiaCount) || Math.ceil(n * ratio),
+    Math.ceil(n * ratio),
+    Math.floor((n - 1) / 2)
+  ));
+  // qolgan slotlarni maxsus rollar va fuqarolarga taqsimlaymiz
+  let remaining = n - mafia;
+  const sheriff = Math.min(Math.max(0, parseInt(sheriffCount) || 0), remaining);
+  remaining -= sheriff;
+  const doctor = Math.min(Math.max(0, parseInt(doctorCount) || 0), remaining);
+  // qolgani — fuqarolar (kamida n - mafia - sheriff - doctor)
+
   const s = [...players].sort(() => Math.random() - 0.5);
   return s.map((p, i) => {
     let role = 'civil';
-    if (i < mafiaCount) role = 'mafia';
-    else if (i < mafiaCount + sheriffCount) role = 'sheriff';
-    else if (i < mafiaCount + sheriffCount + doctorCount) role = 'doctor';
+    if (i < mafia) role = 'mafia';
+    else if (i < mafia + sheriff) role = 'sheriff';
+    else if (i < mafia + sheriff + doctor) role = 'doctor';
     return { ...p, role };
   });
 }

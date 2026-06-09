@@ -37,6 +37,7 @@ const DEFAULT_SETTINGS = {
   durations: {
     day_discussion: 120,
     day_results:    8,
+    night:          35,
     night_mafia:    20,
     night_doctor:   20,
     night_sheriff:  20,
@@ -627,17 +628,35 @@ function publicPlayers(players) {
   }));
 }
 
+// ==================== ROLLAR (performance_arts) ====================
+// taraf: town | mafia | killer | wolf
+const ROLE_SIDE = {
+  civil: 'town', escort: 'town', sergeant: 'town', komissar: 'town', doctor: 'town', daydi: 'town', afsungar: 'town',
+  don: 'mafia', mafia: 'mafia', advokat: 'mafia',
+  qotil: 'killer', bori: 'wolf',
+  sheriff: 'town', // eski o'yinlar uchun
+};
+const ROLE_NAMES = {
+  civil: '👨🏼 Tinch aholi', escort: '💃 Kezuvchi', sergeant: '👮🏻‍♂️ Serjant',
+  komissar: '🕵🏻‍♂️ Komissar', doctor: '👨🏻‍⚕️ Doktor', daydi: '🧙‍♂️ Daydi', afsungar: '🧞‍♂️ Afsungar',
+  don: '🤵🏻 Don', mafia: '🤵🏼 Mafiya', advokat: '👨‍💼 Advokat',
+  qotil: '🔪 Qotil', bori: '🐺 Bo\'ri', sheriff: '🕵🏻‍♂️ Komissar',
+};
+function roleName(r) { return ROLE_NAMES[r] || r; }
+function sideOf(r) { return ROLE_SIDE[r] || 'town'; }
+
 function checkWin(g) {
   const alive = g.players.filter(p => p.isAlive);
-  const mafia = alive.filter(p => p.role === 'mafia').length;
-  const civil = alive.filter(p => p.role !== 'mafia').length;
-  if (mafia === 0) return 'civil';
-  if (mafia >= civil) return 'mafia';
+  const town = alive.filter(p => sideOf(p.role) === 'town').length;
+  const mafia = alive.filter(p => sideOf(p.role) === 'mafia').length;
+  const killer = alive.filter(p => sideOf(p.role) === 'killer').length;
+  const wolf = alive.filter(p => sideOf(p.role) === 'wolf').length;
+  // 🔪 Qotil faqat yakka qolsa g'olib
+  if (killer > 0 && alive.length === killer) return 'killer';
+  // betaraflar (qotil/bo'ri) tirik ekan town/mafiya g'alaba qila olmaydi
+  if (mafia === 0 && killer === 0 && wolf === 0) return 'town';
+  if (killer === 0 && mafia > 0 && mafia >= town + wolf) return 'mafia';
   return null;
-}
-
-function roleName(r) {
-  return { mafia: 'Mafiya', sheriff: 'Komissar', doctor: 'Doktor', civil: 'Fuqaro' }[r] || r;
 }
 
 // ochiq voqealar jurnali — hamma tungi/kunduzgi harakatlarni ko'radi
@@ -671,48 +690,66 @@ async function adjustUserItems(userId, deltas) {
   return items;
 }
 
-function assignRoles(players, mafiaCount, sheriffCount, doctorCount) {
-  // MUHIM: rollar HAQIQIY o'yinchilar soniga qarab hisoblanadi (xona konfiguratsiyasiga emas).
-  // Aks holda kam odam qo'shilsa hammasi mafiya bo'lib qolardi.
-  const n = players.length;
-  const ratio = 0.3; // mafiya taxminan 30%
-  // mafiya har doim ozchilik: konfiguratsiyadan oshmaydi, ~30% dan oshmaydi, va qat'iy ozchilik
-  let mafia = Math.max(1, Math.min(
-    parseInt(mafiaCount) || Math.ceil(n * ratio),
-    Math.ceil(n * ratio),
-    Math.floor((n - 1) / 2)
-  ));
-  // qolgan slotlarni maxsus rollar va fuqarolarga taqsimlaymiz
-  let remaining = n - mafia;
-  const sheriff = Math.min(Math.max(0, parseInt(sheriffCount) || 0), remaining);
-  remaining -= sheriff;
-  const doctor = Math.min(Math.max(0, parseInt(doctorCount) || 0), remaining);
-  // qolgani — fuqarolar (kamida n - mafia - sheriff - doctor)
+// O'yinchilar soniga qarab rollar to'plamini tuzadi (avto, balanslangan).
+// Mafiya har doim ozchilik; maxsus rollar va betaraflar o'yin kattalashgani sayin qo'shiladi.
+function buildRoleList(n) {
+  const roles = [];
+  roles.push('komissar');                 // shahar himoyachisi
+  roles.push('don');                      // mafiya boshlig'i
+  if (n >= 4) roles.push('doctor');
+  // qo'shimcha mafiya (don bilan birga ~28%)
+  const mafiaSide = Math.max(1, Math.round(n * 0.28));
+  for (let i = 1; i < mafiaSide; i++) {
+    if (i === mafiaSide - 1 && n >= 8) roles.push('advokat');
+    else roles.push('mafia');
+  }
+  // shahar maxsus rollari (kattalik bo'yicha)
+  if (n >= 6) roles.push('sergeant');
+  if (n >= 7) roles.push('escort');
+  if (n >= 9) roles.push('daydi');
+  if (n >= 12) roles.push('afsungar');
+  // betaraflar
+  if (n >= 8) roles.push('qotil');
+  if (n >= 11) roles.push('bori');
+  // qolgan joylar — tinch aholi
+  while (roles.length < n) roles.push('civil');
+  // ortib ketsa kesib tashlaymiz (yuqoridagi tartib muhimroq rollarni saqlaydi)
+  roles.length = n;
+  return roles;
+}
 
-  const s = [...players].sort(() => Math.random() - 0.5);
-  return s.map((p, i) => {
-    let role = 'civil';
-    if (i < mafia) role = 'mafia';
-    else if (i < mafia + sheriff) role = 'sheriff';
-    else if (i < mafia + sheriff + doctor) role = 'doctor';
-    return { ...p, role };
-  });
+function assignRoles(players, _mafiaCount, _sheriffCount, _doctorCount) {
+  // rollar HAQIQIY o'yinchilar soniga qarab tuziladi
+  const roleList = buildRoleList(players.length);
+  // aralashtirish
+  for (let i = roleList.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [roleList[i], roleList[j]] = [roleList[j], roleList[i]];
+  }
+  return players.map((p, i) => ({ ...p, role: roleList[i] || 'civil', roleData: {} }));
 }
 
 function dur(g, phase) {
   return (g.durations && g.durations[phase]) || DEFAULT_SETTINGS.durations[phase];
 }
 
+// barcha tirik "tungi harakat" rollari o'z amalini bajardimi?
+function allNightActionsDone(g) {
+  const na = g.nightActions || {};
+  const alive = g.players.filter(p => p.isAlive);
+  const votes = na.mafiaVotes || {};
+  const killers = alive.filter(p => p.role === 'don' || p.role === 'mafia');
+  if (killers.length && killers.some(p => !votes[p.socketId])) return false;
+  const single = [['komissar', na.komissar], ['doctor', na.doctor], ['escort', na.escort], ['advokat', na.lawyer], ['qotil', na.killer], ['daydi', na.daydi]];
+  for (const [role, act] of single) {
+    if (alive.some(p => p.role === role) && !act) return false;
+  }
+  return true;
+}
+
 async function startPhase(gameId, phase) {
   const g = await getG(gameId);
   if (!g || g.status === 'finished') return;
-
-  if (phase === 'night_doctor' && !g.players.some(p => p.isAlive && p.role === 'doctor')) {
-    return startPhase(gameId, 'night_sheriff');
-  }
-  if (phase === 'night_sheriff' && !g.players.some(p => p.isAlive && p.role === 'sheriff')) {
-    return processNight(gameId);
-  }
 
   const d = dur(g, phase);
   const endsAt = Date.now() + d * 1000;
@@ -723,7 +760,7 @@ async function startPhase(gameId, phase) {
     g.dayVotes = {};
     g.round = (g.round || 0) + 1;
     g.status = 'playing';
-  } else if (phase === 'night_mafia') {
+  } else if (phase === 'night') {
     g.nightActions = {};
   }
 
@@ -767,6 +804,16 @@ async function onPhaseEnd(gameId, phase) {
           msg = `☀️ ${p.username} ovoz bilan o'ldirildi — ${roleName(p.role)}`;
           result = { eliminated: p.username, role: p.role };
           logEvent(g, '⚖️', `${p.username} ovoz bilan chiqarildi — u ${roleName(p.role)} edi`);
+          // 🧞‍♂️ Afsungar ovozда o'ldirilsa — o'zi bilan birovni olib ketadi
+          if (p.role === 'afsungar') {
+            const victims = g.players.filter(x => x.isAlive && x.socketId !== p.socketId);
+            if (victims.length) {
+              const v = victims[Math.floor(Math.random() * victims.length)];
+              v.isAlive = false;
+              msg += ` · 🧞‍♂️ Afsungar ${v.username}ni o'zi bilan olib ketdi!`;
+              logEvent(g, '🧞‍♂️', `Afsungar qasos oldi — ${v.username} ham o'ldi (${roleName(v.role)})`);
+            }
+          }
         }
       }
     } else {
@@ -786,34 +833,9 @@ async function onPhaseEnd(gameId, phase) {
       players: publicPlayers(g.players), message: msg, result, log: g.log
     });
     if (timers.has(gameId)) clearTimeout(timers.get(gameId));
-    timers.set(gameId, setTimeout(() => startPhase(gameId, 'night_mafia'), dur(g, 'day_results') * 1000));
+    timers.set(gameId, setTimeout(() => startPhase(gameId, 'night'), dur(g, 'day_results') * 1000));
 
-  } else if (phase === 'night_mafia') {
-    // mafiya ovozlarini sanaymiz: eng ko'p (yagona) ovoz olgan o'ladi; teng/durang bo'lsa hech kim
-    const votes = g.nightActions.mafiaVotes || {};
-    const tally = {};
-    for (const sid of Object.keys(votes)) {
-      const tgt = votes[sid];
-      const target = g.players.find(p => p.socketId === tgt);
-      if (target && target.isAlive && target.role !== 'mafia') {
-        tally[tgt] = (tally[tgt] || 0) + 1;
-      }
-    }
-    let best = null, max = 0, tie = false;
-    for (const tgt of Object.keys(tally)) {
-      if (tally[tgt] > max) { max = tally[tgt]; best = tgt; tie = false; }
-      else if (tally[tgt] === max) { tie = true; }
-    }
-    g.nightActions.mafiaTarget = (best && !tie) ? best : null;
-    await saveG(gameId, g);
-    await startPhase(gameId, 'night_doctor');
-
-  } else if (phase === 'night_doctor') {
-    await saveG(gameId, g);
-    await startPhase(gameId, 'night_sheriff');
-
-  } else if (phase === 'night_sheriff') {
-    await saveG(gameId, g);
+  } else if (phase === 'night') {
     await processNight(gameId);
   }
 }
@@ -821,58 +843,123 @@ async function onPhaseEnd(gameId, phase) {
 async function processNight(gameId) {
   const g = await getG(gameId);
   if (!g) return;
-  const { mafiaTarget, doctorTarget, sheriffTarget } = g.nightActions || {};
-  let msg, result = { killed: null, saved: false };
-  const nameOf = (sid) => g.players.find(p => p.socketId === sid)?.username || '—';
+  const na = g.nightActions || {};
+  const find = (sid) => g.players.find(p => p.socketId === sid);
+  const nameOf = (sid) => find(sid)?.username || '—';
+  const aliveT = (sid) => { const p = find(sid); return p && p.isAlive ? p : null; };
 
   logEvent(g, '🌙', `${g.round}-kecha tushdi`);
+  const deaths = []; // {sid, cause}
 
-  // 🔵 Komissar tekshiruvi (natija ochiq ko'rsatiladi)
-  if (sheriffTarget) {
-    const checked = g.players.find(p => p.socketId === sheriffTarget);
-    if (checked) logEvent(g, '🔵', `Komissar ${checked.username}ni tekshirdi → ${checked.role === 'mafia' ? '🔴 MAFIYA!' : '🟢 tinch'}`);
-  } else if (g.players.some(p => p.isAlive && p.role === 'sheriff')) {
-    logEvent(g, '🔵', 'Komissar bu kecha hech kimni tekshirmadi');
+  // 1) 💃 Kezuvchi bloki (Komissarni bloklay olmaydi)
+  const blocked = new Set();
+  if (na.escort?.target) {
+    const t = find(na.escort.target);
+    if (t && t.role !== 'komissar') { blocked.add(t.socketId); logEvent(g, '💃', `Kezuvchi ${t.username}ni band qildi`); }
+  }
+  const notBlocked = (by) => by && !blocked.has(by);
+
+  // 2) 👨‍💼 Advokat himoyasi (mafiyani Komissardan yashiradi)
+  const lawyerProtect = (na.lawyer && notBlocked(na.lawyer.by)) ? na.lawyer.target : null;
+
+  // 3) 🤵 Mafiya o'ldirish nishoni (ovozlar; durangда Don hal qiladi)
+  let mafiaKill = null;
+  {
+    const votes = na.mafiaVotes || {};
+    const tally = {}; let donPick = null;
+    for (const voterSid of Object.keys(votes)) {
+      const voter = find(voterSid);
+      if (!voter || !voter.isAlive || blocked.has(voterSid)) continue;
+      const tgt = votes[voterSid]; const target = aliveT(tgt);
+      if (!target || sideOf(target.role) === 'mafia') continue;
+      tally[tgt] = (tally[tgt] || 0) + 1;
+      if (voter.role === 'don') donPick = tgt;
+    }
+    let best = null, max = 0, tie = false;
+    for (const tgt of Object.keys(tally)) {
+      if (tally[tgt] > max) { max = tally[tgt]; best = tgt; tie = false; }
+      else if (tally[tgt] === max) tie = true;
+    }
+    mafiaKill = tie ? (donPick || null) : best;
+  }
+  if (mafiaKill) deaths.push({ sid: mafiaKill, cause: 'mafia' });
+
+  // 4) 🔪 Qotil o'ldirish
+  if (na.killer && notBlocked(na.killer.by)) {
+    const t = aliveT(na.killer.target);
+    if (t && sideOf(t.role) !== 'killer') deaths.push({ sid: t.socketId, cause: 'killer' });
   }
 
-  // 💚 Doktor harakati
-  if (doctorTarget) {
-    logEvent(g, '💚', `Doktor ${nameOf(doctorTarget)}nikiga bordi`);
-  } else if (g.players.some(p => p.isAlive && p.role === 'doctor')) {
-    logEvent(g, '💚', 'Doktor bu kecha hech kimnikiga bormadi');
-  }
-
-  // 🔫 Mafiya hujumi natijasi (qalqon → doktor → qo'shimcha jon ketma-ketligida himoya)
-  if (mafiaTarget) {
-    const t = g.players.find(p => p.socketId === mafiaTarget);
-    if (t && t.isAlive) {
-      logEvent(g, '🔫', `Mafiya ${t.username}ga hujum qildi`);
-      if (t.shieldActive) {
-        msg = `🌙 Mafiya hujum qildi, lekin ${t.username} qalqon bilan himoyalandi!`;
-        result.saved = true;
-        logEvent(g, '🛡️', `${t.username} qalqon bilan o'limdan qutuldi!`);
-      } else if (doctorTarget === mafiaTarget) {
-        msg = `🌙 Mafiya hujum qildi, lekin doktor ${t.username}ni qutqardi!`;
-        result.saved = true;
-        logEvent(g, '✅', `${t.username} doktor tomonidan qutqarildi!`);
-      } else if ((t.items?.life || 0) > 0) {
-        t.items.life--;
-        await adjustUserItems(t.userId, { life: -1 });
-        io.to(t.socketId).emit('your_items', { items: t.items });
-        msg = `🌙 Mafiya hujum qildi, lekin ${t.username} qo'shimcha joni bilan omon qoldi!`;
-        result.saved = true;
-        logEvent(g, '❤️', `${t.username} qo'shimcha jon bilan tirik qoldi!`);
+  // 5) 🕵️ Komissar — tekshirish yoki otish
+  if (na.komissar && notBlocked(na.komissar.by)) {
+    const kom = find(na.komissar.by);
+    const t = find(na.komissar.target);
+    if (t) {
+      if (na.komissar.type === 'shoot') {
+        deaths.push({ sid: t.socketId, cause: 'komissar' });
+        logEvent(g, '🔫', `Komissar ${t.username}ga o'q uzdi`);
       } else {
-        t.isAlive = false;
-        msg = `🌙 Kechasi ${t.username} o'ldirildi`;
-        result.killed = t.username;
-        logEvent(g, '💀', `${t.username} o'ldirildi — u ${roleName(t.role)} edi`);
+        const seenMafia = sideOf(t.role) === 'mafia' && lawyerProtect !== t.socketId;
+        if (kom) { kom.roleData = kom.roleData || {}; kom.roleData.checked = true; io.to(kom.socketId).emit('sheriff_result', { username: t.username, isMafia: seenMafia }); }
+        const sgt = g.players.find(p => p.isAlive && p.role === 'sergeant');
+        if (sgt) io.to(sgt.socketId).emit('sheriff_result', { username: t.username, isMafia: seenMafia });
+        logEvent(g, '🔵', `Komissar ${t.username}ni tekshirdi`);
       }
-    } else { msg = '🌙 Kecha tinch o\'tdi'; logEvent(g, '🕊️', 'Kecha tinch o\'tdi'); }
-  } else { msg = '🌙 Kecha tinch o\'tdi'; logEvent(g, '🕊️', 'Mafiya hech kimga tegmadi'); }
+    }
+  }
 
-  // qalqonlar bir kecha amal qiladi — tozalaymiz
+  // 6) 👨🏻‍⚕️ Doktor davolash nishoni
+  const healTarget = (na.doctor && notBlocked(na.doctor.by)) ? na.doctor.target : null;
+  if (healTarget) logEvent(g, '💚', `Doktor ${nameOf(healTarget)}nikiga bordi`);
+
+  // 7) 🧙 Daydi guvohligi
+  if (na.daydi && notBlocked(na.daydi.by)) logEvent(g, '🧙‍♂️', `Daydi ${nameOf(na.daydi.target)} oldiga bordi`);
+
+  // ===== O'limlarni hal qilamiz =====
+  const killedNames = [], savedNames = [], processed = new Set();
+  for (const d of deaths) {
+    const t = aliveT(d.sid);
+    if (!t || processed.has(t.socketId)) continue;
+    if (t.shieldActive) { savedNames.push(t.username); logEvent(g, '🛡️', `${t.username} qalqon bilan omon qoldi`); continue; }
+    if (healTarget === t.socketId) { savedNames.push(t.username); logEvent(g, '✅', `Doktor ${t.username}ni qutqardi`); continue; }
+    if ((t.items?.life || 0) > 0) {
+      t.items.life--; await adjustUserItems(t.userId, { life: -1 });
+      io.to(t.socketId).emit('your_items', { items: t.items });
+      savedNames.push(t.username); logEvent(g, '❤️', `${t.username} qo'shimcha jon bilan tirik qoldi`); continue;
+    }
+    // 🐺 Bo'ri reenkarnatsiyasi
+    if (t.role === 'bori') {
+      if (d.cause === 'mafia') { t.role = 'mafia'; processed.add(t.socketId); logEvent(g, '🐺', `Bo'ri mafiya o'qidan Mafiyaga aylandi`); io.to(t.socketId).emit('your_role', { role: 'mafia' }); continue; }
+      if (d.cause === 'komissar') { t.role = 'sergeant'; processed.add(t.socketId); logEvent(g, '🐺', `Bo'ri Komissar o'qidan Serjantga aylandi`); io.to(t.socketId).emit('your_role', { role: 'sergeant' }); continue; }
+      // qotil → o'ladi (pastda)
+    }
+    // o'ldi
+    t.isAlive = false; processed.add(t.socketId); killedNames.push(t.username);
+    logEvent(g, '💀', `${t.username} o'ldirildi — u ${roleName(t.role)} edi`);
+    // 🧞‍♂️ Afsungar — o'ldirgan o'yinchini o'zi bilan olib ketadi
+    if (t.role === 'afsungar') {
+      let revengeSid = null;
+      if (d.cause === 'killer') revengeSid = na.killer?.by;
+      else if (d.cause === 'komissar') revengeSid = na.komissar?.by;
+      else if (d.cause === 'mafia') { const don = g.players.find(p => p.isAlive && p.role === 'don') || g.players.find(p => p.isAlive && sideOf(p.role) === 'mafia'); revengeSid = don?.socketId; }
+      const rv = aliveT(revengeSid);
+      if (rv) { rv.isAlive = false; processed.add(rv.socketId); killedNames.push(rv.username); logEvent(g, '🧞‍♂️', `Afsungar ${rv.username}ni o'zi bilan olib ketdi (${roleName(rv.role)})`); }
+    }
+  }
+
+  // 👮 Serjant — Komissar o'lgan bo'lsa uning o'rnini egallaydi
+  if (!g.players.some(p => p.isAlive && p.role === 'komissar')) {
+    const sgt = g.players.find(p => p.isAlive && p.role === 'sergeant');
+    if (sgt) { sgt.role = 'komissar'; logEvent(g, '👮🏻‍♂️', `Serjant ${sgt.username} Komissar bo'ldi`); io.to(sgt.socketId).emit('your_role', { role: 'komissar' }); }
+  }
+
   g.players.forEach(p => { p.shieldActive = false; });
+
+  let msg;
+  if (killedNames.length) msg = `🌅 Kechasi ${killedNames.join(', ')} halok bo'ldi`;
+  else if (savedNames.length) msg = '🌅 Hujum bo\'ldi, lekin qutqarildi';
+  else { msg = '🌅 Kecha tinch o\'tdi'; logEvent(g, '🕊️', 'Kecha tinch o\'tdi'); }
+  const result = { killed: killedNames[0] || null, killedAll: killedNames, saved: savedNames.length > 0 };
 
   await saveG(gameId, g);
   const winner = checkWin(g);
@@ -890,7 +977,7 @@ async function processNight(gameId) {
 async function recordStats(g, winner) {
   for (const p of g.players) {
     if (!p.userId || String(p.userId).startsWith('guest-')) continue;
-    const won = (winner === 'mafia' && p.role === 'mafia') || (winner === 'civil' && p.role !== 'mafia');
+    const won = winner === sideOf(p.role) || (winner === 'civil' && sideOf(p.role) === 'town');
     try {
       await prisma.userStats.upsert({
         where: { userId: p.userId },
@@ -908,6 +995,16 @@ async function recordStats(g, winner) {
   }
 }
 
+function winnerMessage(w) {
+  return {
+    mafia: '🔫 Mafiya g\'alaba qildi!',
+    town: '🎉 Tinch aholi g\'alaba qildi!',
+    civil: '🎉 Tinch aholi g\'alaba qildi!',
+    killer: '🔪 Qotil g\'alaba qildi!',
+    wolf: '🐺 Bo\'ri g\'alaba qildi!',
+  }[w] || 'O\'yin tugadi';
+}
+
 async function endGame(gameId, winner) {
   const g = await getG(gameId);
   if (!g) return;
@@ -919,7 +1016,7 @@ async function endGame(gameId, winner) {
   await recordStats(g, winner);
   io.to(`game:${gameId}`).emit('game_over', {
     winner, players: g.players, log: g.log,
-    message: winner === 'mafia' ? '🔫 Mafiya g\'alaba qildi!' : '🎉 Tinch aholi g\'alaba qildi!'
+    message: winnerMessage(winner)
   });
   if (timers.has(gameId)) { clearTimeout(timers.get(gameId)); timers.delete(gameId); }
   setTimeout(() => redis.del(`game:${gameId}`).catch(() => {}), 30000);
@@ -961,8 +1058,8 @@ io.on('connection', (socket) => {
           socket.emit('your_role', { role: existing.role });
           socket.emit('your_items', { items: existing.items || { shield: 0, lupa: 0, life: 0 } });
           // reconnectda ham mafiyaga sheriklarini qayta yuboramiz (socketId yangilangan bo'lishi mumkin)
-          if (existing.role === 'mafia') {
-            const mafiaList = g.players.filter(p => p.role === 'mafia').map(p => ({ socketId: p.socketId, username: p.username }));
+          if (sideOf(existing.role) === 'mafia') {
+            const mafiaList = g.players.filter(p => sideOf(p.role) === 'mafia').map(p => ({ socketId: p.socketId, username: p.username, role: p.role }));
             socket.emit('mafia_team', { mates: mafiaList });
           }
           if (g.phaseEndsAt && g.status === 'playing') {
@@ -975,7 +1072,7 @@ io.on('connection', (socket) => {
           if (g.status === 'finished') {
             socket.emit('game_over', {
               winner: g.winner, players: g.players,
-              message: g.winner === 'mafia' ? '🔫 Mafiya g\'alaba qildi!' : '🎉 Tinch aholi g\'alaba qildi!'
+              message: winnerMessage(g.winner)
             });
           }
           io.to(key).emit('game_state', { ...g, players: publicPlayers(g.players) });
@@ -1043,12 +1140,12 @@ io.on('connection', (socket) => {
       logEvent(g, '🎭', 'O\'yin boshlandi — rollar tarqatildi');
       await saveG(gameId, g);
       prisma.game.update({ where: { id: gameId }, data: { status: 'playing', startedAt: new Date() } }).catch(() => {});
-      const mafiaList = g.players.filter(p => p.role === 'mafia').map(p => ({ socketId: p.socketId, username: p.username }));
+      const mafiaList = g.players.filter(p => sideOf(p.role) === 'mafia').map(p => ({ socketId: p.socketId, username: p.username, role: p.role }));
       g.players.forEach(p => {
         io.to(p.socketId).emit('your_role', { role: p.role });
         io.to(p.socketId).emit('your_items', { items: p.items });
-        // mafiyalar bir-birini ko'rsin
-        if (p.role === 'mafia') io.to(p.socketId).emit('mafia_team', { mates: mafiaList });
+        // mafiya tomoni (Don, Mafiya, Advokat) bir-birini ko'rsin
+        if (sideOf(p.role) === 'mafia') io.to(p.socketId).emit('mafia_team', { mates: mafiaList });
       });
       io.to(`game:${gameId}`).emit('game_starting', {});
       setTimeout(() => startPhase(gameId, 'day_discussion'), 5000);
@@ -1077,49 +1174,80 @@ io.on('connection', (socket) => {
     } catch (e) { console.error('day_vote:', e); }
   }));
 
-  socket.on('night_action', ({ gameId, targetSocketId }) => withLock(gameId, async () => {
+  socket.on('night_action', ({ gameId, targetSocketId, actionType }) => withLock(gameId, async () => {
     try {
       const g = await getG(gameId);
-      if (!g) return;
+      if (!g || g.phase !== 'night') return;
       const player = g.players.find(p => p.socketId === socket.id);
       if (!player || !player.isAlive) return;
-      const phase = g.phase;
       if (!g.nightActions) g.nightActions = {};
+      const na = g.nightActions;
+      const target = g.players.find(p => p.socketId === targetSocketId);
+      const targetAlive = target && target.isAlive;
 
-      if (phase === 'night_mafia' && player.role === 'mafia') {
-        const target = g.players.find(p => p.socketId === targetSocketId);
-        // mafiya boshqa mafiyaga ovoz bera olmaydi
-        if (!target || !target.isAlive || target.role === 'mafia') {
-          socket.emit('game_error', { message: '❌ Mafiyaga ovoz berib bo\'lmaydi' });
+      switch (player.role) {
+        case 'don':
+        case 'mafia': {
+          if (!targetAlive || sideOf(target.role) === 'mafia') { socket.emit('game_error', { message: '❌ Mafiyaga ovoz berib bo\'lmaydi' }); return; }
+          if (!na.mafiaVotes) na.mafiaVotes = {};
+          na.mafiaVotes[socket.id] = targetSocketId;
+          socket.emit('action_confirmed', { message: `🔫 Ovozingiz: ${target.username}` });
+          break;
+        }
+        case 'komissar': {
+          if (!targetAlive) return;
+          const type = actionType === 'shoot' ? 'shoot' : 'check';
+          if (type === 'shoot' && !(player.roleData && player.roleData.checked) && (g.round || 1) <= 1) {
+            socket.emit('game_error', { message: '❌ Birinchi tun: avval tekshiring, otib bo\'lmaydi' }); return;
+          }
+          na.komissar = { by: socket.id, type, target: targetSocketId };
+          socket.emit('action_confirmed', { message: type === 'shoot' ? `🔫 ${target.username}ga otish` : `🔍 ${target.username}ni tekshirish` });
+          break;
+        }
+        case 'doctor': {
+          if (!targetAlive) return;
+          if (targetSocketId === socket.id) {
+            if (player.roleData?.selfHeal) { socket.emit('game_error', { message: '❌ O\'zingizni faqat bir marta davolaysiz' }); return; }
+            player.roleData = player.roleData || {}; player.roleData.selfHeal = true;
+          }
+          na.doctor = { by: socket.id, target: targetSocketId };
+          socket.emit('action_confirmed', { message: `💚 ${target.username} davolanadi` });
+          break;
+        }
+        case 'escort': {
+          if (!targetAlive || targetSocketId === socket.id) return;
+          if (target.role === 'komissar') { socket.emit('game_error', { message: '❌ Komissarni band qila olmaysiz' }); return; }
+          na.escort = { by: socket.id, target: targetSocketId };
+          socket.emit('action_confirmed', { message: `💃 ${target.username} band qilindi` });
+          break;
+        }
+        case 'advokat': {
+          if (!targetAlive) return;
+          na.lawyer = { by: socket.id, target: targetSocketId };
+          socket.emit('action_confirmed', { message: `👨‍💼 ${target.username} himoyalanadi` });
+          break;
+        }
+        case 'qotil': {
+          if (!targetAlive || targetSocketId === socket.id) return;
+          na.killer = { by: socket.id, target: targetSocketId };
+          socket.emit('action_confirmed', { message: `🔪 ${target.username} nishonda` });
+          break;
+        }
+        case 'daydi': {
+          if (!targetAlive || targetSocketId === socket.id) return;
+          na.daydi = { by: socket.id, target: targetSocketId };
+          socket.emit('action_confirmed', { message: `🧙‍♂️ ${target.username} oldiga bording` });
+          break;
+        }
+        default:
           return;
-        }
-        if (!g.nightActions.mafiaVotes) g.nightActions.mafiaVotes = {};
-        g.nightActions.mafiaVotes[socket.id] = targetSocketId;
-        socket.emit('action_confirmed', { message: `🔫 Ovozingiz: ${target.username}` });
-        await saveG(gameId, g);
-        // barcha tirik mafiya ovoz bergan bo'lsa fazani erta tugatamiz
-        const aliveMafia = g.players.filter(p => p.isAlive && p.role === 'mafia');
-        const voted = aliveMafia.filter(p => g.nightActions.mafiaVotes[p.socketId]);
-        if (voted.length >= aliveMafia.length) {
-          if (timers.has(gameId)) clearTimeout(timers.get(gameId));
-          onPhaseEnd(gameId, phase);
-        }
-        return;
       }
 
-      if (phase === 'night_doctor' && player.role === 'doctor') {
-        g.nightActions.doctorTarget = targetSocketId;
-        socket.emit('action_confirmed', { message: '💚 Davolash belgilandi' });
-      } else if (phase === 'night_sheriff' && player.role === 'sheriff') {
-        g.nightActions.sheriffTarget = targetSocketId;
-        const checked = g.players.find(p => p.socketId === targetSocketId);
-        if (checked) socket.emit('sheriff_result', { username: checked.username, isMafia: checked.role === 'mafia' });
-        socket.emit('action_confirmed', { message: '🔍 Tekshirildi' });
-      } else return;
-
       await saveG(gameId, g);
-      if (timers.has(gameId)) clearTimeout(timers.get(gameId));
-      onPhaseEnd(gameId, phase);
+      if (allNightActionsDone(g)) {
+        if (timers.has(gameId)) clearTimeout(timers.get(gameId));
+        onPhaseEnd(gameId, 'night');
+      }
     } catch (e) { console.error('night_action:', e); }
   }));
 

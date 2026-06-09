@@ -1,0 +1,97 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id        String    @id @default(cuid())
+  email     String    @unique
+  username  String    @unique
+  password  String
+  avatar    String?
+  isAdmin   Boolean   @default(false)
+  isBanned  Boolean   @default(false)
+  items     Json?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  lastSeen  DateTime?
+  games     GamePlayer[]
+  stats     UserStats?
+  @@index([email])
+}
+
+model UserStats {
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  gamesPlayed Int      @default(0)
+  gamesWon    Int      @default(0)
+  winRate     Float    @default(0)
+  rating      Int      @default(1000)
+}
+
+model Game {
+  id           String       @id @default(cuid())
+  name         String       @default("Mafia xonasi")
+  status       String       @default("waiting")
+  hostId       String?
+  isPrivate    Boolean      @default(false)
+  totalPlayers Int
+  maxPlayers   Int          @default(20)
+  minPlayers   Int          @default(5)
+  mafiaCount   Int
+  sheriffCount Int
+  doctorCount  Int
+  civilCount   Int
+  winner       String?
+  createdAt    DateTime     @default(now())
+  startedAt    DateTime?
+  endedAt      DateTime?
+  players      GamePlayer[]
+  votes        Vote[]
+  messages     Message[]
+  @@index([status])
+  @@index([createdAt])
+}
+
+model GamePlayer {
+  id       String    @id @default(cuid())
+  gameId   String
+  game     Game      @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  userId   String
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role     String
+  team     String
+  isAlive  Boolean   @default(true)
+  joinedAt DateTime  @default(now())
+  votes    Vote[]
+  messages Message[]
+  @@unique([gameId, userId])
+  @@index([gameId])
+}
+
+model Vote {
+  id         String     @id @default(cuid())
+  gameId     String
+  game       Game       @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  voterId    String
+  voter      GamePlayer @relation(fields: [voterId], references: [id], onDelete: Cascade)
+  votedForId String
+  createdAt  DateTime   @default(now())
+  @@index([gameId])
+}
+
+model Message {
+  id        String     @id @default(cuid())
+  gameId    String
+  game      Game       @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  playerId  String
+  player    GamePlayer @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  content   String
+  createdAt DateTime   @default(now())
+  @@index([gameId])
+}

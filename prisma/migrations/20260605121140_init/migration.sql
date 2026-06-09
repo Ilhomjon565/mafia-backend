@@ -5,8 +5,12 @@ CREATE TABLE "User" (
     "username" TEXT NOT NULL,
     "password" TEXT NOT NULL,
     "avatar" TEXT,
+    "isAdmin" BOOLEAN NOT NULL DEFAULT false,
+    "isBanned" BOOLEAN NOT NULL DEFAULT false,
+    "items" JSONB,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
+    "lastSeen" TIMESTAMP(3),
 
     CONSTRAINT "User_pkey" PRIMARY KEY ("id")
 );
@@ -26,7 +30,10 @@ CREATE TABLE "UserStats" (
 -- CreateTable
 CREATE TABLE "Game" (
     "id" TEXT NOT NULL,
+    "name" TEXT NOT NULL DEFAULT 'Mafia xonasi',
     "status" TEXT NOT NULL DEFAULT 'waiting',
+    "hostId" TEXT,
+    "isPrivate" BOOLEAN NOT NULL DEFAULT false,
     "totalPlayers" INTEGER NOT NULL,
     "maxPlayers" INTEGER NOT NULL DEFAULT 20,
     "minPlayers" INTEGER NOT NULL DEFAULT 5,
@@ -127,3 +134,4 @@ ALTER TABLE "Message" ADD CONSTRAINT "Message_gameId_fkey" FOREIGN KEY ("gameId"
 
 -- AddForeignKey
 ALTER TABLE "Message" ADD CONSTRAINT "Message_playerId_fkey" FOREIGN KEY ("playerId") REFERENCES "GamePlayer"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+

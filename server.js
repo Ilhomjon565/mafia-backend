@@ -7,10 +7,13 @@ import dotenv from 'dotenv';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { PrismaClient } from '@prisma/client';
+import { OAuth2Client } from 'google-auth-library';
 
 dotenv.config();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'mafia-dev-secret';
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '1012676002382-21keol37nklhi22reit714nkgjb58dgm.apps.googleusercontent.com';
+const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 const app = express();
 const httpServer = createServer(app);
@@ -132,6 +135,84 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
+// ==================== GOOGLE SIGN-IN ====================
+// "Sign in with Google" tugmasi yuborgan ID token (credential) ni tekshiradi,
+// gmail/ism/rasm oladi, foydalanuvchini yaratadi yoki topadi va token qaytaradi.
+
+async function uniqueUsername(base) {
+  let candidate = (base || 'player')
+    .normalize('NFKD').replace(/[^a-zA-Z0-9_]/g, '').slice(0, 20) || 'player';
+  let username = candidate;
+  // band bo'lsa raqam qo'shib ketamiz
+  for (let i = 0; i < 50; i++) {
+    const taken = await prisma.user.findUnique({ where: { username } });
+    if (!taken) return username;
+    username = `${candidate}${Math.floor(1000 + Math.random() * 9000)}`;
+  }
+  return `${candidate}${Date.now().toString().slice(-6)}`;
+}
+
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { credential } = req.body;
+    if (!credential) return res.status(400).json({ error: 'Google credential yo\'q' });
+
+    // ID tokenni Google bilan tekshirish
+    let payload;
+    try {
+      const ticket = await googleClient.verifyIdToken({ idToken: credential, audience: GOOGLE_CLIENT_ID });
+      payload = ticket.getPayload();
+    } catch {
+      return res.status(401).json({ error: 'Google token yaroqsiz' });
+    }
+
+    const email = (payload?.email || '').toLowerCase();
+    if (!email || payload.email_verified === false) {
+      return res.status(400).json({ error: 'Gmail tasdiqlanmagan' });
+    }
+    const fullName = payload.name || payload.given_name || email.split('@')[0];
+    const picture = payload.picture || null;
+
+    // email bo'yicha mavjud foydalanuvchini topamiz
+    let user = await prisma.user.findUnique({ where: { email } });
+
+    if (user) {
+      if (user.isBanned) return res.status(403).json({ error: 'Siz bloklangansiz' });
+      user = await prisma.user.update({
+        where: { id: user.id },
+        data: { avatar: picture, lastSeen: new Date() }
+      });
+    } else {
+      const userCount = await prisma.user.count();
+      const username = await uniqueUsername(fullName.replace(/\s+/g, '') || email.split('@')[0]);
+      const randomPass = await bcrypt.hash(Math.random().toString(36) + Date.now(), 8);
+      user = await prisma.user.create({
+        data: {
+          username,
+          email,
+          password: randomPass,
+          avatar: picture,
+          isAdmin: userCount === 0,
+          items: DEFAULT_ITEMS,
+          stats: { create: {} }
+        }
+      });
+    }
+
+    res.json({
+      userId: user.id,
+      username: user.username,
+      isAdmin: user.isAdmin,
+      avatar: user.avatar || null,
+      items: normItems(user.items),
+      token: signToken(user)
+    });
+  } catch (e) {
+    if (e.code === 'P2002') return res.status(409).json({ error: 'Bu hisob allaqachon mavjud' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ALOHIDA ADMIN PANEL LOGIN (faqat admin huquqiga ega foydalanuvchilar)
 app.post('/api/admin/login', async (req, res) => {
   try {
@@ -169,6 +250,7 @@ app.get('/api/me', authMiddleware, async (req, res) => {
     const roomsToday = await prisma.game.count({ where: { hostId: u.id, createdAt: { gte: startOfDay } } });
     res.json({
       userId: u.id, username: u.username, isAdmin: u.isAdmin, isBanned: u.isBanned,
+      avatar: u.avatar || null,
       items: normItems(items),
       dailyLimit, roomsToday, roomsLeft: Math.max(0, dailyLimit - roomsToday),
       stats: u.stats || { gamesPlayed: 0, gamesWon: 0, winRate: 0, rating: 1000 }

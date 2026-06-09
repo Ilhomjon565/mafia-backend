@@ -730,10 +730,22 @@ async function onPhaseEnd(gameId, phase) {
     timers.set(gameId, setTimeout(() => startPhase(gameId, 'night_mafia'), dur(g, 'day_results') * 1000));
 
   } else if (phase === 'night_mafia') {
-    if (!g.nightActions.mafiaTarget) {
-      const t = g.players.filter(p => p.isAlive && p.role !== 'mafia');
-      if (t.length) g.nightActions.mafiaTarget = t[Math.floor(Math.random() * t.length)].socketId;
+    // mafiya ovozlarini sanaymiz: eng ko'p (yagona) ovoz olgan o'ladi; teng/durang bo'lsa hech kim
+    const votes = g.nightActions.mafiaVotes || {};
+    const tally = {};
+    for (const sid of Object.keys(votes)) {
+      const tgt = votes[sid];
+      const target = g.players.find(p => p.socketId === tgt);
+      if (target && target.isAlive && target.role !== 'mafia') {
+        tally[tgt] = (tally[tgt] || 0) + 1;
+      }
     }
+    let best = null, max = 0, tie = false;
+    for (const tgt of Object.keys(tally)) {
+      if (tally[tgt] > max) { max = tally[tgt]; best = tgt; tie = false; }
+      else if (tally[tgt] === max) { tie = true; }
+    }
+    g.nightActions.mafiaTarget = (best && !tie) ? best : null;
     await saveG(gameId, g);
     await startPhase(gameId, 'night_doctor');
 
@@ -1010,9 +1022,27 @@ io.on('connection', (socket) => {
       if (!g.nightActions) g.nightActions = {};
 
       if (phase === 'night_mafia' && player.role === 'mafia') {
-        g.nightActions.mafiaTarget = targetSocketId;
-        socket.emit('action_confirmed', { message: '🔫 Nishon belgilandi' });
-      } else if (phase === 'night_doctor' && player.role === 'doctor') {
+        const target = g.players.find(p => p.socketId === targetSocketId);
+        // mafiya boshqa mafiyaga ovoz bera olmaydi
+        if (!target || !target.isAlive || target.role === 'mafia') {
+          socket.emit('game_error', { message: '❌ Mafiyaga ovoz berib bo\'lmaydi' });
+          return;
+        }
+        if (!g.nightActions.mafiaVotes) g.nightActions.mafiaVotes = {};
+        g.nightActions.mafiaVotes[socket.id] = targetSocketId;
+        socket.emit('action_confirmed', { message: `🔫 Ovozingiz: ${target.username}` });
+        await saveG(gameId, g);
+        // barcha tirik mafiya ovoz bergan bo'lsa fazani erta tugatamiz
+        const aliveMafia = g.players.filter(p => p.isAlive && p.role === 'mafia');
+        const voted = aliveMafia.filter(p => g.nightActions.mafiaVotes[p.socketId]);
+        if (voted.length >= aliveMafia.length) {
+          if (timers.has(gameId)) clearTimeout(timers.get(gameId));
+          onPhaseEnd(gameId, phase);
+        }
+        return;
+      }
+
+      if (phase === 'night_doctor' && player.role === 'doctor') {
         g.nightActions.doctorTarget = targetSocketId;
         socket.emit('action_confirmed', { message: '💚 Davolash belgilandi' });
       } else if (phase === 'night_sheriff' && player.role === 'sheriff') {

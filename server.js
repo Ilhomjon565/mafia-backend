@@ -58,6 +58,17 @@ async function saveSettings(s) {
   await redis.set('settings:global', JSON.stringify(s));
 }
 
+// foydalanuvchining kunlik xona limiti — admin tomonidan alohida belgilangan bo'lsa o'shani,
+// aks holda umumiy sozlamadagi qiymatni qaytaradi
+async function userDailyLimit(userId, settings) {
+  const def = (settings || await getSettings()).dailyRoomLimit || 2;
+  try {
+    const v = await redis.hget('roomlimits', String(userId));
+    if (v != null && v !== '') return Math.max(0, parseInt(v));
+  } catch {}
+  return def;
+}
+
 // ==================== AUTH HELPERS ====================
 
 function signToken(user) {
@@ -246,7 +257,7 @@ app.get('/api/me', authMiddleware, async (req, res) => {
     }
     const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
     const settings = await getSettings();
-    const dailyLimit = settings.dailyRoomLimit || 2;
+    const dailyLimit = await userDailyLimit(u.id, settings);
     const roomsToday = await prisma.game.count({ where: { hostId: u.id, createdAt: { gte: startOfDay } } });
     res.json({
       userId: u.id, username: u.username, isAdmin: u.isAdmin, isBanned: u.isBanned,
@@ -336,7 +347,7 @@ app.post('/api/games', authMiddleware, async (req, res) => {
     // KUNLIK LIMIT: har bir foydalanuvchi kuniga maksimum 2 ta xona yaratadi
     const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
     const todayCount = await prisma.game.count({ where: { hostId: req.user.userId, createdAt: { gte: startOfDay } } });
-    const DAILY_LIMIT = settings.dailyRoomLimit || 2;
+    const DAILY_LIMIT = await userDailyLimit(req.user.userId, settings);
     if (todayCount >= DAILY_LIMIT) {
       return res.status(429).json({ error: `Kuniga maksimum ${DAILY_LIMIT} ta xona yaratish mumkin. Mavjud xonaga qo'shiling.` });
     }
@@ -436,11 +447,16 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, async (_, res) => {
       orderBy: { createdAt: 'desc' },
       include: { stats: true }
     });
+    const settings = await getSettings();
+    const defaultRoomLimit = settings.dailyRoomLimit || 2;
+    const overrides = (await redis.hgetall('roomlimits').catch(() => ({}))) || {};
     res.json(users.map(u => ({
       id: u.id, username: u.username, email: u.email,
       isAdmin: u.isAdmin, isBanned: u.isBanned,
       createdAt: u.createdAt, lastSeen: u.lastSeen,
       items: normItems(u.items),
+      roomLimit: overrides[u.id] != null ? parseInt(overrides[u.id]) : null, // null = default ishlatiladi
+      defaultRoomLimit,
       stats: u.stats || { gamesPlayed: 0, gamesWon: 0, winRate: 0, rating: 1000 }
     })));
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -461,6 +477,24 @@ app.post('/api/admin/users/:id/admin', authMiddleware, adminMiddleware, async (r
     if (!u) return res.status(404).json({ error: 'Topilmadi' });
     const updated = await prisma.user.update({ where: { id: u.id }, data: { isAdmin: !u.isAdmin } });
     res.json({ id: updated.id, isAdmin: updated.isAdmin });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// admin foydalanuvchiga shaxsiy kunlik xona limitini belgilaydi: { limit }
+// limit null/bo'sh bo'lsa — override o'chiriladi (umumiy default ishlatiladi)
+app.post('/api/admin/users/:id/room-limit', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const u = await prisma.user.findUnique({ where: { id: req.params.id } });
+    if (!u) return res.status(404).json({ error: 'Topilmadi' });
+    const { limit } = req.body;
+    if (limit === null || limit === undefined || limit === '') {
+      await redis.hdel('roomlimits', u.id);
+      return res.json({ id: u.id, roomLimit: null });
+    }
+    const n = parseInt(limit);
+    if (!Number.isFinite(n) || n < 0 || n > 1000) return res.status(400).json({ error: 'Limit 0–1000 oralig\'ida bo\'lishi kerak' });
+    await redis.hset('roomlimits', u.id, String(n));
+    res.json({ id: u.id, roomLimit: n });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

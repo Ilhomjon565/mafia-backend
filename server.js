@@ -313,6 +313,10 @@ async function saveG(gameId, g) {
 // barcha aktiv xonalar ro'yxati
 app.get('/api/games', async (_, res) => {
   try {
+    // qisqa keshlash: ko'p klient poll qilsa ham og'ir ish 3s da bir marta bajariladi
+    const cached = await redis.get('cache:games').catch(() => null);
+    if (cached) return res.json(JSON.parse(cached));
+
     const games = await prisma.game.findMany({
       where: { status: { in: ['waiting', 'playing'] }, isPrivate: false },
       orderBy: { createdAt: 'desc' }
@@ -331,7 +335,9 @@ app.get('/api/games', async (_, res) => {
         players: (state?.players || []).map(p => ({ userId: p.userId, username: p.username, isAlive: p.isAlive }))
       };
     }));
-    res.json(enriched.filter(Boolean));
+    const list = enriched.filter(Boolean);
+    await redis.set('cache:games', JSON.stringify(list), 'EX', 3).catch(() => {});
+    res.json(list);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -452,6 +458,7 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, async (_, res) => {
     const overrides = (await redis.hgetall('roomlimits').catch(() => ({}))) || {};
     res.json(users.map(u => ({
       id: u.id, username: u.username, email: u.email,
+      avatar: u.avatar || null,
       isAdmin: u.isAdmin, isBanned: u.isBanned,
       createdAt: u.createdAt, lastSeen: u.lastSeen,
       items: normItems(u.items),
@@ -612,6 +619,7 @@ function publicPlayers(players) {
     socketId: p.socketId,
     userId: p.userId,
     username: p.username,
+    avatar: p.avatar || null,
     isAlive: p.isAlive,
     connected: p.connected !== false,
     isHost: p.isHost === true,
@@ -990,10 +998,16 @@ io.on('connection', (socket) => {
       }
 
       const isHost = g.hostId && g.hostId === userId;
+      let avatar = null;
+      if (userId && !String(userId).startsWith('guest-')) {
+        const u = await prisma.user.findUnique({ where: { id: userId }, select: { avatar: true } }).catch(() => null);
+        avatar = u?.avatar || null;
+      }
       const player = {
         socketId: socket.id,
         userId: userId || 'guest-' + socket.id.slice(0, 6),
         username: username || 'O\'yinchi-' + socket.id.slice(0, 4),
+        avatar,
         role: null, isAlive: true, connected: true, isHost, joinedAt: Date.now()
       };
       g.players.push(player);

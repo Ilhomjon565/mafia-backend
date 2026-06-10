@@ -482,13 +482,13 @@ app.get('/api/leaderboard', async (req, res) => {
     const rows = await prisma.userStats.findMany({
       orderBy: [{ rating: 'desc' }, { gamesWon: 'desc' }],
       skip: (page - 1) * limit, take: limit,
-      include: { user: { select: { username: true, avatar: true } } }
+      include: { user: { select: { username: true } } }   // avatar yo'q — payload yengil
     });
     res.json({
       total, page, limit, pages: Math.max(1, Math.ceil(total / limit)),
       players: rows.map((s, i) => ({
         rank: (page - 1) * limit + i + 1,
-        username: s.user.username, avatar: s.user.avatar || null, rating: s.rating,
+        username: s.user.username, rating: s.rating,
         gamesPlayed: s.gamesPlayed, gamesWon: s.gamesWon, winRate: s.winRate
       }))
     });

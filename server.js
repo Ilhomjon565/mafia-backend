@@ -1546,6 +1546,24 @@ function voiceLeave(gameId, socketId) {
   if (set) { set.delete(socketId); if (!set.size) voicePeers.delete(gameId); }
 }
 
+// ==================== DO'ST BOT-O'YINIGA QO'SHILISH ====================
+const pendingJoins = new Map(); // requestId -> { requesterSocketId, requesterUserId, requesterUsername, requesterAvatar, gameId }
+
+// username bo'yicha o'sha foydalanuvchining aktiv botlar o'yinini topadi
+async function findBotGameByHost(hostUsername) {
+  const host = await prisma.user.findUnique({ where: { username: hostUsername } }).catch(() => null);
+  if (!host) return null;
+  const games = await prisma.game.findMany({
+    where: { hostId: host.id, status: { in: ['waiting', 'playing'] } },
+    orderBy: { createdAt: 'desc' }
+  });
+  for (const gm of games) {
+    const g = await getG(gm.id).catch(() => null);
+    if (g && g.vsBots) return { gameId: gm.id, g, host };
+  }
+  return null;
+}
+
 io.on('connection', (socket) => {
   console.log(`✅ ${socket.id}`);
 
@@ -1863,6 +1881,69 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ===== Do'st bot-o'yiniga qo'shilish so'rovi =====
+  socket.on('request_join_bot', async ({ hostUsername, userId, username, avatar }) => {
+    try {
+      if (!hostUsername || !username) return socket.emit('bot_join_error', { message: 'Username kerak' });
+      const found = await findBotGameByHost(String(hostUsername).trim());
+      if (!found) return socket.emit('bot_join_error', { message: 'Bu foydalanuvchi hozir botlar bilan o\'ynamayapti' });
+      const { gameId, g } = found;
+      if (userId && g.hostId === userId) return socket.emit('bot_join_error', { message: 'Bu sizning o\'yiningiz' });
+      const already = g.players.find(p => !p.isBot && (p.userId === userId || p.username === username));
+      if (already) return socket.emit('join_approved', { gameId });
+      if ((g.rejects?.[userId] || 0) >= 3) return socket.emit('join_rejected', { blocked: true, message: 'Siz bu o\'yinga qo\'shila olmaysiz (3 marta rad etildi)' });
+      if (!g.players.some(p => p.isAlive && p.isBot)) return socket.emit('bot_join_error', { message: 'O\'yinda bo\'sh joy yo\'q' });
+      const hostP = g.players.find(p => !p.isBot && p.userId === g.hostId && p.connected !== false) || g.players.find(p => !p.isBot && p.connected !== false);
+      if (!hostP || !hostP.socketId) return socket.emit('bot_join_error', { message: 'O\'yin egasi hozir mavjud emas' });
+      const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      pendingJoins.set(requestId, { requesterSocketId: socket.id, requesterUserId: userId, requesterUsername: username, requesterAvatar: avatar || null, gameId });
+      io.to(hostP.socketId).emit('join_request', { requestId, requester: { userId, username, avatar: avatar || null } });
+      socket.emit('bot_join_pending', { host: hostUsername });
+      setTimeout(() => {
+        if (pendingJoins.has(requestId)) { pendingJoins.delete(requestId); io.to(socket.id).emit('bot_join_error', { message: 'Javob kelmadi (vaqt tugadi)' }); }
+      }, 60000);
+    } catch (e) { socket.emit('bot_join_error', { message: e.message }); }
+  });
+
+  socket.on('join_response', async ({ requestId, accept }) => {
+    const req = pendingJoins.get(requestId);
+    if (!req) return;
+    pendingJoins.delete(requestId);
+    await withLock(req.gameId, async () => {
+      const g = await getG(req.gameId);
+      if (!g) { io.to(req.requesterSocketId).emit('bot_join_error', { message: 'O\'yin tugagan' }); return; }
+      // javob beruvchi haqiqatan ham o'yin ichidagi odammi (xavfsizlik)
+      const responder = g.players.find(p => p.socketId === socket.id && !p.isBot);
+      if (!responder) return;
+      if (accept) {
+        const bot = pickRandom(g.players.filter(p => p.isAlive && p.isBot));
+        if (!bot) { io.to(req.requesterSocketId).emit('bot_join_error', { message: 'Bo\'sh joy qolmadi' }); return; }
+        // bot o'rnini do'st egallaydi (roli saqlanadi)
+        bot.isBot = false;
+        bot.userId = req.requesterUserId;
+        bot.username = req.requesterUsername;
+        bot.avatar = req.requesterAvatar;
+        bot.connected = false; // socketда kirganda true bo'ladi
+        bot.items = await loadUserItems(req.requesterUserId);
+        bot.shieldActive = false;
+        if (g.rejects) delete g.rejects[req.requesterUserId];
+        logEvent(g, '🤝', `${req.requesterUsername} o'yinga qo'shildi`);
+        await saveG(req.gameId, g);
+        // mafiya tarkibi o'zgargan bo'lishi mumkin — mafiyalarga yangilaymiz
+        const mafiaList = g.players.filter(p => sideOf(p.role) === 'mafia').map(p => ({ socketId: p.socketId, username: p.username, role: p.role }));
+        for (const m of g.players.filter(p => !p.isBot && p.connected !== false && sideOf(p.role) === 'mafia')) io.to(m.socketId).emit('mafia_team', { mates: mafiaList });
+        io.to(`game:${req.gameId}`).emit('game_state', { ...g, players: publicPlayers(g.players) });
+        io.to(req.requesterSocketId).emit('join_approved', { gameId: req.gameId });
+      } else {
+        g.rejects = g.rejects || {};
+        g.rejects[req.requesterUserId] = (g.rejects[req.requesterUserId] || 0) + 1;
+        const blocked = g.rejects[req.requesterUserId] >= 3;
+        await saveG(req.gameId, g);
+        io.to(req.requesterSocketId).emit('join_rejected', { blocked, message: blocked ? 'Rad etildingiz — bu o\'yinga boshqa so\'rov yubora olmaysiz' : 'So\'rovingiz rad etildi' });
+      }
+    });
+  });
+
   // ===== Ovozli chat signaling =====
   socket.on('voice_join', ({ gameId }) => {
     const set = voicePeers.get(gameId) || new Set();
@@ -1894,16 +1975,23 @@ io.on('connection', (socket) => {
     await withLock(data.gameId, async () => {
       const g = await getG(data.gameId);
       if (!g) return;
-      // 🤖 botlar o'yini: foydalanuvchi chiqsa, 15s ichida qaytmasa — o'yin o'chadi
+      // 🤖 botlar o'yini: o'yinchi belgisini offline qilamiz.
+      // Hech qanday ULANGAN odam qolmasa — 15s ichida qaytmasa o'yin o'chadi.
       if (g.vsBots) {
+        const me = g.players.find(x => x.socketId === socket.id);
+        if (me) { me.connected = false; await saveG(data.gameId, g); }
         io.to(`game:${data.gameId}`).emit('player_offline', { username: data.username });
-        if (botDeleteTimers.has(data.gameId)) clearTimeout(botDeleteTimers.get(data.gameId));
-        botDeleteTimers.set(data.gameId, setTimeout(async () => {
-          botDeleteTimers.delete(data.gameId);
-          if (timers.has(data.gameId)) { clearTimeout(timers.get(data.gameId)); timers.delete(data.gameId); }
-          await redis.del(`game:${data.gameId}`).catch(() => {});
-          await prisma.game.delete({ where: { id: data.gameId } }).catch(() => {});
-        }, 15000));
+        io.to(`game:${data.gameId}`).emit('game_state', { ...g, players: publicPlayers(g.players) });
+        const anyHuman = g.players.some(x => !x.isBot && x.connected !== false);
+        if (!anyHuman) {
+          if (botDeleteTimers.has(data.gameId)) clearTimeout(botDeleteTimers.get(data.gameId));
+          botDeleteTimers.set(data.gameId, setTimeout(async () => {
+            botDeleteTimers.delete(data.gameId);
+            if (timers.has(data.gameId)) { clearTimeout(timers.get(data.gameId)); timers.delete(data.gameId); }
+            await redis.del(`game:${data.gameId}`).catch(() => {});
+            await prisma.game.delete({ where: { id: data.gameId } }).catch(() => {});
+          }, 15000));
+        }
         return;
       }
       if (g.status === 'waiting') {

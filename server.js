@@ -8,6 +8,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { PrismaClient } from '@prisma/client';
 import { OAuth2Client } from 'google-auth-library';
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -129,12 +130,20 @@ async function userDailyLimit(userId, settings) {
 
 // ==================== AUTH HELPERS ====================
 
-function signToken(user) {
-  return jwt.sign(
-    { userId: user.id, username: user.username, isAdmin: user.isAdmin },
-    JWT_SECRET,
-    { expiresIn: '30d' }
-  );
+// qurilma ID hash'i (token o'g'irlanishidan himoya — token shu qurilmaga bog'lanadi)
+function deviceHash(id) {
+  if (!id) return null;
+  return crypto.createHash('sha256').update(String(id)).digest('hex').slice(0, 16);
+}
+function reqDeviceId(req) {
+  return req.headers['x-device-id'] || req.body?.deviceId || null;
+}
+
+function signToken(user, deviceId) {
+  const payload = { userId: user.id, username: user.username, isAdmin: user.isAdmin };
+  const dvc = deviceHash(deviceId);
+  if (dvc) payload.dvc = dvc; // tokenni shu qurilmaga bog'laymiz
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
 }
 
 function authMiddleware(req, res, next) {
@@ -142,10 +151,18 @@ function authMiddleware(req, res, next) {
   const token = h.startsWith('Bearer ') ? h.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'Avtorizatsiya kerak' });
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
+    const payload = jwt.verify(token, JWT_SECRET);
+    // qurilma bog'lash: token qurilmaga bog'langan bo'lsa — mos kelishi shart
+    if (payload.dvc) {
+      const dev = reqDeviceId(req);
+      if (!dev || deviceHash(dev) !== payload.dvc) {
+        return res.status(401).json({ error: 'Qurilma mos emas — sessiya bekor qilindi', code: 'device_mismatch' });
+      }
+    }
+    req.user = payload;
     next();
   } catch {
-    res.status(401).json({ error: 'Token yaroqsiz' });
+    res.status(401).json({ error: 'Token yaroqsiz', code: 'token_invalid' });
   }
 }
 
@@ -183,7 +200,7 @@ app.post('/api/register', limitAuth, async (req, res) => {
         stats: { create: {} }
       }
     });
-    res.json({ userId: user.id, username: user.username, isAdmin: user.isAdmin, items: normItems(user.items), token: signToken(user) });
+    res.json({ userId: user.id, username: user.username, isAdmin: user.isAdmin, items: normItems(user.items), token: signToken(user, reqDeviceId(req)) });
   } catch (e) {
     if (e.code === 'P2002') return res.status(409).json({ error: 'Bu username band' });
     res.status(500).json({ error: e.message });
@@ -200,7 +217,7 @@ app.post('/api/login', limitAuth, async (req, res) => {
     const ok = await bcrypt.compare(password || '', user.password);
     if (!ok) return res.status(401).json({ error: 'Parol noto\'g\'ri' });
     await prisma.user.update({ where: { id: user.id }, data: { lastSeen: new Date() } }).catch(() => {});
-    res.json({ userId: user.id, username: user.username, isAdmin: user.isAdmin, token: signToken(user) });
+    res.json({ userId: user.id, username: user.username, isAdmin: user.isAdmin, token: signToken(user, reqDeviceId(req)) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -276,7 +293,7 @@ app.post('/api/auth/google', limitAuth, async (req, res) => {
       isAdmin: user.isAdmin,
       avatar: user.avatar || null,
       items: normItems(user.items),
-      token: signToken(user)
+      token: signToken(user, reqDeviceId(req))
     });
   } catch (e) {
     if (e.code === 'P2002') return res.status(409).json({ error: 'Bu hisob allaqachon mavjud' });
@@ -295,7 +312,7 @@ app.post('/api/admin/login', limitAuth, async (req, res) => {
     const ok = await bcrypt.compare(password || '', user.password);
     if (!ok) return res.status(401).json({ error: 'Parol noto\'g\'ri' });
     await prisma.user.update({ where: { id: user.id }, data: { lastSeen: new Date() } }).catch(() => {});
-    res.json({ userId: user.id, username: user.username, isAdmin: true, token: signToken(user) });
+    res.json({ userId: user.id, username: user.username, isAdmin: true, token: signToken(user, reqDeviceId(req)) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -410,7 +427,7 @@ app.put('/api/me/profile', authMiddleware, limitByUser(15), async (req, res) => 
     if (!Object.keys(data).length) return res.status(400).json({ error: 'O\'zgartirish yo\'q' });
     const u = await prisma.user.update({ where: { id: req.user.userId }, data });
     // username token ichida — yangi token qaytaramiz
-    res.json({ userId: u.id, username: u.username, avatar: u.avatar || null, isAdmin: u.isAdmin, token: signToken(u) });
+    res.json({ userId: u.id, username: u.username, avatar: u.avatar || null, isAdmin: u.isAdmin, token: signToken(u, reqDeviceId(req)) });
   } catch (e) {
     if (e.code === 'P2002') return res.status(409).json({ error: 'Bu nikname band' });
     res.status(500).json({ error: e.message });
@@ -1642,7 +1659,17 @@ function guard(socket, key, max, windowMs) {
 io.use((socket, next) => {
   try {
     const token = socket.handshake.auth?.token;
-    if (token) { try { socket.data.auth = jwt.verify(token, JWT_SECRET); } catch {} }
+    if (token) {
+      try {
+        const p = jwt.verify(token, JWT_SECRET);
+        // qurilmaga bog'langan token — qurilma mos kelsagina ishonamiz
+        if (p.dvc) {
+          const dev = socket.handshake.auth?.deviceId;
+          if (dev && deviceHash(dev) === p.dvc) socket.data.auth = p;
+          // mos kelmasa — auth o'rnatilmaydi (boshqa nomidan kira olmaydi)
+        } else socket.data.auth = p;
+      } catch {}
+    }
   } catch {}
   const ip = socketIp(socket);
   socket.data.ip = ip;

@@ -473,17 +473,40 @@ app.put('/api/me/profile', authMiddleware, limitByUser(15), async (req, res) => 
   }
 });
 
-// reyting jadvali (public)
-app.get('/api/leaderboard', async (_, res) => {
+// reyting jadvali (public) — pagination
+app.get('/api/leaderboard', async (req, res) => {
   try {
-    const top = await prisma.userStats.findMany({
-      orderBy: { rating: 'desc' }, take: 20,
-      include: { user: { select: { username: true } } }
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(50, Math.max(5, parseInt(req.query.limit) || 20));
+    const total = await prisma.userStats.count();
+    const rows = await prisma.userStats.findMany({
+      orderBy: [{ rating: 'desc' }, { gamesWon: 'desc' }],
+      skip: (page - 1) * limit, take: limit,
+      include: { user: { select: { username: true, avatar: true } } }
     });
-    res.json(top.map(s => ({
-      username: s.user.username, rating: s.rating,
-      gamesPlayed: s.gamesPlayed, gamesWon: s.gamesWon, winRate: s.winRate
-    })));
+    res.json({
+      total, page, limit, pages: Math.max(1, Math.ceil(total / limit)),
+      players: rows.map((s, i) => ({
+        rank: (page - 1) * limit + i + 1,
+        username: s.user.username, avatar: s.user.avatar || null, rating: s.rating,
+        gamesPlayed: s.gamesPlayed, gamesWon: s.gamesWon, winRate: s.winRate
+      }))
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// joriy foydalanuvchining reytingdagi o'rni
+app.get('/api/me/rank', authMiddleware, async (req, res) => {
+  try {
+    const s = await prisma.userStats.findUnique({ where: { userId: req.user.userId } });
+    const rating = s?.rating ?? 1000;
+    // mendan yuqori reytingli o'yinchilar soni + 1 = mening o'rnim
+    const higher = await prisma.userStats.count({ where: { rating: { gt: rating } } });
+    const total = await prisma.userStats.count();
+    res.json({
+      rank: higher + 1, total, rating,
+      gamesPlayed: s?.gamesPlayed ?? 0, gamesWon: s?.gamesWon ?? 0, winRate: s?.winRate ?? 0
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

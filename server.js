@@ -268,13 +268,66 @@ app.get('/api/me', authMiddleware, async (req, res) => {
     const settings = await getSettings();
     const dailyLimit = await userDailyLimit(u.id, settings);
     const roomsToday = await prisma.game.count({ where: { hostId: u.id, createdAt: { gte: startOfDay } } });
+    // kunlik bonus bugun olinganmi?
+    const bonusReady = !u.lastBonusAt || new Date(u.lastBonusAt) < startOfDay;
     res.json({
       userId: u.id, username: u.username, isAdmin: u.isAdmin, isBanned: u.isBanned,
       avatar: u.avatar || null,
       items: normItems(items),
+      coins: u.coins ?? 0,
+      bonusReady,
+      shopPrices: ECONOMY.prices,
+      dailyBonus: ECONOMY.dailyBonus,
       dailyLimit, roomsToday, roomsLeft: Math.max(0, dailyLimit - roomsToday),
       stats: u.stats || { gamesPlayed: 0, gamesWon: 0, winRate: 0, rating: 1000 }
     });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 🛒 do'kon — tangaga item sotib olish
+app.post('/api/shop/buy', authMiddleware, async (req, res) => {
+  try {
+    const { item } = req.body;
+    if (!ITEM_KEYS.includes(item)) return res.status(400).json({ error: 'Noma\'lum buyum' });
+    const price = ECONOMY.prices[item];
+    const u = await prisma.user.findUnique({ where: { id: req.user.userId } });
+    if (!u) return res.status(404).json({ error: 'Topilmadi' });
+    if ((u.coins ?? 0) < price) return res.status(400).json({ error: 'Tanga yetarli emas' });
+    const items = normItems(u.items);
+    items[item] = (items[item] || 0) + 1;
+    const updated = await prisma.user.update({
+      where: { id: u.id },
+      data: { coins: { decrement: price }, items }
+    });
+    res.json({ ok: true, coins: updated.coins, items: normItems(updated.items) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 🎁 kunlik bonus — kuniga bir marta
+app.post('/api/daily-bonus', authMiddleware, async (req, res) => {
+  try {
+    const u = await prisma.user.findUnique({ where: { id: req.user.userId } });
+    if (!u) return res.status(404).json({ error: 'Topilmadi' });
+    const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
+    if (u.lastBonusAt && new Date(u.lastBonusAt) >= startOfDay) {
+      return res.status(429).json({ error: 'Bugungi bonus allaqachon olingan' });
+    }
+    const updated = await prisma.user.update({
+      where: { id: u.id },
+      data: { coins: { increment: ECONOMY.dailyBonus }, lastBonusAt: new Date() }
+    });
+    res.json({ ok: true, coins: updated.coins, bonus: ECONOMY.dailyBonus });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 📜 o'yin tarixi (oxirgi 20 ta)
+app.get('/api/me/history', authMiddleware, async (req, res) => {
+  try {
+    const list = await prisma.gameHistory.findMany({
+      where: { userId: req.user.userId },
+      orderBy: { createdAt: 'desc' }, take: 20
+    });
+    res.json(list.map(h => ({ role: h.role, won: h.won, winner: h.winner, coins: h.coins, createdAt: h.createdAt })));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -698,6 +751,14 @@ function logEvent(g, icon, text) {
 // shield = qalqon (kechasi mafiyadan himoya), lupa = rolni bilish, life = qo'shimcha jon
 const ITEM_KEYS = ['shield', 'lupa', 'life'];
 const DEFAULT_ITEMS = { shield: 1, lupa: 1, life: 1 }; // yangi user ozginadan oladi
+
+// 🪙 Tanga iqtisodi (do'kon narxlari, mukofotlar, kunlik bonus)
+const ECONOMY = {
+  winReward: 50,
+  loseReward: 15,
+  dailyBonus: 30,
+  prices: { shield: 60, lupa: 50, life: 100 },
+};
 function normItems(it) {
   const out = { shield: 0, lupa: 0, life: 0 };
   if (it) for (const k of ITEM_KEYS) out[k] = Math.max(0, parseInt(it[k]) || 0);
@@ -1130,6 +1191,7 @@ async function recordStats(g, winner) {
   for (const p of g.players) {
     if (!p.userId || String(p.userId).startsWith('guest-')) continue;
     const won = winner === sideOf(p.role) || (winner === 'civil' && sideOf(p.role) === 'town');
+    const reward = won ? ECONOMY.winReward : ECONOMY.loseReward;
     try {
       await prisma.userStats.upsert({
         where: { userId: p.userId },
@@ -1143,6 +1205,14 @@ async function recordStats(g, winner) {
           data: { winRate: Math.round((s.gamesWon / s.gamesPlayed) * 1000) / 10 }
         });
       }
+      // 🪙 tanga mukofoti + o'yin tarixi
+      await prisma.user.update({ where: { id: p.userId }, data: { coins: { increment: reward } } });
+      await prisma.gameHistory.create({
+        data: { userId: p.userId, gameId: g.id, role: p.role || 'civil', won, winner: winner || '', coins: reward }
+      });
+      // tirik klientga yangi tanga balansini yuboramiz
+      const fresh = await prisma.user.findUnique({ where: { id: p.userId }, select: { coins: true } }).catch(() => null);
+      if (fresh && p.socketId) io.to(p.socketId).emit('coins_update', { coins: fresh.coins, reward });
     } catch {}
   }
 }

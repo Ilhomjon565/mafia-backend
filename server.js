@@ -331,6 +331,39 @@ app.get('/api/me/history', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// 👤 profilni tahrirlash — nikname va rasm. Bo'sh nikname mumkin emas.
+app.put('/api/me/profile', authMiddleware, async (req, res) => {
+  try {
+    let { username, avatar } = req.body;
+    const data = {};
+    if (username !== undefined) {
+      username = String(username || '').trim();
+      if (username.length < 2) return res.status(400).json({ error: 'Nikname kamida 2 belgi bo\'lishi kerak' });
+      if (username.length > 20) return res.status(400).json({ error: 'Nikname 20 belgidan oshmasin' });
+      const taken = await prisma.user.findFirst({ where: { username, NOT: { id: req.user.userId } } });
+      if (taken) return res.status(409).json({ error: 'Bu nikname band' });
+      data.username = username;
+    }
+    if (avatar !== undefined) {
+      if (avatar === null || avatar === '') data.avatar = null;
+      else {
+        const s = String(avatar);
+        // data URL (base64) yoki oddiy URL; ~500KB chegara
+        if (!/^(data:image\/|https?:\/\/)/.test(s)) return res.status(400).json({ error: 'Rasm formati noto\'g\'ri' });
+        if (s.length > 700000) return res.status(400).json({ error: 'Rasm juda katta (max ~500KB)' });
+        data.avatar = s;
+      }
+    }
+    if (!Object.keys(data).length) return res.status(400).json({ error: 'O\'zgartirish yo\'q' });
+    const u = await prisma.user.update({ where: { id: req.user.userId }, data });
+    // username token ichida — yangi token qaytaramiz
+    res.json({ userId: u.id, username: u.username, avatar: u.avatar || null, isAdmin: u.isAdmin, token: signToken(u) });
+  } catch (e) {
+    if (e.code === 'P2002') return res.status(409).json({ error: 'Bu nikname band' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // reyting jadvali (public)
 app.get('/api/leaderboard', async (_, res) => {
   try {
@@ -451,6 +484,7 @@ app.post('/api/games', authMiddleware, async (req, res) => {
       dayVotes: {}, nightActions: {}, round: 0, durations: settings.durations, log: []
     };
     await saveG(game.id, state);
+    scheduleEmptyCheck(game.id); // 2 daqiqa ichida hech kim kirmasa o'chadi
     res.json(game);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -520,25 +554,36 @@ app.get('/api/admin/stats', authMiddleware, adminMiddleware, async (_, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/admin/users', authMiddleware, adminMiddleware, async (_, res) => {
+app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) => {
   try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(5, parseInt(req.query.limit) || 20));
+    const q = String(req.query.q || '').trim();
+    const where = q ? { OR: [{ username: { contains: q, mode: 'insensitive' } }, { email: { contains: q, mode: 'insensitive' } }] } : {};
+
+    const total = await prisma.user.count({ where });
     const users = await prisma.user.findMany({
-      orderBy: { createdAt: 'desc' },
+      where, orderBy: { createdAt: 'desc' },
+      skip: (page - 1) * limit, take: limit,
       include: { stats: true }
     });
     const settings = await getSettings();
     const defaultRoomLimit = settings.dailyRoomLimit || 2;
     const overrides = (await redis.hgetall('roomlimits').catch(() => ({}))) || {};
-    res.json(users.map(u => ({
-      id: u.id, username: u.username, email: u.email,
-      avatar: u.avatar || null,
-      isAdmin: u.isAdmin, isBanned: u.isBanned,
-      createdAt: u.createdAt, lastSeen: u.lastSeen,
-      items: normItems(u.items),
-      roomLimit: overrides[u.id] != null ? parseInt(overrides[u.id]) : null, // null = default ishlatiladi
-      defaultRoomLimit,
-      stats: u.stats || { gamesPlayed: 0, gamesWon: 0, winRate: 0, rating: 1000 }
-    })));
+    res.json({
+      total, page, limit, pages: Math.max(1, Math.ceil(total / limit)),
+      users: users.map(u => ({
+        id: u.id, username: u.username, email: u.email,
+        avatar: u.avatar || null,
+        isAdmin: u.isAdmin, isBanned: u.isBanned,
+        createdAt: u.createdAt, lastSeen: u.lastSeen,
+        items: normItems(u.items),
+        coins: u.coins ?? 0,
+        roomLimit: overrides[u.id] != null ? parseInt(overrides[u.id]) : null, // null = default ishlatiladi
+        defaultRoomLimit,
+        stats: u.stats || { gamesPlayed: 0, gamesWon: 0, winRate: 0, rating: 1000 }
+      }))
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -676,6 +721,31 @@ app.put('/api/admin/settings', authMiddleware, adminMiddleware, async (req, res)
 // ==================== GAME ENGINE ====================
 
 const timers = new Map();
+
+// ==================== BO'SH XONA AVTO-O'CHIRISH ====================
+// Xona yaratilgach yoki barcha o'yinchilar chiqib ketib 0 ga tushganda 2 daqiqa kutiladi.
+// Shu vaqt ichida hech kim kirmasa — xona o'chiriladi. Hatto 1 kishi kirsa — bekor qilinadi.
+const EMPTY_ROOM_MS = 120000;
+const emptyTimers = new Map();
+function scheduleEmptyCheck(gameId) {
+  if (emptyTimers.has(gameId)) clearTimeout(emptyTimers.get(gameId));
+  emptyTimers.set(gameId, setTimeout(() => withLock(gameId, () => deleteIfEmpty(gameId)), EMPTY_ROOM_MS));
+}
+function cancelEmptyCheck(gameId) {
+  if (emptyTimers.has(gameId)) { clearTimeout(emptyTimers.get(gameId)); emptyTimers.delete(gameId); }
+}
+async function deleteIfEmpty(gameId) {
+  emptyTimers.delete(gameId);
+  const g = await getG(gameId);
+  if (!g) return;
+  // faqat hali boshlanmagan (waiting) va mutlaqo bo'sh xonalar o'chiriladi
+  if (g.status === 'waiting' && (g.players || []).length === 0) {
+    if (timers.has(gameId)) { clearTimeout(timers.get(gameId)); timers.delete(gameId); }
+    io.to(`game:${gameId}`).emit('game_closed', { message: 'Xona bo\'sh qolgani uchun yopildi' });
+    await redis.del(`game:${gameId}`).catch(() => {});
+    await prisma.game.delete({ where: { id: gameId } }).catch(() => {});
+  }
+}
 
 // ==================== PER-GAME LOCK ====================
 // Bir xona holatini bir vaqtda o'zgartirishdan saqlaydi (race condition oldini oladi)
@@ -1308,6 +1378,7 @@ io.on('connection', (socket) => {
       }
 
       // LOBBY
+      cancelEmptyCheck(gameId); // kimdir kirdi — bo'sh-xona taymerini bekor qilamiz
       const existing = matchPlayer();
       if (existing) {
         existing.socketId = socket.id;
@@ -1357,6 +1428,7 @@ io.on('connection', (socket) => {
       if (g.hostId && starter && starter.userId !== g.hostId && !starter.isHost) {
         socket.emit('game_error', { message: 'Faqat xona egasi boshlay oladi' }); return;
       }
+      cancelEmptyCheck(gameId);
       g.players = assignRoles(g.players, g.roleConfig);
       g.status = 'playing';
       g.round = 0; g.nightActions = {}; g.dayVotes = {}; g.log = [];
@@ -1580,6 +1652,8 @@ io.on('connection', (socket) => {
         await saveG(data.gameId, g);
         io.to(`game:${data.gameId}`).emit('game_state', { ...g, players: publicPlayers(g.players) });
         io.to(`game:${data.gameId}`).emit('player_left', { username: data.username });
+        // xona bo'sh qoldi — 2 daqiqada hech kim kirmasa o'chadi
+        if (g.players.length === 0) scheduleEmptyCheck(data.gameId);
       } else if (g.status === 'playing') {
         const p = g.players.find(p => p.socketId === socket.id);
         if (p) { p.connected = false; await saveG(data.gameId, g); }

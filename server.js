@@ -15,6 +15,9 @@ dotenv.config();
 const JWT_SECRET = process.env.JWT_SECRET || 'mafia-dev-secret';
 // maxfiy admin kalit — admin panel/API'ni yashiradi. .env'da bo'ladi (repoда yo'q).
 const ADMIN_ACCESS_KEY = process.env.ADMIN_ACCESS_KEY || '';
+// Telegram orqali admin kirishini tasdiqlash (token/chat .env'да)
+const TG_ADMIN_BOT_TOKEN = process.env.TG_ADMIN_BOT_TOKEN || '';
+const TG_ADMIN_CHAT_ID = process.env.TG_ADMIN_CHAT_ID || '';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '1012676002382-21keol37nklhi22reit714nkgjb58dgm.apps.googleusercontent.com';
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
@@ -99,17 +102,103 @@ app.use(limitGlobal); // umumiy IP xavfsizlik to'ri (saxiy — CGNAT'ni hisobga 
 
 // 🕵️ Admin panelni yashirish: maxfiy kalitsiz BARCHA /api/admin/* — 404 (mavjud emasdek).
 // Kalit .env'da (ADMIN_ACCESS_KEY); repoда yo'q. Login parolдан oldingi qatlam.
-function adminGate(req, res, next) {
-  if (req.method === 'OPTIONS') return next(); // CORS preflight
-  if (!ADMIN_ACCESS_KEY) return next(); // kalit o'rnatilmagan — eski xatti-harakat (ogohlantirish)
-  if (req.headers['x-admin-key'] !== ADMIN_ACCESS_KEY) {
-    return res.status(404).json({ error: 'Not found' }); // mavjudligini oshkor qilmaymiz
-  }
-  next();
+// qurilma Telegram orqali tasdiqlanganmi?
+async function isDeviceApproved(deviceId) {
+  if (!deviceId) return false;
+  try { return (await redis.exists(`admin:approved:${deviceId}`)) === 1; } catch { return false; }
 }
-app.use('/api/admin', adminGate);
-// kalit to'g'riligini tekshirish (frontend panel uchun; auth talab qilmaydi, faqat kalit)
-app.get('/api/admin/ping', (_, res) => res.json({ ok: true }));
+async function adminGate(req, res, next) {
+  if (req.method === 'OPTIONS') return next(); // CORS preflight
+  // hech narsa sozlanmagan bo'lsa — eski xatti-harakat (lockout bo'lmasin)
+  if (!ADMIN_ACCESS_KEY && !TG_ADMIN_BOT_TOKEN) return next();
+  // 1) maxfiy kalit (zaxira) yoki 2) Telegram orqali tasdiqlangan qurilma
+  if (ADMIN_ACCESS_KEY && req.headers['x-admin-key'] === ADMIN_ACCESS_KEY) return next();
+  if (await isDeviceApproved(req.headers['x-device-id'])) return next();
+  return res.status(404).json({ error: 'Not found' }); // mavjudligini oshkor qilmaymiz
+}
+app.use('/api/admin', (req, res, next) => { adminGate(req, res, next).catch(() => res.status(404).json({ error: 'Not found' })); });
+
+// ==================== TELEGRAM ORQALI ADMIN KIRISH TASDIG'I ====================
+const accessReqs = new Map(); // requestId -> { deviceId, ip, ua, status, t }
+async function tgApi(method, body) {
+  if (!TG_ADMIN_BOT_TOKEN) return null;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TG_ADMIN_BOT_TOKEN}/${method}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    return await r.json().catch(() => null);
+  } catch { return null; }
+}
+async function approveDevice(deviceId) {
+  if (deviceId) await redis.set(`admin:approved:${deviceId}`, '1', 'EX', 7200).catch(() => {}); // 2 soat
+}
+// eskirgan so'rovlarni tozalash
+setInterval(() => { const now = Date.now(); for (const [k, v] of accessReqs) if (now - v.t > 600000) accessReqs.delete(k); }, 300000).unref?.();
+
+// /control kirishida — Telegram'ga so'rov yuboradi
+app.post('/api/access-request', limitAuth, async (req, res) => {
+  try {
+    const deviceId = String(req.headers['x-device-id'] || req.body?.deviceId || '').slice(0, 60);
+    const ip = clientIp(req);
+    const ua = String(req.headers['user-agent'] || '').slice(0, 220);
+    if (!TG_ADMIN_BOT_TOKEN || !TG_ADMIN_CHAT_ID) return res.json({ requestId: null, disabled: true });
+    // dedup: shu qurilma+IP yaqinда pending bo'lsa qayta yubormaymiz (spam oldini olish)
+    for (const [rid, r] of accessReqs) {
+      if (r.deviceId === deviceId && r.ip === ip && r.status === 'pending' && Date.now() - r.t < 120000) {
+        return res.json({ requestId: rid });
+      }
+    }
+    const requestId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+    const rec = { deviceId, ip, ua, status: 'pending', t: Date.now() };
+    accessReqs.set(requestId, rec);
+    const text = `🔐 <b>Admin panelga kirish so'rovi</b>\n\n🌐 IP: <code>${ip}</code>\n📱 Qurilma: <code>${(deviceId || '—').slice(0, 16)}</code>\n🧭 <code>${ua.replace(/[<>]/g, '')}</code>\n🕒 ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC`;
+    tgApi('sendMessage', {
+      chat_id: TG_ADMIN_CHAT_ID, text, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[
+        { text: '✅ Ruxsat berish', callback_data: `ok:${requestId}` },
+        { text: '❌ Rad etish', callback_data: `no:${requestId}` },
+      ]] },
+    }).catch(() => {});
+    res.json({ requestId });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// frontend holatni so'rab turadi
+app.get('/api/access-status', (req, res) => {
+  const r = accessReqs.get(String(req.query.requestId || ''));
+  res.json({ status: r ? r.status : 'unknown' });
+});
+
+// Telegram tugmalarini qabul qilish (long-polling)
+let tgOffset = 0;
+async function tgPoll() {
+  if (!TG_ADMIN_BOT_TOKEN) return;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TG_ADMIN_BOT_TOKEN}/getUpdates?timeout=30&offset=${tgOffset}`);
+    const j = await r.json().catch(() => null);
+    if (j?.ok && Array.isArray(j.result)) {
+      for (const u of j.result) {
+        tgOffset = u.update_id + 1;
+        const cb = u.callback_query;
+        if (cb?.data) {
+          const [action, rid] = String(cb.data).split(':');
+          const rec = accessReqs.get(rid);
+          let note = 'Eskirgan yoki yopilgan so\'rov';
+          if (rec && rec.status === 'pending') {
+            if (action === 'ok') { rec.status = 'approved'; await approveDevice(rec.deviceId); note = '✅ Ruxsat berildi (2 soat)'; }
+            else if (action === 'no') { rec.status = 'denied'; note = '❌ Rad etildi'; }
+          }
+          await tgApi('answerCallbackQuery', { callback_query_id: cb.id, text: note });
+          if (cb.message) await tgApi('editMessageText', {
+            chat_id: cb.message.chat.id, message_id: cb.message.message_id,
+            text: `${cb.message.text}\n\n— <b>${note}</b>`, parse_mode: 'HTML',
+          });
+        }
+      }
+    }
+  } catch {}
+  setTimeout(tgPoll, 800);
+}
 
 // ==================== SETTINGS ====================
 
@@ -2289,6 +2378,10 @@ httpServer.listen(PORT, () => {
   Ready! 🎮
   `);
   recoverTimers(); // restart'dan keyin ketayotgan o'yinlarni davom ettiramiz
+  if (TG_ADMIN_BOT_TOKEN) {
+    tgApi('deleteWebhook', {}).finally(() => tgPoll()); // getUpdates uchun webhook bo'lmasligi kerak
+    console.log('🤖 Telegram admin-tasdiq boti ishga tushdi');
+  }
 });
 
 process.on('SIGTERM', () => httpServer.close(() => { prisma.$disconnect(); redis.disconnect(); }));

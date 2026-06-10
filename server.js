@@ -38,9 +38,15 @@ const DEFAULT_SETTINGS = {
     day_discussion: 120,
     day_results:    8,
     night:          35,
-    night_mafia:    20,
+    night_mafia:    25,
+    night_komissar: 20,
     night_doctor:   20,
     night_sheriff:  20,
+    night_escort:   20,
+    night_advokat:  20,
+    night_qotil:    20,
+    night_daydi:    20,
+    night_skip:     3,   // rol yo'q bo'lsa "...siz" qisqa o'tish
     night_results:  8,
   },
   defaultRoles: { sheriffCount: 1, doctorCount: 1, mafiaRatio: 0.3 },
@@ -733,18 +739,43 @@ function dur(g, phase) {
   return (g.durations && g.durations[phase]) || DEFAULT_SETTINGS.durations[phase];
 }
 
-// barcha tirik "tungi harakat" rollari o'z amalini bajardimi?
-function allNightActionsDone(g) {
+// ==================== KETMA-KET TUNGI BOSQICHLAR ====================
+// Tun navbat bilan o'tadi: avval mafiya kelishadi, keyin komissar, doktor va h.k.
+// Har bosqichda faqat o'sha rol harakat qiladi, qolganlar kutadi.
+// Rol o'yinda bo'lmasa — qisqa "...siz" o'tish ko'rsatiladi.
+const NIGHT_STEPS = [
+  { phase: 'night_mafia',    roles: ['don', 'mafia'], dur: 'night_mafia',    noun: 'Mafiya' },
+  { phase: 'night_komissar', roles: ['komissar'],     dur: 'night_komissar', noun: 'Komissar' },
+  { phase: 'night_doctor',   roles: ['doctor'],       dur: 'night_doctor',   noun: 'Doktor' },
+  { phase: 'night_escort',   roles: ['escort'],       dur: 'night_escort',   noun: 'Kezuvchi' },
+  { phase: 'night_advokat',  roles: ['advokat'],      dur: 'night_advokat',  noun: 'Advokat' },
+  { phase: 'night_qotil',    roles: ['qotil'],        dur: 'night_qotil',    noun: 'Qotil' },
+  { phase: 'night_daydi',    roles: ['daydi'],         dur: 'night_daydi',    noun: 'Daydi' },
+];
+function nightStepByPhase(phase) { return NIGHT_STEPS.find(s => s.phase === phase); }
+
+// shu bosqich roli o'yinda (tirik) bormi?
+function stepHasActor(g, step) {
+  return g.players.some(p => p.isAlive && step.roles.includes(p.role));
+}
+
+// bosqich tugadimi? (rol o'z amalini bajardimi)
+// mafiya uchun: barcha tirik mafiya bir XIL nishonga ovoz bergan bo'lsa (konsensus) — erta tugaydi.
+// kelisha olmasa — vaqt tugaguncha kutadi, keyin hech kim o'lmaydi.
+function nightStepComplete(g, step) {
   const na = g.nightActions || {};
-  const alive = g.players.filter(p => p.isAlive);
-  const votes = na.mafiaVotes || {};
-  const killers = alive.filter(p => p.role === 'don' || p.role === 'mafia');
-  if (killers.length && killers.some(p => !votes[p.socketId])) return false;
-  const single = [['komissar', na.komissar], ['doctor', na.doctor], ['escort', na.escort], ['advokat', na.lawyer], ['qotil', na.killer], ['daydi', na.daydi]];
-  for (const [role, act] of single) {
-    if (alive.some(p => p.role === role) && !act) return false;
+  if (step.phase === 'night_mafia') {
+    const aliveMafia = g.players.filter(p => p.isAlive && sideOf(p.role) === 'mafia');
+    if (!aliveMafia.length) return true;
+    const votes = na.mafiaVotes || {};
+    const first = votes[aliveMafia[0].socketId];
+    return !!first && aliveMafia.every(p => votes[p.socketId] === first);
   }
-  return true;
+  const keyByPhase = {
+    night_komissar: 'komissar', night_doctor: 'doctor', night_escort: 'escort',
+    night_advokat: 'lawyer', night_qotil: 'killer', night_daydi: 'daydi',
+  };
+  return !!na[keyByPhase[step.phase]];
 }
 
 async function startPhase(gameId, phase) {
@@ -833,7 +864,7 @@ async function onPhaseEnd(gameId, phase) {
       players: publicPlayers(g.players), message: msg, result, log: g.log
     });
     if (timers.has(gameId)) clearTimeout(timers.get(gameId));
-    timers.set(gameId, setTimeout(() => startPhase(gameId, 'night'), dur(g, 'day_results') * 1000));
+    timers.set(gameId, setTimeout(() => startNight(gameId), dur(g, 'day_results') * 1000));
 
   } else if (phase === 'night') {
     await processNight(gameId);
@@ -862,25 +893,23 @@ async function processNight(gameId) {
   // 2) 👨‍💼 Advokat himoyasi (mafiyani Komissardan yashiradi)
   const lawyerProtect = (na.lawyer && notBlocked(na.lawyer.by)) ? na.lawyer.target : null;
 
-  // 3) 🤵 Mafiya o'ldirish nishoni (ovozlar; durangда Don hal qiladi)
+  // 3) 🤵 Mafiya o'ldirish nishoni — mafialar KELISHISHI shart.
+  // Barcha tirik (bloklanmagan) mafiya bir XIL nishonga ovoz bersa — o'sha o'ladi.
+  // Kelisha olmasalar (ovozlar bo'linsa) — hech kim o'lmaydi.
   let mafiaKill = null;
   {
     const votes = na.mafiaVotes || {};
-    const tally = {}; let donPick = null;
-    for (const voterSid of Object.keys(votes)) {
-      const voter = find(voterSid);
-      if (!voter || !voter.isAlive || blocked.has(voterSid)) continue;
-      const tgt = votes[voterSid]; const target = aliveT(tgt);
-      if (!target || sideOf(target.role) === 'mafia') continue;
-      tally[tgt] = (tally[tgt] || 0) + 1;
-      if (voter.role === 'don') donPick = tgt;
+    const aliveMafia = g.players.filter(p => p.isAlive && sideOf(p.role) === 'mafia');
+    const active = aliveMafia.filter(p => !blocked.has(p.socketId)); // kezuvchi bloklaganlar sanalmaydi
+    const picks = active.map(p => votes[p.socketId]).filter(Boolean);
+    const unanimous = active.length > 0 && picks.length === active.length && picks.every(v => v === picks[0]);
+    if (unanimous) {
+      const target = aliveT(picks[0]);
+      if (target && sideOf(target.role) !== 'mafia') mafiaKill = picks[0];
+    } else if (aliveMafia.length && picks.length) {
+      // ovoz berishgan, lekin kelisha olmaganlar
+      logEvent(g, '🤝', 'Mafiya kelisha olmadi — bu kecha hech kimni o\'ldirmadi');
     }
-    let best = null, max = 0, tie = false;
-    for (const tgt of Object.keys(tally)) {
-      if (tally[tgt] > max) { max = tally[tgt]; best = tgt; tie = false; }
-      else if (tally[tgt] === max) tie = true;
-    }
-    mafiaKill = tie ? (donPick || null) : best;
   }
   if (mafiaKill) deaths.push({ sid: mafiaKill, cause: 'mafia' });
 
@@ -920,9 +949,11 @@ async function processNight(gameId) {
   for (const d of deaths) {
     const t = aliveT(d.sid);
     if (!t || processed.has(t.socketId)) continue;
-    if (t.shieldActive) { savedNames.push(t.username); logEvent(g, '🛡️', `${t.username} qalqon bilan omon qoldi`); continue; }
-    if (healTarget === t.socketId) { savedNames.push(t.username); logEvent(g, '✅', `Doktor ${t.username}ni qutqardi`); continue; }
-    if ((t.items?.life || 0) > 0) {
+    // 🔫 Komissar o'qi — qutqarib bo'lmaydi (qalqon/doktor/qo'shimcha jon ta'sir qilmaydi)
+    const unstoppable = d.cause === 'komissar';
+    if (!unstoppable && t.shieldActive) { savedNames.push(t.username); logEvent(g, '🛡️', `${t.username} qalqon bilan omon qoldi`); continue; }
+    if (!unstoppable && healTarget === t.socketId) { savedNames.push(t.username); logEvent(g, '✅', `Doktor ${t.username}ni qutqardi`); continue; }
+    if (!unstoppable && (t.items?.life || 0) > 0) {
       t.items.life--; await adjustUserItems(t.userId, { life: -1 });
       io.to(t.socketId).emit('your_items', { items: t.items });
       savedNames.push(t.username); logEvent(g, '❤️', `${t.username} qo'shimcha jon bilan tirik qoldi`); continue;
@@ -972,6 +1003,53 @@ async function processNight(gameId) {
   });
   if (timers.has(gameId)) clearTimeout(timers.get(gameId));
   timers.set(gameId, setTimeout(() => startPhase(gameId, 'day_discussion'), dur(g, 'night_results') * 1000));
+}
+
+// ===== Ketma-ket tunni boshlash =====
+async function startNight(gameId) {
+  const g = await getG(gameId);
+  if (!g || g.status === 'finished') return;
+  g.nightActions = {};
+  g.nightStep = -1;
+  logEvent(g, '🌙', `${g.round}-kecha tushdi — shahar uxlaydi`);
+  await saveG(gameId, g);
+  await startNightStep(gameId, 0);
+}
+
+// idx-bosqichni boshlaydi (kerak bo'lsa rolsiz bosqichni qisqa o'tkazadi)
+async function startNightStep(gameId, idx) {
+  const g = await getG(gameId);
+  if (!g || g.status === 'finished') return;
+  if (idx >= NIGHT_STEPS.length) return processNight(gameId);
+
+  const step = NIGHT_STEPS[idx];
+  const present = stepHasActor(g, step);
+  const d = present ? dur(g, step.dur) : (dur(g, 'night_skip') || 3);
+  const endsAt = Date.now() + d * 1000;
+
+  g.phase = step.phase;
+  g.nightStep = idx;
+  g.nightPresent = present;
+  g.phaseEndsAt = endsAt;
+  await saveG(gameId, g);
+
+  io.to(`game:${gameId}`).emit('phase_change', {
+    phase: step.phase, endsAt, duration: d, round: g.round,
+    players: publicPlayers(g.players), log: g.log,
+    present, stepNoun: step.noun,
+  });
+
+  if (timers.has(gameId)) clearTimeout(timers.get(gameId));
+  timers.set(gameId, setTimeout(() => withLock(gameId, () => endNightStep(gameId, idx)), d * 1000));
+}
+
+// bosqichni yakunlab keyingisiga o'tadi (vaqt tugaganda yoki rol harakat qilganda)
+async function endNightStep(gameId, idx) {
+  const g = await getG(gameId);
+  if (!g || g.status === 'finished') return;
+  if (g.nightStep !== idx) return; // allaqachon o'tib bo'lingan
+  if (timers.has(gameId)) { clearTimeout(timers.get(gameId)); timers.delete(gameId); }
+  await startNightStep(gameId, idx + 1);
 }
 
 async function recordStats(g, winner) {
@@ -1063,10 +1141,13 @@ io.on('connection', (socket) => {
             socket.emit('mafia_team', { mates: mafiaList });
           }
           if (g.phaseEndsAt && g.status === 'playing') {
+            const step = nightStepByPhase(g.phase);
             socket.emit('phase_change', {
               phase: g.phase, endsAt: g.phaseEndsAt,
-              duration: dur(g, g.phase) || 0, round: g.round,
-              players: publicPlayers(g.players)
+              duration: (step ? dur(g, step.dur) : dur(g, g.phase)) || 0, round: g.round,
+              players: publicPlayers(g.players),
+              present: step ? (g.nightPresent !== false) : undefined,
+              stepNoun: step ? step.noun : undefined,
             });
           }
           if (g.status === 'finished') {
@@ -1177,9 +1258,13 @@ io.on('connection', (socket) => {
   socket.on('night_action', ({ gameId, targetSocketId, actionType }) => withLock(gameId, async () => {
     try {
       const g = await getG(gameId);
-      if (!g || g.phase !== 'night') return;
+      if (!g) return;
+      const step = nightStepByPhase(g.phase);
+      if (!step) return; // hozir tungi harakat fazasi emas
       const player = g.players.find(p => p.socketId === socket.id);
       if (!player || !player.isAlive) return;
+      // faqat shu bosqich roli harakat qila oladi
+      if (!step.roles.includes(player.role)) { socket.emit('game_error', { message: '⏳ Hozir sizning navbatingiz emas' }); return; }
       if (!g.nightActions) g.nightActions = {};
       const na = g.nightActions;
       const target = g.players.find(p => p.socketId === targetSocketId);
@@ -1192,6 +1277,16 @@ io.on('connection', (socket) => {
           if (!na.mafiaVotes) na.mafiaVotes = {};
           na.mafiaVotes[socket.id] = targetSocketId;
           socket.emit('action_confirmed', { message: `🔫 Ovozingiz: ${target.username}` });
+          // mafiya sheriklarga joriy ovozlarni ko'rsatamiz (kelishish uchun)
+          const mafiaVotesView = {};
+          for (const m of g.players.filter(p => p.isAlive && sideOf(p.role) === 'mafia')) {
+            const tgtSid = na.mafiaVotes[m.socketId];
+            const tgt = tgtSid ? g.players.find(p => p.socketId === tgtSid) : null;
+            mafiaVotesView[m.username] = tgt ? tgt.username : null;
+          }
+          for (const m of g.players.filter(p => p.isAlive && sideOf(p.role) === 'mafia')) {
+            io.to(m.socketId).emit('mafia_vote_update', { votes: mafiaVotesView });
+          }
           break;
         }
         case 'komissar': {
@@ -1244,9 +1339,9 @@ io.on('connection', (socket) => {
       }
 
       await saveG(gameId, g);
-      if (allNightActionsDone(g)) {
-        if (timers.has(gameId)) clearTimeout(timers.get(gameId));
-        onPhaseEnd(gameId, 'night');
+      // bosqich tugagan bo'lsa (rol harakat qildi / mafiya kelishdi) — keyingisiga o'tamiz
+      if (nightStepComplete(g, step)) {
+        await endNightStep(gameId, g.nightStep);
       }
     } catch (e) { console.error('night_action:', e); }
   }));

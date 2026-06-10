@@ -71,6 +71,18 @@ const limitAuth = rateLimiter({ windowMs: 60000, max: 40, message: 'Juda ko\'p u
 const limitGlobal = rateLimiter({ windowMs: 60000, max: 1000 }); // umumiy xavfsizlik to'ri (IP)
 const limitByUser = (max) => rateLimiter({ windowMs: 60000, max, keyFn: (req) => 'u:' + (req.user?.userId || clientIp(req)) });
 
+// yangi akkaunt yaratish tezligi — bitta IP'dan soatiga (faqat ishonchli ommaviy IP)
+const signupHits = new Map();
+setInterval(() => { const now = Date.now(); for (const [k, v] of signupHits) if (now > v.resetAt) signupHits.delete(k); }, 3600000).unref?.();
+function signupAllowed(ip, max) {
+  if (!isPublicIp(ip)) return true; // proxy/local — IP'ga ishonmaymiz, bu yerda cheklamaymiz
+  const now = Date.now();
+  let h = signupHits.get(ip);
+  if (!h || now > h.resetAt) { h = { count: 0, resetAt: now + 3600000 }; signupHits.set(ip, h); }
+  h.count++;
+  return h.count <= max;
+}
+
 const prisma = new PrismaClient();
 const redis = new Redis({
   host: process.env.REDIS_HOST || 'localhost',
@@ -104,6 +116,8 @@ const DEFAULT_SETTINGS = {
   defaultRoles: { sheriffCount: 1, doctorCount: 1, mafiaRatio: 0.3 },
   minPlayers: 3,
   maxRooms: 50,
+  allowPasswordAuth: false,   // parol bilan register/login o'chiq — faqat Google (anti-bot)
+  maxSignupsPerIpHour: 8,     // bir IP'dan soatiga yangi akkaunt chegarasi (proxy bo'lmasa)
 };
 
 async function getSettings() {
@@ -180,6 +194,8 @@ async function adminMiddleware(req, res, next) {
 
 app.post('/api/register', limitAuth, async (req, res) => {
   try {
+    const s = await getSettings();
+    if (!s.allowPasswordAuth) return res.status(403).json({ error: 'Ro\'yxatdan o\'tish faqat Google orqali' });
     let { username, password } = req.body;
     username = (username || '').trim();
     if (username.length < 2) return res.status(400).json({ error: 'Username kamida 2 belgi' });
@@ -209,6 +225,8 @@ app.post('/api/register', limitAuth, async (req, res) => {
 
 app.post('/api/login', limitAuth, async (req, res) => {
   try {
+    const s = await getSettings();
+    if (!s.allowPasswordAuth) return res.status(403).json({ error: 'Kirish faqat Google orqali' });
     let { username, password } = req.body;
     username = (username || '').trim();
     const user = await prisma.user.findUnique({ where: { username } });
@@ -271,6 +289,11 @@ app.post('/api/auth/google', limitAuth, async (req, res) => {
         data: { avatar: picture, lastSeen: new Date() }
       });
     } else {
+      // yangi akkaunt — bitta IP'dan soatiga ortiqcha akkaunt ochishni cheklaymiz (proxy bo'lmasa)
+      const s = await getSettings();
+      if (!signupAllowed(clientIp(req), s.maxSignupsPerIpHour || 8)) {
+        return res.status(429).json({ error: 'Bu qurilmadan juda ko\'p yangi akkaunt. Keyinroq urinib ko\'ring.' });
+      }
       const userCount = await prisma.user.count();
       const username = await uniqueUsername(fullName.replace(/\s+/g, '') || email.split('@')[0]);
       const randomPass = await bcrypt.hash(Math.random().toString(36) + Date.now(), 8);
@@ -1688,8 +1711,10 @@ io.on('connection', (socket) => {
   socket.on('join_game', ({ gameId, userId, username }) => withLock(gameId, async () => {
     try {
       if (!guard(socket, 'join', 10, 5000)) return;
-      // tokendan ishonchli identifikatsiya (boshqa odam nomidan kirishni oldini oladi)
-      if (socket.data.auth) { userId = socket.data.auth.userId; username = socket.data.auth.username; }
+      // faqat haqiqiy (Google-tasdiqlangan) foydalanuvchilar — anonim/guest flood yo'q
+      if (!socket.data.auth) { socket.emit('game_error', { message: 'Avtorizatsiya kerak — qaytadan kiring' }); return; }
+      userId = socket.data.auth.userId;
+      username = socket.data.auth.username;
       // bloklangan foydalanuvchini tekshirish
       if (userId && !String(userId).startsWith('guest-')) {
         const u = await prisma.user.findUnique({ where: { id: userId } }).catch(() => null);

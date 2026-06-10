@@ -3,8 +3,8 @@
 // (javob bermasa) — pm2 buni sezmaydi (faqat crash'ni sezadi), shuning uchun
 // biz uni avtomatik restart qilamiz. Bu process juda yengil (~10MB).
 
-const http = require('http');
-const { exec } = require('child_process');
+import http from 'http';
+import { exec } from 'child_process';
 
 const URL = process.env.WATCH_URL || 'http://localhost:4100/health';
 const APP = process.env.WATCH_APP || 'mafia-backend';

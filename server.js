@@ -13,6 +13,8 @@ import crypto from 'crypto';
 dotenv.config();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'mafia-dev-secret';
+// maxfiy admin kalit — admin panel/API'ni yashiradi. .env'da bo'ladi (repoда yo'q).
+const ADMIN_ACCESS_KEY = process.env.ADMIN_ACCESS_KEY || '';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '1012676002382-21keol37nklhi22reit714nkgjb58dgm.apps.googleusercontent.com';
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
@@ -94,6 +96,20 @@ app.use(cors());
 app.use(express.json({ limit: '800kb' })); // avatar (base64) sig'adi, lekin ulkan payload floodini cheklaydi
 app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); next(); });
 app.use(limitGlobal); // umumiy IP xavfsizlik to'ri (saxiy — CGNAT'ni hisobga olib)
+
+// 🕵️ Admin panelni yashirish: maxfiy kalitsiz BARCHA /api/admin/* — 404 (mavjud emasdek).
+// Kalit .env'da (ADMIN_ACCESS_KEY); repoда yo'q. Login parolдан oldingi qatlam.
+function adminGate(req, res, next) {
+  if (req.method === 'OPTIONS') return next(); // CORS preflight
+  if (!ADMIN_ACCESS_KEY) return next(); // kalit o'rnatilmagan — eski xatti-harakat (ogohlantirish)
+  if (req.headers['x-admin-key'] !== ADMIN_ACCESS_KEY) {
+    return res.status(404).json({ error: 'Not found' }); // mavjudligini oshkor qilmaymiz
+  }
+  next();
+}
+app.use('/api/admin', adminGate);
+// kalit to'g'riligini tekshirish (frontend panel uchun; auth talab qilmaydi, faqat kalit)
+app.get('/api/admin/ping', (_, res) => res.json({ ok: true }));
 
 // ==================== SETTINGS ====================
 
@@ -475,6 +491,23 @@ app.get('/api/leaderboard', async (_, res) => {
 
 app.get('/health', (_, res) => res.json({ status: 'ok' }));
 
+// 🟢 Presence (live users) — har qurilma 15s'da bir marta "men shu yerdaman" deydi.
+// Auth qilganlar va qilmaganlar alohida hisoblanadi (qurilma ID bo'yicha).
+app.post('/api/presence', async (req, res) => {
+  try {
+    const deviceId = req.headers['x-device-id'];
+    if (!deviceId) return res.json({ ok: true });
+    let authed = false;
+    const h = req.headers.authorization || '';
+    const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+    if (token) { try { jwt.verify(token, JWT_SECRET); authed = true; } catch {} }
+    const now = Date.now();
+    if (authed) { await redis.zadd('presence:auth', now, deviceId); await redis.zrem('presence:anon', deviceId); }
+    else { await redis.zadd('presence:anon', now, deviceId); await redis.zrem('presence:auth', deviceId); }
+    res.json({ ok: true });
+  } catch { res.json({ ok: true }); }
+});
+
 // hydrate: redis yo'q bo'lsa postgres dan tiklash (faqat waiting xonalar uchun)
 async function getG(gameId) {
   const r = await redis.get(`game:${gameId}`);
@@ -675,6 +708,20 @@ app.get('/api/games/:id', async (req, res) => {
 });
 
 // ==================== ADMIN ROUTES ====================
+
+// 🟢 hozir saytда turgan qurilmalar soni (auth qilgan / qilmagan alohida)
+app.get('/api/admin/live', authMiddleware, adminMiddleware, async (_, res) => {
+  try {
+    const cut = Date.now() - 30000; // oxirgi 30s ichida "ko'ringan" qurilmalar = onlayn
+    await redis.zremrangebyscore('presence:auth', '-inf', cut).catch(() => {});
+    await redis.zremrangebyscore('presence:anon', '-inf', cut).catch(() => {});
+    const [authed, anon] = await Promise.all([
+      redis.zcard('presence:auth').catch(() => 0),
+      redis.zcard('presence:anon').catch(() => 0),
+    ]);
+    res.json({ authed, anon, total: authed + anon });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 app.get('/api/admin/stats', authMiddleware, adminMiddleware, async (_, res) => {
   try {

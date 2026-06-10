@@ -299,6 +299,7 @@ app.post('/api/shop/buy', authMiddleware, async (req, res) => {
       where: { id: u.id },
       data: { coins: { decrement: price }, items }
     });
+    await logActivity(u.id, 'shop_buy', { item, amount: -price, detail: `Do'kondan ${item} sotib olindi` });
     res.json({ ok: true, coins: updated.coins, items: normItems(updated.items) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -316,6 +317,7 @@ app.post('/api/daily-bonus', authMiddleware, async (req, res) => {
       where: { id: u.id },
       data: { coins: { increment: ECONOMY.dailyBonus }, lastBonusAt: new Date() }
     });
+    await logActivity(u.id, 'coin_bonus', { amount: ECONOMY.dailyBonus, detail: 'Kunlik bonus' });
     res.json({ ok: true, coins: updated.coins, bonus: ECONOMY.dailyBonus });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -632,7 +634,45 @@ app.post('/api/admin/users/:id/give', authMiddleware, adminMiddleware, async (re
     if (!Number.isFinite(n) || n === 0) return res.status(400).json({ error: 'Miqdor noto\'g\'ri' });
     const items = await adjustUserItems(req.params.id, { [item]: n });
     if (!items) return res.status(404).json({ error: 'Topilmadi' });
+    await logActivity(req.params.id, 'admin_grant', { item, amount: n, detail: `Admin ${n > 0 ? 'berdi' : 'oldi'}: ${item} ${Math.abs(n)}` });
     res.json({ id: req.params.id, items });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 👤 bitta foydalanuvchining TO'LIQ ma'lumoti (admin batafsil sahifasi)
+app.get('/api/admin/users/:id', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const u = await prisma.user.findUnique({ where: { id: req.params.id }, include: { stats: true } });
+    if (!u) return res.status(404).json({ error: 'Topilmadi' });
+    const [activities, history] = await Promise.all([
+      prisma.activity.findMany({ where: { userId: u.id }, orderBy: { createdAt: 'desc' }, take: 100 }),
+      prisma.gameHistory.findMany({ where: { userId: u.id }, orderBy: { createdAt: 'desc' }, take: 30 }),
+    ]);
+    // qisqa xulosa: item bo'yicha sotib olish/ishlatish/admin, tanga kirim/chiqim
+    const summary = {
+      coinsEarned: 0, coinsSpent: 0,
+      bought: { shield: 0, lupa: 0, life: 0 },
+      used: { shield: 0, lupa: 0, life: 0 },
+      granted: { shield: 0, lupa: 0, life: 0 },
+    };
+    for (const a of activities) {
+      if (a.amount > 0 && (a.type === 'coin_earn' || a.type === 'coin_bonus')) summary.coinsEarned += a.amount;
+      if (a.type === 'shop_buy') { summary.coinsSpent += Math.abs(a.amount); if (a.item && summary.bought[a.item] != null) summary.bought[a.item]++; }
+      if (a.type === 'item_use' && a.item && summary.used[a.item] != null) summary.used[a.item]++;
+      if (a.type === 'admin_grant' && a.item && summary.granted[a.item] != null) summary.granted[a.item] += a.amount;
+    }
+    const overrides = (await redis.hgetall('roomlimits').catch(() => ({}))) || {};
+    res.json({
+      id: u.id, username: u.username, email: u.email, avatar: u.avatar || null,
+      isAdmin: u.isAdmin, isBanned: u.isBanned, createdAt: u.createdAt, lastSeen: u.lastSeen,
+      coins: u.coins ?? 0, lastBonusAt: u.lastBonusAt,
+      items: normItems(u.items),
+      roomLimit: overrides[u.id] != null ? parseInt(overrides[u.id]) : null,
+      stats: u.stats || { gamesPlayed: 0, gamesWon: 0, winRate: 0, rating: 1000 },
+      summary,
+      activities: activities.map(a => ({ type: a.type, item: a.item, amount: a.amount, detail: a.detail, gameId: a.gameId, createdAt: a.createdAt })),
+      history: history.map(h => ({ role: h.role, won: h.won, winner: h.winner, coins: h.coins, createdAt: h.createdAt })),
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -644,9 +684,15 @@ app.delete('/api/admin/users/:id', authMiddleware, adminMiddleware, async (req, 
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/admin/games', authMiddleware, adminMiddleware, async (_, res) => {
+app.get('/api/admin/games', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const games = await prisma.game.findMany({ orderBy: { createdAt: 'desc' }, take: 100 });
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(5, parseInt(req.query.limit) || 20));
+    const statusFilter = ['waiting', 'playing', 'finished'].includes(req.query.status) ? req.query.status : null;
+    const where = statusFilter ? { status: statusFilter } : {};
+
+    const total = await prisma.game.count({ where });
+    const games = await prisma.game.findMany({ where, orderBy: { createdAt: 'desc' }, skip: (page - 1) * limit, take: limit });
     const enriched = await Promise.all(games.map(async g => {
       const raw = await redis.get(`game:${g.id}`);
       const state = raw ? JSON.parse(raw) : null;
@@ -656,7 +702,7 @@ app.get('/api/admin/games', authMiddleware, adminMiddleware, async (_, res) => {
         hasState: !!state, livePlayers: state?.players?.length || 0, phase: state?.phase || null
       };
     }));
-    res.json(enriched);
+    res.json({ total, page, limit, pages: Math.max(1, Math.ceil(total / limit)), games: enriched });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -834,6 +880,16 @@ function normItems(it) {
   if (it) for (const k of ITEM_KEYS) out[k] = Math.max(0, parseInt(it[k]) || 0);
   return out;
 }
+// foydalanuvchi faoliyatini jurnalga yozadi (admin batafsil sahifasi uchun)
+async function logActivity(userId, type, data = {}) {
+  if (!userId || String(userId).startsWith('guest-')) return;
+  try {
+    await prisma.activity.create({
+      data: { userId, type, item: data.item || null, amount: data.amount || 0, detail: data.detail || null, gameId: data.gameId || null }
+    });
+  } catch {}
+}
+
 async function loadUserItems(userId) {
   if (!userId || String(userId).startsWith('guest-')) return { shield: 0, lupa: 0, life: 0 };
   const u = await prisma.user.findUnique({ where: { id: userId }, select: { items: true } }).catch(() => null);
@@ -1280,6 +1336,7 @@ async function recordStats(g, winner) {
       await prisma.gameHistory.create({
         data: { userId: p.userId, gameId: g.id, role: p.role || 'civil', won, winner: winner || '', coins: reward }
       });
+      await logActivity(p.userId, 'coin_earn', { amount: reward, gameId: g.id, detail: `${won ? 'G\'alaba' : 'Mag\'lubiyat'} — ${roleName(p.role)}` });
       // tirik klientga yangi tanga balansini yuboramiz
       const fresh = await prisma.user.findUnique({ where: { id: p.userId }, select: { coins: true } }).catch(() => null);
       if (fresh && p.socketId) io.to(p.socketId).emit('coins_update', { coins: fresh.coins, reward });
@@ -1580,12 +1637,14 @@ io.on('connection', (socket) => {
         p.items.shield--;
         p.shieldActive = true;
         await adjustUserItems(p.userId, { shield: -1 });
+        await logActivity(p.userId, 'item_use', { item: 'shield', amount: -1, gameId, detail: `${g.round}-kechada qalqon yoqildi` });
         socket.emit('item_result', { item, ok: true, message: '🛡️ Qalqon yoqildi — bu kecha mafiyadan himoyalangansiz' });
       } else if (item === 'lupa') {
         const t = g.players.find(x => x.socketId === targetSocketId);
         if (!t) { socket.emit('item_result', { item, ok: false, message: '❌ Avval o\'yinchini tanlang' }); return; }
         p.items.lupa--;
         await adjustUserItems(p.userId, { lupa: -1 });
+        await logActivity(p.userId, 'item_use', { item: 'lupa', amount: -1, gameId, detail: `${t.username} tekshirildi — ${roleName(t.role)}` });
         socket.emit('item_result', { item, ok: true, target: t.username, role: t.role, message: `🔍 ${t.username} → ${roleName(t.role)}` });
       } else {
         socket.emit('item_result', { item, ok: false, message: 'Bu buyum avtomatik ishlaydi' });

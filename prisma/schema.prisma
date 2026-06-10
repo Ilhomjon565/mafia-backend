@@ -24,7 +24,21 @@ model User {
   games       GamePlayer[]
   stats       UserStats?
   history     GameHistory[]
+  activities  Activity[]
   @@index([email])
+}
+
+model Activity {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String   // coin_earn | coin_bonus | shop_buy | item_use | admin_grant
+  item      String?  // shield | lupa | life (item bilan bog'liq bo'lsa)
+  amount    Int      @default(0) // tanga yoki item miqdori (delta)
+  detail    String?  // qo'shimcha izoh
+  gameId    String?
+  createdAt DateTime @default(now())
+  @@index([userId])
 }
 
 model GameHistory {

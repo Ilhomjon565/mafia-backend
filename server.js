@@ -99,8 +99,10 @@ function authMiddleware(req, res, next) {
 }
 
 async function adminMiddleware(req, res, next) {
-  if (!req.user?.isAdmin) return res.status(403).json({ error: 'Faqat admin' });
-  // double-check in DB (token could be stale)
+  if (!req.user?.userId) return res.status(401).json({ error: 'Avtorizatsiya kerak' });
+  // DB — admin huquqining HAQIQIY manbasi. Token eskirgan bo'lishi mumkin
+  // (foydalanuvchi hozirgina admin qilingan yoki adminlikdan olingan bo'lishi mumkin),
+  // shuning uchun tokenga emas, bazadagi joriy qiymatga tayanamiz.
   const u = await prisma.user.findUnique({ where: { id: req.user.userId } });
   if (!u?.isAdmin) return res.status(403).json({ error: 'Faqat admin' });
   next();
@@ -665,6 +667,15 @@ function checkWin(g) {
   return null;
 }
 
+// o'lim sababiga qarab kim o'ldirgani yorlig'i (tong e'lonida ko'rsatiladi)
+const KILLER_LABEL = {
+  mafia:    '🔫 Mafiya',
+  killer:   '🔪 Qotil',
+  komissar: '🕵🏻‍♂️ Komissar',
+  afsungar: '🧞‍♂️ Afsungar',
+};
+function killerLabel(cause) { return KILLER_LABEL[cause] || 'Kimdir'; }
+
 // ochiq voqealar jurnali — hamma tungi/kunduzgi harakatlarni ko'radi
 function logEvent(g, icon, text) {
   if (!g.log) g.log = [];
@@ -800,6 +811,14 @@ async function startPhase(gameId, phase) {
     phase, endsAt, duration: d, round: g.round, players: publicPlayers(g.players), log: g.log
   });
 
+  // kunduz boshlandi — komissarning kechagi tekshiruv natijasini endi yuboramiz
+  if (phase === 'day_discussion' && g.nightCheck) {
+    const recipients = g.players.filter(p => p.isAlive && (p.role === 'komissar' || p.role === 'sergeant'));
+    for (const r of recipients) io.to(r.socketId).emit('sheriff_result', g.nightCheck);
+    delete g.nightCheck;
+    await saveG(gameId, g);
+  }
+
   if (timers.has(gameId)) clearTimeout(timers.get(gameId));
   timers.set(gameId, setTimeout(() => onPhaseEnd(gameId, phase), d * 1000));
 }
@@ -929,10 +948,10 @@ async function processNight(gameId) {
         logEvent(g, '🔫', `Komissar ${t.username}ga o'q uzdi`);
       } else {
         const seenMafia = sideOf(t.role) === 'mafia' && lawyerProtect !== t.socketId;
-        if (kom) { kom.roleData = kom.roleData || {}; kom.roleData.checked = true; io.to(kom.socketId).emit('sheriff_result', { username: t.username, isMafia: seenMafia }); }
-        const sgt = g.players.find(p => p.isAlive && p.role === 'sergeant');
-        if (sgt) io.to(sgt.socketId).emit('sheriff_result', { username: t.username, isMafia: seenMafia });
-        logEvent(g, '🔵', `Komissar ${t.username}ni tekshirdi`);
+        if (kom) { kom.roleData = kom.roleData || {}; kom.roleData.checked = true; }
+        // natija KUNDUZI (day_discussion boshlanganda) komissar/serjantga yuboriladi
+        g.nightCheck = { username: t.username, isMafia: seenMafia };
+        logEvent(g, '🔵', `Komissar kimnidir tekshirdi`);
       }
     }
   }
@@ -945,7 +964,8 @@ async function processNight(gameId) {
   if (na.daydi && notBlocked(na.daydi.by)) logEvent(g, '🧙‍♂️', `Daydi ${nameOf(na.daydi.target)} oldiga bordi`);
 
   // ===== O'limlarni hal qilamiz =====
-  const killedNames = [], savedNames = [], processed = new Set();
+  // killed: { name, cause } — tongda "kim kimni o'ldirgani" e'lon qilinadi
+  const killed = [], killedNames = [], savedNames = [], processed = new Set();
   for (const d of deaths) {
     const t = aliveT(d.sid);
     if (!t || processed.has(t.socketId)) continue;
@@ -965,8 +985,9 @@ async function processNight(gameId) {
       // qotil → o'ladi (pastda)
     }
     // o'ldi
-    t.isAlive = false; processed.add(t.socketId); killedNames.push(t.username);
-    logEvent(g, '💀', `${t.username} o'ldirildi — u ${roleName(t.role)} edi`);
+    t.isAlive = false; processed.add(t.socketId);
+    killedNames.push(t.username); killed.push({ name: t.username, cause: d.cause });
+    logEvent(g, '💀', `${killerLabel(d.cause)} ${t.username}ni o'ldirdi — u ${roleName(t.role)} edi`);
     // 🧞‍♂️ Afsungar — o'ldirgan o'yinchini o'zi bilan olib ketadi
     if (t.role === 'afsungar') {
       let revengeSid = null;
@@ -974,7 +995,7 @@ async function processNight(gameId) {
       else if (d.cause === 'komissar') revengeSid = na.komissar?.by;
       else if (d.cause === 'mafia') { const don = g.players.find(p => p.isAlive && p.role === 'don') || g.players.find(p => p.isAlive && sideOf(p.role) === 'mafia'); revengeSid = don?.socketId; }
       const rv = aliveT(revengeSid);
-      if (rv) { rv.isAlive = false; processed.add(rv.socketId); killedNames.push(rv.username); logEvent(g, '🧞‍♂️', `Afsungar ${rv.username}ni o'zi bilan olib ketdi (${roleName(rv.role)})`); }
+      if (rv) { rv.isAlive = false; processed.add(rv.socketId); killedNames.push(rv.username); killed.push({ name: rv.username, cause: 'afsungar' }); logEvent(g, '🧞‍♂️', `Afsungar ${rv.username}ni o'zi bilan olib ketdi (${roleName(rv.role)})`); }
     }
   }
 
@@ -987,10 +1008,10 @@ async function processNight(gameId) {
   g.players.forEach(p => { p.shieldActive = false; });
 
   let msg;
-  if (killedNames.length) msg = `🌅 Kechasi ${killedNames.join(', ')} halok bo'ldi`;
+  if (killed.length) msg = '🌅 ' + killed.map(k => `${killerLabel(k.cause)} ${k.name}ni o'ldirdi`).join(' · ');
   else if (savedNames.length) msg = '🌅 Hujum bo\'ldi, lekin qutqarildi';
   else { msg = '🌅 Kecha tinch o\'tdi'; logEvent(g, '🕊️', 'Kecha tinch o\'tdi'); }
-  const result = { killed: killedNames[0] || null, killedAll: killedNames, saved: savedNames.length > 0 };
+  const result = { killed: killedNames[0] || null, killedAll: killedNames, killedInfo: killed, saved: savedNames.length > 0 };
 
   await saveG(gameId, g);
   const winner = checkWin(g);

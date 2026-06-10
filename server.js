@@ -16,10 +16,59 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '1012676002382-21keol37
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 const app = express();
+app.set('trust proxy', true); // cloudflared/nginx ortida — X-Forwarded-For ga ishonamiz
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
-  cors: { origin: '*', methods: ['GET', 'POST'] }
+  cors: { origin: '*', methods: ['GET', 'POST'] },
+  maxHttpBufferSize: 1e6,   // 1MB — katta socket xabar floodini cheklaydi
+  pingTimeout: 20000,
 });
+
+// ==================== HIMOYA: real IP + rate limiting ====================
+// Cloudflare/nginx ortidagi haqiqiy mijoz IP'si
+function clientIp(req) {
+  return req.headers['cf-connecting-ip']
+    || (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
+    || req.ip || req.socket?.remoteAddress || 'unknown';
+}
+// IP haqiqiy ommaviy IP'mi? (proxy/local bo'lsa — IP-cheklovga ishonmaymiz,
+// chunki real IP uzatilmagan bo'lsa hamma bitta IP bo'lib ko'rinib bloklanib qoladi)
+function isPublicIp(ip) {
+  if (!ip) return false;
+  ip = String(ip).replace('::ffff:', '');
+  if (ip === '127.0.0.1' || ip === '::1' || ip === 'unknown' || ip === '') return false;
+  if (/^10\./.test(ip) || /^192\.168\./.test(ip) || /^172\.(1[6-9]|2\d|3[01])\./.test(ip) || /^169\.254\./.test(ip)) return false;
+  return true;
+}
+// yengil, xotirada ishlaydigan fixed-window rate limiter (Redis/round-trip yo'q — tez)
+function rateLimiter({ windowMs, max, keyFn, message }) {
+  const hits = new Map();
+  const sweep = setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of hits) if (now > v.resetAt) hits.delete(k);
+  }, windowMs);
+  sweep.unref?.();
+  return (req, res, next) => {
+    const key = keyFn ? keyFn(req) : clientIp(req);
+    if (!key) return next();
+    // IP-asosli cheklov: IP ishonchsiz (proxy/local) bo'lsa o'tkazib yuboramiz —
+    // aks holda real IP uzatilmasa hamma bitta IP bo'lib bloklanib qolardi.
+    if (!keyFn && !isPublicIp(key)) return next();
+    const now = Date.now();
+    let h = hits.get(key);
+    if (!h || now > h.resetAt) { h = { count: 0, resetAt: now + windowMs }; hits.set(key, h); }
+    h.count++;
+    if (h.count > max) {
+      res.set('Retry-After', String(Math.ceil((h.resetAt - now) / 1000)));
+      return res.status(429).json({ error: message || 'Juda ko\'p so\'rov yubordingiz. Birozdan keyin urinib ko\'ring.' });
+    }
+    next();
+  };
+}
+// tez-tez ishlatiladigan limiterlar
+const limitAuth = rateLimiter({ windowMs: 60000, max: 40, message: 'Juda ko\'p urinish. Bir daqiqadan keyin urinib ko\'ring.' }); // login/register (IP)
+const limitGlobal = rateLimiter({ windowMs: 60000, max: 1000 }); // umumiy xavfsizlik to'ri (IP)
+const limitByUser = (max) => rateLimiter({ windowMs: 60000, max, keyFn: (req) => 'u:' + (req.user?.userId || clientIp(req)) });
 
 const prisma = new PrismaClient();
 const redis = new Redis({
@@ -29,7 +78,9 @@ const redis = new Redis({
 });
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '800kb' })); // avatar (base64) sig'adi, lekin ulkan payload floodini cheklaydi
+app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); next(); });
+app.use(limitGlobal); // umumiy IP xavfsizlik to'ri (saxiy — CGNAT'ni hisobga olib)
 
 // ==================== SETTINGS ====================
 
@@ -110,7 +161,7 @@ async function adminMiddleware(req, res, next) {
 
 // ==================== AUTH ROUTES ====================
 
-app.post('/api/register', async (req, res) => {
+app.post('/api/register', limitAuth, async (req, res) => {
   try {
     let { username, password } = req.body;
     username = (username || '').trim();
@@ -139,7 +190,7 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', limitAuth, async (req, res) => {
   try {
     let { username, password } = req.body;
     username = (username || '').trim();
@@ -172,7 +223,7 @@ async function uniqueUsername(base) {
   return `${candidate}${Date.now().toString().slice(-6)}`;
 }
 
-app.post('/api/auth/google', async (req, res) => {
+app.post('/api/auth/google', limitAuth, async (req, res) => {
   try {
     const { credential } = req.body;
     if (!credential) return res.status(400).json({ error: 'Google credential yo\'q' });
@@ -234,7 +285,7 @@ app.post('/api/auth/google', async (req, res) => {
 });
 
 // ALOHIDA ADMIN PANEL LOGIN (faqat admin huquqiga ega foydalanuvchilar)
-app.post('/api/admin/login', async (req, res) => {
+app.post('/api/admin/login', limitAuth, async (req, res) => {
   try {
     let { username, password } = req.body;
     username = (username || '').trim();
@@ -285,7 +336,7 @@ app.get('/api/me', authMiddleware, async (req, res) => {
 });
 
 // 🛒 do'kon — tangaga item sotib olish
-app.post('/api/shop/buy', authMiddleware, async (req, res) => {
+app.post('/api/shop/buy', authMiddleware, limitByUser(40), async (req, res) => {
   try {
     const { item } = req.body;
     if (!ITEM_KEYS.includes(item)) return res.status(400).json({ error: 'Noma\'lum buyum' });
@@ -305,7 +356,7 @@ app.post('/api/shop/buy', authMiddleware, async (req, res) => {
 });
 
 // 🎁 kunlik bonus — kuniga bir marta
-app.post('/api/daily-bonus', authMiddleware, async (req, res) => {
+app.post('/api/daily-bonus', authMiddleware, limitByUser(20), async (req, res) => {
   try {
     const u = await prisma.user.findUnique({ where: { id: req.user.userId } });
     if (!u) return res.status(404).json({ error: 'Topilmadi' });
@@ -334,7 +385,7 @@ app.get('/api/me/history', authMiddleware, async (req, res) => {
 });
 
 // 👤 profilni tahrirlash — nikname va rasm. Bo'sh nikname mumkin emas.
-app.put('/api/me/profile', authMiddleware, async (req, res) => {
+app.put('/api/me/profile', authMiddleware, limitByUser(15), async (req, res) => {
   try {
     let { username, avatar } = req.body;
     const data = {};
@@ -439,7 +490,7 @@ app.get('/api/games', async (_, res) => {
 });
 
 // yangi xona yaratish (ko'p xona ruxsat etilgan)
-app.post('/api/games', authMiddleware, async (req, res) => {
+app.post('/api/games', authMiddleware, limitByUser(30), async (req, res) => {
   try {
     const settings = await getSettings();
     const activeCount = await prisma.game.count({ where: { status: { in: ['waiting', 'playing'] } } });
@@ -492,7 +543,7 @@ app.post('/api/games', authMiddleware, async (req, res) => {
 });
 
 // 🤖 BOTLAR BILAN O'YIN — xona ochmasdan, barcha rollardan, tez o'yin
-app.post('/api/games/bots', authMiddleware, async (req, res) => {
+app.post('/api/games/bots', authMiddleware, limitByUser(30), async (req, res) => {
   try {
     const settings = await getSettings();
     const roleConfig = allRolesConfig();
@@ -1564,11 +1615,54 @@ async function findBotGameByHost(hostUsername) {
   return null;
 }
 
+// ==================== SOCKET HIMOYASI ====================
+const ipConns = new Map();           // ip -> ulanishlar soni
+const MAX_CONN_PER_IP = 30;          // saxiy (umumiy/CGNAT IP'lar uchun)
+function socketIp(socket) {
+  const h = socket.handshake.headers || {};
+  return h['cf-connecting-ip'] || (h['x-forwarded-for'] || '').split(',')[0].trim() || socket.handshake.address || 'unknown';
+}
+// har socket uchun: umumiy flood + event bo'yicha cheklov. Ruxsat bo'lsa true.
+function guard(socket, key, max, windowMs) {
+  const d = socket.data; const now = Date.now();
+  // umumiy flood (sekundiga) — chegaradan oshsa socketni uzamiz
+  // umumiy flood chegarasi — WebRTC ulanish portlashlarini (ICE) hisobga olib saxiy (200/s).
+  // Haqiqiy hujum minglab/s yuboradi; 200/s zaif serverга zarar bermaydi, ovoz setup'ni esa o'ldirmaydi.
+  const f = d.flood || (d.flood = { t: now, c: 0 });
+  if (now - f.t >= 1000) { f.t = now; f.c = 0; }
+  if (++f.c > 200) { try { socket.disconnect(true); } catch {} return false; }
+  // event bo'yicha (jim tashlanadi — amplifikatsiya bermaymiz)
+  const rl = d.rl || (d.rl = {});
+  let b = rl[key];
+  if (!b || now - b.t >= windowMs) { b = { t: now, c: 0 }; rl[key] = b; }
+  return ++b.c <= max;
+}
+
+// ulanishda: token (ixtiyoriy) tekshirish + IP bo'yicha ulanish chegarasi
+io.use((socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token;
+    if (token) { try { socket.data.auth = jwt.verify(token, JWT_SECRET); } catch {} }
+  } catch {}
+  const ip = socketIp(socket);
+  socket.data.ip = ip;
+  // IP-cheklov faqat ishonchli ommaviy IP'da (proxy/local bo'lsa hammani bloklamaymiz)
+  if (isPublicIp(ip)) {
+    const n = (ipConns.get(ip) || 0) + 1;
+    if (n > MAX_CONN_PER_IP) return next(new Error('too_many_connections'));
+    ipConns.set(ip, n);
+  }
+  next();
+});
+
 io.on('connection', (socket) => {
   console.log(`✅ ${socket.id}`);
 
   socket.on('join_game', ({ gameId, userId, username }) => withLock(gameId, async () => {
     try {
+      if (!guard(socket, 'join', 10, 5000)) return;
+      // tokendan ishonchli identifikatsiya (boshqa odam nomidan kirishni oldini oladi)
+      if (socket.data.auth) { userId = socket.data.auth.userId; username = socket.data.auth.username; }
       // bloklangan foydalanuvchini tekshirish
       if (userId && !String(userId).startsWith('guest-')) {
         const u = await prisma.user.findUnique({ where: { id: userId } }).catch(() => null);
@@ -1671,6 +1765,7 @@ io.on('connection', (socket) => {
 
   socket.on('start_game', ({ gameId }) => withLock(gameId, async () => {
     try {
+      if (!guard(socket, 'start', 5, 5000)) return;
       const g = await getG(gameId);
       if (!g) return;
       const settings = await getSettings();
@@ -1687,6 +1782,7 @@ io.on('connection', (socket) => {
 
   socket.on('day_vote', ({ gameId, targetSocketId }) => withLock(gameId, async () => {
     try {
+      if (!guard(socket, 'vote', 20, 5000)) return;
       const g = await getG(gameId);
       if (!g || g.phase !== 'day_discussion') return;
       const voter = g.players.find(p => p.socketId === socket.id);
@@ -1714,6 +1810,7 @@ io.on('connection', (socket) => {
 
   socket.on('night_action', ({ gameId, targetSocketId, actionType }) => withLock(gameId, async () => {
     try {
+      if (!guard(socket, 'night', 25, 5000)) return;
       const g = await getG(gameId);
       if (!g) return;
       const step = nightStepByPhase(g.phase);
@@ -1809,6 +1906,7 @@ io.on('connection', (socket) => {
 
   socket.on('use_item', ({ gameId, item, targetSocketId }) => withLock(gameId, async () => {
     try {
+      if (!guard(socket, 'item', 10, 5000)) return;
       const g = await getG(gameId);
       if (!g || g.status !== 'playing') return;
       const p = g.players.find(x => x.socketId === socket.id);
@@ -1840,6 +1938,7 @@ io.on('connection', (socket) => {
   }));
 
   socket.on('chat_message', async ({ gameId, message }) => {
+    if (!guard(socket, 'chat', 6, 5000)) return; // ~1.2 xabar/sekund
     const data = socketData.get(socket.id);
     if (!data) return;
     const text = String(message || '').trim().slice(0, 300);
@@ -1884,6 +1983,9 @@ io.on('connection', (socket) => {
   // ===== Do'st bot-o'yiniga qo'shilish so'rovi =====
   socket.on('request_join_bot', async ({ hostUsername, userId, username, avatar }) => {
     try {
+      if (!guard(socket, 'joinreq', 3, 30000)) return socket.emit('bot_join_error', { message: 'Juda tez-tez so\'rov yubordingiz' });
+      // tokendan ishonchli identifikatsiya
+      if (socket.data.auth) { userId = socket.data.auth.userId; username = socket.data.auth.username; }
       if (!hostUsername || !username) return socket.emit('bot_join_error', { message: 'Username kerak' });
       const found = await findBotGameByHost(String(hostUsername).trim());
       if (!found) return socket.emit('bot_join_error', { message: 'Bu foydalanuvchi hozir botlar bilan o\'ynamayapti' });
@@ -1906,6 +2008,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('join_response', async ({ requestId, accept }) => {
+    if (!guard(socket, 'joinresp', 10, 5000)) return;
     const req = pendingJoins.get(requestId);
     if (!req) return;
     pendingJoins.delete(requestId);
@@ -1946,6 +2049,7 @@ io.on('connection', (socket) => {
 
   // ===== Ovozli chat signaling =====
   socket.on('voice_join', ({ gameId }) => {
+    if (!guard(socket, 'vjoin', 5, 5000)) return;
     const set = voicePeers.get(gameId) || new Set();
     // qo'shiluvchiga mavjud ovozli o'yinchilar ro'yxatini yuboramiz (u ularga ulanadi)
     socket.emit('voice_peers', { peers: [...set] });
@@ -1956,17 +2060,22 @@ io.on('connection', (socket) => {
     voiceLeave(gameId, socket.id);
     socket.to(`game:${gameId}`).emit('voice_peer_leave', { socketId: socket.id });
   });
-  // SDP/ICE ni aniq bir o'yinchiga uzatish
+  // SDP/ICE ni aniq bir o'yinchiga uzatish (ICE ko'p bo'lishi mumkin — saxiy limit)
   socket.on('voice_signal', ({ to, data }) => {
+    if (!guard(socket, 'vsig', 600, 10000)) return; // ICE ko'p bo'lishi mumkin — saxiy
     io.to(to).emit('voice_signal', { from: socket.id, data });
   });
   // "gapiryapti" indikatori — faqat ruxsat etilgan tinglovchilarga
   socket.on('voice_talk', ({ to, on }) => {
+    if (!guard(socket, 'vtalk', 40, 5000)) return;
     if (Array.isArray(to)) for (const sid of to) io.to(sid).emit('voice_talk', { from: socket.id, on: !!on });
   });
 
   socket.on('disconnect', async () => {
     console.log(`❌ ${socket.id}`);
+    // IP ulanish hisobini kamaytiramiz (faqat hisoblangan ommaviy IP uchun)
+    const ip = socket.data?.ip;
+    if (ip && isPublicIp(ip)) { const n = (ipConns.get(ip) || 1) - 1; if (n <= 0) ipConns.delete(ip); else ipConns.set(ip, n); }
     const data = socketData.get(socket.id);
     socketData.delete(socket.id);
     // ovozli chatdan chiqaramiz
@@ -2010,6 +2119,42 @@ io.on('connection', (socket) => {
   });
 });
 
+// ==================== RESTART'DAN KEYIN TIKLASH ====================
+// Server qayta ishga tushganda xotiradagi taymerlar yo'qoladi — Redis'dagi
+// aktiv o'yinlarni topib, ularning fazasiga qarab taymerlarni qayta o'rnatamiz.
+// Shunda restart/crash bo'lsa ham ketayotgan o'yinlar muzlab qolmaydi.
+async function recoverTimers() {
+  try {
+    const keys = await redis.keys('game:*');
+    let recovered = 0;
+    for (const key of keys) {
+      const raw = await redis.get(key).catch(() => null);
+      if (!raw) continue;
+      let g; try { g = JSON.parse(raw); } catch { continue; }
+      if (!g || g.status !== 'playing' || !g.id) continue;
+      const gameId = g.id;
+      const remain = Math.max(0, (g.phaseEndsAt || 0) - Date.now());
+      const phase = g.phase;
+      const step = nightStepByPhase(phase);
+      const fire = () => {
+        if (step) return endNightStep(gameId, g.nightStep);
+        if (phase === 'day_discussion') return onPhaseEnd(gameId, 'day_discussion');
+        if (phase === 'day_results') return startNight(gameId);
+        if (phase === 'night_results') return startPhase(gameId, 'day_discussion');
+      };
+      if (timers.has(gameId)) clearTimeout(timers.get(gameId));
+      timers.set(gameId, setTimeout(() => withLock(gameId, fire), remain));
+      // botlar o'yini bo'lsa — joriy faza bot harakatlarini ham qayta rejalashtiramiz
+      if (g.vsBots) {
+        if (step) scheduleBotNightStep(gameId, g.nightStep);
+        else if (phase === 'day_discussion') scheduleBotDay(gameId, g);
+      }
+      recovered++;
+    }
+    if (recovered) console.log(`🔄 ${recovered} ta aktiv o'yin taymeri tiklandi`);
+  } catch (e) { console.error('recoverTimers:', e.message); }
+}
+
 // ==================== START ====================
 
 const PORT = process.env.PORT || 4000;
@@ -2021,6 +2166,7 @@ httpServer.listen(PORT, () => {
   🏠 Ko'p xona | 👑 Admin panel | 📊 Statistika
   Ready! 🎮
   `);
+  recoverTimers(); // restart'dan keyin ketayotgan o'yinlarni davom ettiramiz
 });
 
 process.on('SIGTERM', () => httpServer.close(() => { prisma.$disconnect(); redis.disconnect(); }));

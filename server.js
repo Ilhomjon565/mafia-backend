@@ -367,12 +367,23 @@ app.post('/api/games', authMiddleware, async (req, res) => {
       return res.status(429).json({ error: `Kuniga maksimum ${DAILY_LIMIT} ta xona yaratish mumkin. Mavjud xonaga qo'shiling.` });
     }
 
-    let { name, totalPlayers, mafiaCount, sheriffCount, doctorCount, isPrivate } = req.body;
+    let { name, totalPlayers, mafiaCount, sheriffCount, doctorCount, isPrivate, roles } = req.body;
     totalPlayers = Math.max(5, Math.min(20, parseInt(totalPlayers) || 8));
-    mafiaCount   = Math.max(1, Math.min(totalPlayers - 2, parseInt(mafiaCount) || Math.ceil(totalPlayers * settings.defaultRoles.mafiaRatio)));
-    sheriffCount = Math.max(0, parseInt(sheriffCount ?? settings.defaultRoles.sheriffCount));
-    doctorCount  = Math.max(0, parseInt(doctorCount ?? settings.defaultRoles.doctorCount));
-    const civilCount = Math.max(0, totalPlayers - mafiaCount - sheriffCount - doctorCount);
+
+    // host qo'lda rol tanlagan bo'lsa — tekshirib olamiz
+    const roleConfig = normalizeRoleConfig(roles, totalPlayers);
+
+    if (roleConfig) {
+      // DB ustunlari (lobby kartochkalarida ko'rsatish uchun) roleConfig'dan kelib chiqadi
+      mafiaCount   = SELECTABLE_ROLES.filter(r => sideOf(r) === 'mafia').reduce((a, r) => a + (roleConfig[r] || 0), 0);
+      doctorCount  = roleConfig.doctor || 0;
+      sheriffCount = roleConfig.komissar || 0;
+    } else {
+      mafiaCount   = Math.max(1, Math.min(totalPlayers - 2, parseInt(mafiaCount) || Math.ceil(totalPlayers * settings.defaultRoles.mafiaRatio)));
+      sheriffCount = Math.max(0, parseInt(sheriffCount ?? settings.defaultRoles.sheriffCount));
+      doctorCount  = Math.max(0, parseInt(doctorCount ?? settings.defaultRoles.doctorCount));
+    }
+    const civilCount = roleConfig ? (roleConfig.civil || 0) : Math.max(0, totalPlayers - mafiaCount - sheriffCount - doctorCount);
 
     const game = await prisma.game.create({
       data: {
@@ -383,7 +394,7 @@ app.post('/api/games', authMiddleware, async (req, res) => {
       }
     });
     const state = {
-      ...game, players: [], phase: 'waiting',
+      ...game, players: [], phase: 'waiting', roleConfig: roleConfig || null,
       dayVotes: {}, nightActions: {}, round: 0, durations: settings.durations, log: []
     };
     await saveG(game.id, state);
@@ -735,9 +746,42 @@ function buildRoleList(n) {
   return roles;
 }
 
-function assignRoles(players, _mafiaCount, _sheriffCount, _doctorCount) {
-  // rollar HAQIQIY o'yinchilar soniga qarab tuziladi
-  const roleList = buildRoleList(players.length);
+// host xona yaratganda qo'lda tanlay oladigan rollar (civil avtomatik to'ldiriladi)
+const SELECTABLE_ROLES = ['komissar', 'sergeant', 'doctor', 'escort', 'daydi', 'afsungar', 'don', 'mafia', 'advokat', 'qotil', 'bori'];
+
+// { role: count } ni tekshirib normalizatsiya qiladi. Yaroqsiz bo'lsa null.
+function normalizeRoleConfig(roles, total) {
+  if (!roles || typeof roles !== 'object') return null;
+  const cfg = {}; let sum = 0;
+  for (const r of SELECTABLE_ROLES) {
+    const c = Math.max(0, Math.min(total, parseInt(roles[r]) || 0));
+    if (c > 0) { cfg[r] = c; sum += c; }
+  }
+  if (sum === 0 || sum > total) return null;
+  const mafiaSide = SELECTABLE_ROLES.filter(r => sideOf(r) === 'mafia').reduce((a, r) => a + (cfg[r] || 0), 0);
+  if (mafiaSide < 1) return null;            // kamida 1 mafiya bo'lishi shart
+  if (mafiaSide >= total) return null;       // mafiya hammasi bo'lib qolmasin
+  cfg.civil = total - sum;                   // qolgani tinch aholi
+  return cfg;
+}
+
+function assignRoles(players, roleConfig) {
+  const n = players.length;
+  let roleList = null;
+  // host qo'lda rol tanlagan bo'lsa va maxsus rollar soniga sig'sa — o'shani ishlatamiz
+  if (roleConfig) {
+    const specials = [];
+    for (const [role, count] of Object.entries(roleConfig)) {
+      if (role === 'civil') continue;
+      for (let i = 0; i < count; i++) specials.push(role);
+    }
+    if (specials.length <= n) {
+      roleList = specials.slice();
+      while (roleList.length < n) roleList.push('civil');
+    }
+  }
+  // aks holda — o'yinchilar soniga qarab avto balans
+  if (!roleList) roleList = buildRoleList(n);
   // aralashtirish
   for (let i = roleList.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -836,6 +880,9 @@ async function onPhaseEnd(gameId, phase) {
       else if (cnt === maxV) tie = true;
     }
     if (tie) eliminated = null;
+    // "skip" (hech kim) eng ko'p ovoz olgan bo'lsa — hech kim chiqarilmaydi
+    const skipped = eliminated === 'skip';
+    if (skipped) eliminated = null;
 
     let msg, result = { eliminated: null, role: null };
     if (eliminated) {
@@ -854,6 +901,9 @@ async function onPhaseEnd(gameId, phase) {
           msg = `☀️ ${p.username} ovoz bilan o'ldirildi — ${roleName(p.role)}`;
           result = { eliminated: p.username, role: p.role };
           logEvent(g, '⚖️', `${p.username} ovoz bilan chiqarildi — u ${roleName(p.role)} edi`);
+          // 🗣️ Oxirgi so'z — chiqarilgan o'yinchi day_results davomida bitta ochiq xabar yozadi
+          g.lastWordSid = p.socketId;
+          io.to(p.socketId).emit('your_last_word', {});
           // 🧞‍♂️ Afsungar ovozда o'ldirilsa — o'zi bilan birovni olib ketadi
           if (p.role === 'afsungar') {
             const victims = g.players.filter(x => x.isAlive && x.socketId !== p.socketId);
@@ -867,8 +917,10 @@ async function onPhaseEnd(gameId, phase) {
         }
       }
     } else {
-      msg = tie ? '☀️ Ovozlar teng — hech kim o\'lmadi' : '☀️ Hech kim ovoz bermadi';
-      logEvent(g, '🤝', tie ? 'Ovozlar teng — hech kim chiqarilmadi' : 'Hech kim ovoz bermadi');
+      msg = skipped ? '☀️ Shahar hech kimni chiqarmaslikka qaror qildi'
+        : tie ? '☀️ Ovozlar teng — hech kim o\'lmadi'
+        : '☀️ Hech kim ovoz bermadi';
+      logEvent(g, '🤝', skipped ? 'Ovoz o\'tkazib yuborildi — hech kim chiqarilmadi' : tie ? 'Ovozlar teng — hech kim chiqarilmadi' : 'Hech kim ovoz bermadi');
     }
 
     g.dayVotes = {};
@@ -1032,6 +1084,7 @@ async function startNight(gameId) {
   if (!g || g.status === 'finished') return;
   g.nightActions = {};
   g.nightStep = -1;
+  delete g.lastWordSid;
   logEvent(g, '🌙', `${g.round}-kecha tushdi — shahar uxlaydi`);
   await saveG(gameId, g);
   await startNightStep(gameId, 0);
@@ -1234,7 +1287,7 @@ io.on('connection', (socket) => {
       if (g.hostId && starter && starter.userId !== g.hostId && !starter.isHost) {
         socket.emit('game_error', { message: 'Faqat xona egasi boshlay oladi' }); return;
       }
-      g.players = assignRoles(g.players, g.mafiaCount, g.sheriffCount, g.doctorCount);
+      g.players = assignRoles(g.players, g.roleConfig);
       g.status = 'playing';
       g.round = 0; g.nightActions = {}; g.dayVotes = {}; g.log = [];
       // har bir o'yinchining buyumlarini bazadan o'yin holatiga yuklaymiz
@@ -1260,6 +1313,11 @@ io.on('connection', (socket) => {
       if (!g || g.phase !== 'day_discussion') return;
       const voter = g.players.find(p => p.socketId === socket.id);
       if (!voter || !voter.isAlive) return;
+      // 'skip' = hech kimni chiqarmaslik. Aks holda — tirik o'yinchi bo'lishi shart.
+      if (targetSocketId !== 'skip') {
+        const tgt = g.players.find(p => p.socketId === targetSocketId);
+        if (!tgt || !tgt.isAlive) return;
+      }
       g.dayVotes[socket.id] = targetSocketId;
       await saveG(gameId, g);
 
@@ -1267,7 +1325,7 @@ io.on('connection', (socket) => {
       Object.values(g.dayVotes).forEach(t => { counts[t] = (counts[t] || 0) + 1; });
       const aliveCount = g.players.filter(p => p.isAlive).length;
       io.to(`game:${gameId}`).emit('vote_update', { counts, totalVoters: Object.keys(g.dayVotes).length, aliveCount });
-      socket.emit('action_confirmed', { message: '✅ Ovoz berildi' });
+      socket.emit('action_confirmed', { message: targetSocketId === 'skip' ? '⏭ O\'tkazib yuborildi' : '✅ Ovoz berildi' });
 
       if (Object.keys(g.dayVotes).length >= aliveCount) {
         if (timers.has(gameId)) clearTimeout(timers.get(gameId));
@@ -1405,10 +1463,38 @@ io.on('connection', (socket) => {
     const g = await getG(gameId);
     const player = g?.players.find(p => p.socketId === socket.id);
     if (!player) return;
-    // o'liklar faqat o'liklar bilan; tiriklar hammasi ko'radi (kechasi ham real-time chat)
-    io.to(`game:${gameId}`).emit('chat_message', {
-      username: data.username, message: text, isAlive: player.isAlive, timestamp: Date.now()
-    });
+
+    // 🗣️ Oxirgi so'z — chiqarilgan o'yinchi day_results davomida bitta OCHIQ xabar yozadi
+    if (g.lastWordSid && socket.id === g.lastWordSid && g.phase === 'day_results') {
+      delete g.lastWordSid;
+      await saveG(gameId, g);
+      io.to(`game:${gameId}`).emit('chat_message', {
+        username: data.username, message: text, channel: 'public', isAlive: false, lastWord: true, timestamp: Date.now()
+      });
+      return;
+    }
+
+    const isNight = String(g.phase || '').startsWith('night');
+    // KANALLAR: public (kunduzgi ochiq), mafia (tunda faqat mafiya), dead (o'liklar)
+    let channel;
+    if (!player.isAlive) channel = 'dead';
+    else if (isNight) {
+      if (sideOf(player.role) === 'mafia') channel = 'mafia';
+      else { socket.emit('game_error', { message: '🌙 Tunda faqat mafiya gaplasha oladi' }); return; }
+    } else channel = 'public';
+
+    const payload = { username: data.username, message: text, channel, isAlive: player.isAlive, timestamp: Date.now() };
+
+    if (channel === 'public') {
+      // hammaga (o'liklar ham ochiq muhokamani o'qiydi)
+      io.to(`game:${gameId}`).emit('chat_message', payload);
+    } else if (channel === 'mafia') {
+      // faqat tirik mafiya tomoni
+      for (const m of g.players.filter(p => p.isAlive && sideOf(p.role) === 'mafia')) io.to(m.socketId).emit('chat_message', payload);
+    } else {
+      // faqat o'liklar bir-biri bilan
+      for (const dpl of g.players.filter(p => !p.isAlive)) io.to(dpl.socketId).emit('chat_message', payload);
+    }
   });
 
   socket.on('disconnect', async () => {

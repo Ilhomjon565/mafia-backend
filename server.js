@@ -491,6 +491,51 @@ app.post('/api/games', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// 🤖 BOTLAR BILAN O'YIN — xona ochmasdan, barcha rollardan, tez o'yin
+app.post('/api/games/bots', authMiddleware, async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const roleConfig = allRolesConfig();
+    const totalPlayers = Object.values(roleConfig).reduce((a, c) => a + c, 0); // 12
+    const mafiaCount = SELECTABLE_ROLES.filter(r => sideOf(r) === 'mafia').reduce((a, r) => a + (roleConfig[r] || 0), 0);
+
+    const game = await prisma.game.create({
+      data: {
+        name: `🤖 ${req.user.username} — botlar`,
+        status: 'waiting', hostId: req.user.userId, isPrivate: true,
+        totalPlayers, maxPlayers: 20, minPlayers: 2,
+        mafiaCount, sheriffCount: roleConfig.komissar || 0, doctorCount: roleConfig.doctor || 0,
+        civilCount: roleConfig.civil || 0
+      }
+    });
+    // botlar (foydalanuvchi keyin socket orqali qo'shiladi)
+    const names = [...BOT_NAMES].sort(() => Math.random() - 0.5);
+    const bots = [];
+    for (let i = 0; i < totalPlayers - 1; i++) {
+      bots.push({
+        socketId: 'bot-' + i, userId: 'bot-' + game.id.slice(0, 4) + '-' + i,
+        username: '🤖 ' + (names[i] || ('Bot' + (i + 1))),
+        avatar: null, role: null, isAlive: true, connected: true, isHost: false, isBot: true, joinedAt: Date.now()
+      });
+    }
+    const state = {
+      ...game, players: bots, phase: 'waiting', roleConfig, vsBots: true,
+      dayVotes: {}, nightActions: {}, round: 0, durations: settings.durations, log: []
+    };
+    await saveG(game.id, state);
+    // zaxira: foydalanuvchi 60s ichida kirmasa (boshlanmasa) o'chiramiz
+    botDeleteTimers.set(game.id, setTimeout(async () => {
+      botDeleteTimers.delete(game.id);
+      const cur = await getG(game.id).catch(() => null);
+      if (cur && cur.status === 'waiting') {
+        await redis.del(`game:${game.id}`).catch(() => {});
+        await prisma.game.delete({ where: { id: game.id } }).catch(() => {});
+      }
+    }, 60000));
+    res.json({ id: game.id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // foydalanuvchining o'z xonalari (yopiqlar ham ko'rinadi)
 app.get('/api/my-games', authMiddleware, async (req, res) => {
   try {
@@ -882,7 +927,7 @@ function normItems(it) {
 }
 // foydalanuvchi faoliyatini jurnalga yozadi (admin batafsil sahifasi uchun)
 async function logActivity(userId, type, data = {}) {
-  if (!userId || String(userId).startsWith('guest-')) return;
+  if (!isRealUser(userId)) return;
   try {
     await prisma.activity.create({
       data: { userId, type, item: data.item || null, amount: data.amount || 0, detail: data.detail || null, gameId: data.gameId || null }
@@ -890,13 +935,17 @@ async function logActivity(userId, type, data = {}) {
   } catch {}
 }
 
+// haqiqiy (DB'dagi) foydalanuvchimi? guest va bot — yo'q
+function isRealUser(userId) {
+  return userId && !String(userId).startsWith('guest-') && !String(userId).startsWith('bot-');
+}
 async function loadUserItems(userId) {
-  if (!userId || String(userId).startsWith('guest-')) return { shield: 0, lupa: 0, life: 0 };
+  if (!isRealUser(userId)) return { shield: 0, lupa: 0, life: 0 };
   const u = await prisma.user.findUnique({ where: { id: userId }, select: { items: true } }).catch(() => null);
   return normItems(u?.items);
 }
 async function adjustUserItems(userId, deltas) {
-  if (!userId || String(userId).startsWith('guest-')) return null;
+  if (!isRealUser(userId)) return null;
   const u = await prisma.user.findUnique({ where: { id: userId }, select: { items: true } }).catch(() => null);
   if (!u) return null;
   const items = normItems(u.items);
@@ -1052,6 +1101,9 @@ async function startPhase(gameId, phase) {
 
   if (timers.has(gameId)) clearTimeout(timers.get(gameId));
   timers.set(gameId, setTimeout(() => onPhaseEnd(gameId, phase), d * 1000));
+
+  // BOTLAR REJIMI: kunduzi botlar 2–4.5s da ovoz beradi (foydalanuvchi ovoz berganda yakunlanadi)
+  if (g.vsBots && phase === 'day_discussion') scheduleBotDay(gameId, g);
 }
 
 async function onPhaseEnd(gameId, phase) {
@@ -1301,7 +1353,20 @@ async function startNightStep(gameId, idx) {
   });
 
   if (timers.has(gameId)) clearTimeout(timers.get(gameId));
-  timers.set(gameId, setTimeout(() => withLock(gameId, () => endNightStep(gameId, idx)), d * 1000));
+
+  if (g.vsBots) {
+    // BOTLAR REJIMI: botlar 2–4.5s da harakat qiladi.
+    // Agar bu bosqich roli foydalanuvchida bo'lsa — vaqt chegarasi yo'q (u bajarmaguncha kutamiz).
+    const actors = g.players.filter(p => p.isAlive && step.roles.includes(p.role));
+    const humanActor = present && actors.some(p => !isBot(p));
+    if (present) scheduleBotNightStep(gameId, idx);
+    if (!humanActor) {
+      const fb = present ? 7000 : (d * 1000); // bot-only/rolsiz: qisqa zaxira taymer
+      timers.set(gameId, setTimeout(() => withLock(gameId, () => endNightStep(gameId, idx)), fb));
+    }
+  } else {
+    timers.set(gameId, setTimeout(() => withLock(gameId, () => endNightStep(gameId, idx)), d * 1000));
+  }
 }
 
 // bosqichni yakunlab keyingisiga o'tadi (vaqt tugaganda yoki rol harakat qilganda)
@@ -1313,9 +1378,107 @@ async function endNightStep(gameId, idx) {
   await startNightStep(gameId, idx + 1);
 }
 
+// ==================== BOTLAR BILAN O'YIN ====================
+const BOT_NAMES = ['Aziz', 'Bobur', 'Davron', 'Eldor', 'Farrux', 'Gulnoza', 'Hasan', 'Jasur', 'Kamol', 'Laziz', 'Madina', 'Nodira', 'Olim', 'Sardor', 'Umid', 'Zafar', 'Shoxrux', 'Dilshod'];
+const botDeleteTimers = new Map();
+function isBot(p) { return p && p.isBot === true; }
+function botDelayMs() { return 2000 + Math.floor(Math.random() * 2500); } // 2.0–4.5s
+function pickRandom(arr) { return arr.length ? arr[Math.floor(Math.random() * arr.length)] : null; }
+
+// barcha rollardan bittadan (botlar bilan o'ynash) — 11 maxsus + 1 civil = 12 o'yinchi
+function allRolesConfig() {
+  const cfg = {};
+  for (const r of SELECTABLE_ROLES) cfg[r] = 1;
+  cfg.civil = 1;
+  return cfg;
+}
+
+// o'yinni boshlash (start_game va botlar avto-boshlash uchun umumiy)
+async function beginGame(gameId) {
+  const g = await getG(gameId);
+  if (!g || g.status !== 'waiting') return;
+  cancelEmptyCheck(gameId);
+  g.players = assignRoles(g.players, g.roleConfig);
+  g.status = 'playing';
+  g.round = 0; g.nightActions = {}; g.dayVotes = {}; g.log = [];
+  for (const p of g.players) { p.items = await loadUserItems(p.userId); p.shieldActive = false; }
+  logEvent(g, '🎭', 'O\'yin boshlandi — rollar tarqatildi');
+  await saveG(gameId, g);
+  prisma.game.update({ where: { id: gameId }, data: { status: 'playing', startedAt: new Date() } }).catch(() => {});
+  const mafiaList = g.players.filter(p => sideOf(p.role) === 'mafia').map(p => ({ socketId: p.socketId, username: p.username, role: p.role }));
+  g.players.forEach(p => {
+    if (isBot(p)) return; // botlarga socket xabari yuborilmaydi
+    io.to(p.socketId).emit('your_role', { role: p.role });
+    io.to(p.socketId).emit('your_items', { items: p.items });
+    if (sideOf(p.role) === 'mafia') io.to(p.socketId).emit('mafia_team', { mates: mafiaList });
+  });
+  io.to(`game:${gameId}`).emit('game_starting', {});
+  setTimeout(() => startPhase(gameId, 'day_discussion'), 5000);
+}
+
+// tungi bosqichda botlar harakatini rejalashtiradi (2–4.5s kechikish bilan)
+function scheduleBotNightStep(gameId, idx) {
+  setTimeout(() => withLock(gameId, () => runBotNightStep(gameId, idx)), botDelayMs());
+}
+async function runBotNightStep(gameId, idx) {
+  const g = await getG(gameId);
+  if (!g || g.status === 'finished' || g.nightStep !== idx) return;
+  const step = NIGHT_STEPS[idx];
+  const na = g.nightActions = g.nightActions || {};
+  const alive = g.players.filter(p => p.isAlive);
+  const actors = alive.filter(p => step.roles.includes(p.role));
+  const botActors = actors.filter(isBot);
+  const humanActor = actors.some(p => !isBot(p));
+
+  if (step.phase === 'night_mafia') {
+    if (humanActor) return; // human mafia — botlar uni kutadi (u ovoz berganda nusxalanadi)
+    const targets = alive.filter(p => sideOf(p.role) !== 'mafia');
+    const t = pickRandom(targets);
+    if (t) { na.mafiaVotes = na.mafiaVotes || {}; for (const b of botActors) na.mafiaVotes[b.socketId] = t.socketId; }
+  } else {
+    const bot = botActors[0];
+    if (humanActor || !bot) return; // user navbati — kutamiz
+    const others = alive.filter(p => p.socketId !== bot.socketId);
+    switch (bot.role) {
+      case 'komissar': { const t = pickRandom(others); if (t) na.komissar = { by: bot.socketId, type: 'check', target: t.socketId }; break; }
+      case 'doctor':   { const t = pickRandom(alive); if (t) na.doctor = { by: bot.socketId, target: t.socketId }; break; }
+      case 'escort':   { const t = pickRandom(others.filter(p => p.role !== 'komissar')); if (t) na.escort = { by: bot.socketId, target: t.socketId }; break; }
+      case 'advokat':  { const t = pickRandom(alive); if (t) na.lawyer = { by: bot.socketId, target: t.socketId }; break; }
+      case 'qotil':    { const t = pickRandom(others); if (t) na.killer = { by: bot.socketId, target: t.socketId }; break; }
+      case 'daydi':    { const t = pickRandom(others); if (t) na.daydi = { by: bot.socketId, target: t.socketId }; break; }
+    }
+  }
+  await saveG(gameId, g);
+  if (nightStepComplete(g, step)) await endNightStep(gameId, idx);
+}
+
+// kunduzgi ovozда bitta bot ovoz beradi (har biri alohida kechikish bilan)
+async function botDayVoteOne(gameId, botSid) {
+  const g = await getG(gameId);
+  if (!g || g.phase !== 'day_discussion') return;
+  const bot = g.players.find(p => p.socketId === botSid);
+  if (!isBot(bot) || !bot.isAlive || g.dayVotes[botSid]) return;
+  const targets = g.players.filter(p => p.isAlive && p.socketId !== botSid);
+  g.dayVotes[botSid] = Math.random() < 0.12 ? 'skip' : (pickRandom(targets)?.socketId || 'skip');
+  await saveG(gameId, g);
+  const counts = {}; Object.values(g.dayVotes).forEach(t => { counts[t] = (counts[t] || 0) + 1; });
+  const aliveCount = g.players.filter(p => p.isAlive).length;
+  io.to(`game:${gameId}`).emit('vote_update', { counts, totalVoters: Object.keys(g.dayVotes).length, aliveCount });
+  if (Object.keys(g.dayVotes).length >= aliveCount) {
+    if (timers.has(gameId)) clearTimeout(timers.get(gameId));
+    onPhaseEnd(gameId, 'day_discussion');
+  }
+}
+function scheduleBotDay(gameId, g) {
+  for (const bot of g.players.filter(p => p.isAlive && isBot(p))) {
+    setTimeout(() => withLock(gameId, () => botDayVoteOne(gameId, bot.socketId)), botDelayMs());
+  }
+}
+
 async function recordStats(g, winner) {
+  if (g.vsBots) return; // botlar bilan o'yin reyting/tangaga ta'sir qilmaydi (farm oldini olish)
   for (const p of g.players) {
-    if (!p.userId || String(p.userId).startsWith('guest-')) continue;
+    if (!isRealUser(p.userId)) continue;
     const won = winner === sideOf(p.role) || (winner === 'civil' && sideOf(p.role) === 'town');
     const reward = won ? ECONOMY.winReward : ECONOMY.loseReward;
     try {
@@ -1390,6 +1553,8 @@ io.on('connection', (socket) => {
       const g = await getG(gameId);
       if (!g) { socket.emit('game_error', { message: 'O\'yin topilmadi yoki tugagan' }); return; }
       if (!g.players) g.players = [];
+      // botlar o'yiniga qaytib kelindi — o'chirish taymerini bekor qilamiz
+      if (botDeleteTimers.has(gameId)) { clearTimeout(botDeleteTimers.get(gameId)); botDeleteTimers.delete(gameId); }
 
       const matchPlayer = () => g.players.find(p =>
         (userId && p.userId === userId) || p.username === username
@@ -1467,6 +1632,11 @@ io.on('connection', (socket) => {
 
       io.to(key).emit('game_state', { ...g, players: publicPlayers(g.players) });
       io.to(key).emit('player_joined', { username: player.username, total: g.players.length });
+
+      // 🤖 botlar o'yini — foydalanuvchi kirishi bilan avtomatik boshlanadi
+      if (g.vsBots && g.status === 'waiting') {
+        setTimeout(() => withLock(gameId, () => beginGame(gameId)), 700);
+      }
     } catch (e) {
       console.error('join_game:', e);
       socket.emit('game_error', { message: e.message });
@@ -1485,24 +1655,7 @@ io.on('connection', (socket) => {
       if (g.hostId && starter && starter.userId !== g.hostId && !starter.isHost) {
         socket.emit('game_error', { message: 'Faqat xona egasi boshlay oladi' }); return;
       }
-      cancelEmptyCheck(gameId);
-      g.players = assignRoles(g.players, g.roleConfig);
-      g.status = 'playing';
-      g.round = 0; g.nightActions = {}; g.dayVotes = {}; g.log = [];
-      // har bir o'yinchining buyumlarini bazadan o'yin holatiga yuklaymiz
-      for (const p of g.players) { p.items = await loadUserItems(p.userId); p.shieldActive = false; }
-      logEvent(g, '🎭', 'O\'yin boshlandi — rollar tarqatildi');
-      await saveG(gameId, g);
-      prisma.game.update({ where: { id: gameId }, data: { status: 'playing', startedAt: new Date() } }).catch(() => {});
-      const mafiaList = g.players.filter(p => sideOf(p.role) === 'mafia').map(p => ({ socketId: p.socketId, username: p.username, role: p.role }));
-      g.players.forEach(p => {
-        io.to(p.socketId).emit('your_role', { role: p.role });
-        io.to(p.socketId).emit('your_items', { items: p.items });
-        // mafiya tomoni (Don, Mafiya, Advokat) bir-birini ko'rsin
-        if (sideOf(p.role) === 'mafia') io.to(p.socketId).emit('mafia_team', { mates: mafiaList });
-      });
-      io.to(`game:${gameId}`).emit('game_starting', {});
-      setTimeout(() => startPhase(gameId, 'day_discussion'), 5000);
+      await beginGame(gameId);
     } catch (e) { console.error('start_game:', e); }
   }));
 
@@ -1554,6 +1707,10 @@ io.on('connection', (socket) => {
           if (!targetAlive || sideOf(target.role) === 'mafia') { socket.emit('game_error', { message: '❌ Mafiyaga ovoz berib bo\'lmaydi' }); return; }
           if (!na.mafiaVotes) na.mafiaVotes = {};
           na.mafiaVotes[socket.id] = targetSocketId;
+          // BOTLAR REJIMI: bot mafiyalar foydalanuvchini qo'llab-quvvatlaydi (bir xil nishon)
+          if (g.vsBots) {
+            for (const b of g.players.filter(p => p.isAlive && isBot(p) && sideOf(p.role) === 'mafia')) na.mafiaVotes[b.socketId] = targetSocketId;
+          }
           socket.emit('action_confirmed', { message: `🔫 Ovozingiz: ${target.username}` });
           // mafiya sheriklarga joriy ovozlarni ko'rsatamiz (kelishish uchun)
           const mafiaVotesView = {};
@@ -1706,6 +1863,18 @@ io.on('connection', (socket) => {
     await withLock(data.gameId, async () => {
       const g = await getG(data.gameId);
       if (!g) return;
+      // 🤖 botlar o'yini: foydalanuvchi chiqsa, 15s ichida qaytmasa — o'yin o'chadi
+      if (g.vsBots) {
+        io.to(`game:${data.gameId}`).emit('player_offline', { username: data.username });
+        if (botDeleteTimers.has(data.gameId)) clearTimeout(botDeleteTimers.get(data.gameId));
+        botDeleteTimers.set(data.gameId, setTimeout(async () => {
+          botDeleteTimers.delete(data.gameId);
+          if (timers.has(data.gameId)) { clearTimeout(timers.get(data.gameId)); timers.delete(data.gameId); }
+          await redis.del(`game:${data.gameId}`).catch(() => {});
+          await prisma.game.delete({ where: { id: data.gameId } }).catch(() => {});
+        }, 15000));
+        return;
+      }
       if (g.status === 'waiting') {
         g.players = g.players.filter(p => p.socketId !== socket.id);
         await saveG(data.gameId, g);

@@ -1538,6 +1538,14 @@ async function endGame(gameId, winner) {
 
 const socketData = new Map();
 
+// ==================== OVOZLI CHAT (WebRTC signaling) ====================
+// Server faqat signaling qiladi (SDP/ICE almashinuvi). Audio brauzerlar orasida P2P oqadi.
+const voicePeers = new Map(); // gameId -> Set(socketId)
+function voiceLeave(gameId, socketId) {
+  const set = voicePeers.get(gameId);
+  if (set) { set.delete(socketId); if (!set.size) voicePeers.delete(gameId); }
+}
+
 io.on('connection', (socket) => {
   console.log(`✅ ${socket.id}`);
 
@@ -1855,10 +1863,33 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ===== Ovozli chat signaling =====
+  socket.on('voice_join', ({ gameId }) => {
+    const set = voicePeers.get(gameId) || new Set();
+    // qo'shiluvchiga mavjud ovozli o'yinchilar ro'yxatini yuboramiz (u ularga ulanadi)
+    socket.emit('voice_peers', { peers: [...set] });
+    set.add(socket.id);
+    voicePeers.set(gameId, set);
+  });
+  socket.on('voice_leave', ({ gameId }) => {
+    voiceLeave(gameId, socket.id);
+    socket.to(`game:${gameId}`).emit('voice_peer_leave', { socketId: socket.id });
+  });
+  // SDP/ICE ni aniq bir o'yinchiga uzatish
+  socket.on('voice_signal', ({ to, data }) => {
+    io.to(to).emit('voice_signal', { from: socket.id, data });
+  });
+  // "gapiryapti" indikatori — faqat ruxsat etilgan tinglovchilarga
+  socket.on('voice_talk', ({ to, on }) => {
+    if (Array.isArray(to)) for (const sid of to) io.to(sid).emit('voice_talk', { from: socket.id, on: !!on });
+  });
+
   socket.on('disconnect', async () => {
     console.log(`❌ ${socket.id}`);
     const data = socketData.get(socket.id);
     socketData.delete(socket.id);
+    // ovozli chatdan chiqaramiz
+    if (data?.gameId) { voiceLeave(data.gameId, socket.id); socket.to(`game:${data.gameId}`).emit('voice_peer_leave', { socketId: socket.id }); }
     if (!data?.gameId) return;
     await withLock(data.gameId, async () => {
       const g = await getG(data.gameId);

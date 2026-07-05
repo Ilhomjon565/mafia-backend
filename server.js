@@ -819,6 +819,37 @@ app.get('/api/games/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ==================== ICE SERVERLAR (ovozli chat) ====================
+// TURN sirlari serverda turadi; frontend shu endpointdan oladi.
+// Cloudflare TURN ulash uchun .env ga: CF_TURN_KEY_ID va CF_TURN_API_TOKEN
+const ICE_STUN = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+];
+let iceCache = { at: 0, servers: null };
+app.get('/api/ice', async (_, res) => {
+  try {
+    const keyId = process.env.CF_TURN_KEY_ID, token = process.env.CF_TURN_API_TOKEN;
+    if (!keyId || !token) return res.json({ iceServers: ICE_STUN });
+    // Cloudflare vaqtinchalik credential beradi (ttl 24h) — 6 soat keshda ushlaymiz
+    if (iceCache.servers && Date.now() - iceCache.at < 6 * 3600 * 1000) return res.json({ iceServers: iceCache.servers });
+    const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${keyId}/credentials/generate-ice-servers`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ttl: 86400 }),
+    });
+    if (!r.ok) throw new Error(`CF TURN ${r.status}`);
+    const d = await r.json();
+    const turn = Array.isArray(d.iceServers) ? d.iceServers : (d.iceServers ? [d.iceServers] : []);
+    iceCache = { at: Date.now(), servers: [...ICE_STUN, ...turn] };
+    res.json({ iceServers: iceCache.servers });
+  } catch (e) {
+    console.error('ICE/TURN xato:', e.message);
+    res.json({ iceServers: ICE_STUN });
+  }
+});
+
 // ==================== ADMIN ROUTES ====================
 
 // 🟢 hozir saytда turgan qurilmalar soni (auth qilgan / qilmagan alohida)

@@ -231,13 +231,50 @@ async function tgRoomFinish(gameId) {
   });
 }
 
-// xona hech kim kirmay o'chdi / admin yopdi — e'lonni guruhdan olib tashlaymiz
-async function tgRoomCancel(gameId, messageId) {
+// Toshkent vaqtida qisqa sana-vaqt
+function tgTime(v) {
+  if (!v) return '—';
+  try {
+    return new Date(v).toLocaleString('uz-UZ', {
+      timeZone: 'Asia/Tashkent', hour12: false,
+      day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
+    });
+  } catch { return '—'; }
+}
+
+// Xona o'chirilgandagi e'lon matni — xabar O'CHIRILMAYDI, shu holatga tahrirlanadi,
+// ya'ni guruhda xona haqidagi ma'lumot tarix bo'lib qoladi.
+function tgRoomClosedText(g, reason) {
+  const players = (g.players || []).filter(p => !p.isBot);
+  const max = g.totalPlayers || g.maxPlayers || 8;
+  const names = players.map(p => tgEsc(p.username)).slice(0, 12);
+  const more = players.length - names.length;
+  const wasPlaying = g.status === 'playing';
+  const lines = [
+    `\u{1F5D1} <b>${tgEsc(g.name || 'Mafia xonasi')}</b> — xona o'chirildi`,
+    '',
+    `\u{1F4CB} Sabab: ${tgEsc(reason)}`,
+    `\u{1F4CA} Holati: ${wasPlaying ? "o'yin ketayotgan edi" : 'kutish (boshlanmagan)'}`,
+    `\u{1F465} O'yinchilar: <b>${players.length}/${max}</b>`,
+  ];
+  if (names.length) lines.push(`   ${names.join(', ')}${more > 0 ? ` va yana ${more} ta` : ''}`);
+  if (wasPlaying && g.round) lines.push(`\u{1F504} Raund: ${g.round}`);
+  lines.push(`\u{1F551} Ochilgan: ${tgTime(g.createdAt)}`);
+  lines.push(`\u{1F551} Yopilgan: ${tgTime(Date.now())}`);
+  return lines.join('\n');
+}
+
+// xona o'chdi (bo'sh qoldi / egasi yopdi / admin yopdi) — e'lon "o'chirildi" holatiga o'tadi
+async function tgRoomCancel(gameId, g, reason) {
   if (!tgGroupOn()) return;
   const t = tgEditTimers.get(gameId);
   if (t) { clearTimeout(t.timer); tgEditTimers.delete(gameId); }
-  if (!messageId) return;
-  await tgApi('deleteMessage', { chat_id: TG_GROUP_CHAT_ID, message_id: messageId });
+  if (!g || !g.tgMessageId) return;
+  await tgApi('editMessageText', {
+    chat_id: TG_GROUP_CHAT_ID, message_id: g.tgMessageId,
+    text: tgRoomClosedText(g, reason), parse_mode: 'HTML',
+    disable_web_page_preview: true, reply_markup: { inline_keyboard: [] },
+  });
 }
 
 async function approveDevice(deviceId) {
@@ -917,6 +954,9 @@ app.delete('/api/games/:id', authMiddleware, async (req, res) => {
     if (game.hostId !== req.user.userId) return res.status(403).json({ error: 'Faqat o\'z xonangizni o\'chira olasiz' });
     io.to(`game:${id}`).emit('game_closed', { message: 'Xona egasi xonani yopdi' });
     if (timers.has(id)) { clearTimeout(timers.get(id)); timers.delete(id); }
+    // guruhdagi e'lonni "o'chirildi" holatiga keltiramiz (redis o'chishidan OLDIN o'qiymiz)
+    const hostG = await getG(id);
+    tgRoomCancel(id, hostG, 'xona egasi yopdi').catch(() => {});
     await redis.del(`game:${id}`).catch(() => {});
     await prisma.game.delete({ where: { id } }).catch(() => {});
     res.json({ ok: true });
@@ -1153,7 +1193,7 @@ app.post('/api/admin/games/:id/stop', authMiddleware, adminMiddleware, async (re
     if (timers.has(id)) { clearTimeout(timers.get(id)); timers.delete(id); }
     // guruhdagi e'lonni olib tashlaymiz (redis o'chishidan OLDIN o'qiymiz)
     const stopG = await getG(id);
-    tgRoomCancel(id, stopG?.tgMessageId).catch(() => {});
+    tgRoomCancel(id, stopG, 'admin xonani yopdi').catch(() => {});
     await redis.del(`game:${id}`).catch(() => {});
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1166,7 +1206,7 @@ app.delete('/api/admin/games/:id', authMiddleware, adminMiddleware, async (req, 
     io.to(`game:${id}`).emit('game_closed', { message: 'Admin xonani o\'chirdi' });
     if (timers.has(id)) { clearTimeout(timers.get(id)); timers.delete(id); }
     const delG = await getG(id);
-    tgRoomCancel(id, delG?.tgMessageId).catch(() => {});
+    tgRoomCancel(id, delG, "admin xonani o'chirdi").catch(() => {});
     await redis.del(`game:${id}`).catch(() => {});
     await prisma.game.delete({ where: { id } }).catch(() => {});
     res.json({ ok: true });
@@ -1231,7 +1271,7 @@ async function deleteIfEmpty(gameId) {
   if (g.status === 'waiting' && (g.players || []).length === 0) {
     if (timers.has(gameId)) { clearTimeout(timers.get(gameId)); timers.delete(gameId); }
     io.to(`game:${gameId}`).emit('game_closed', { message: 'Xona bo\'sh qolgani uchun yopildi' });
-    tgRoomCancel(gameId, g.tgMessageId).catch(() => {}); // e'lonni guruhdan olib tashlaymiz
+    tgRoomCancel(gameId, g, 'hech kim kirmagani uchun avtomatik yopildi').catch(() => {});
     await redis.del(`game:${gameId}`).catch(() => {});
     await prisma.game.delete({ where: { id: gameId } }).catch(() => {});
   }

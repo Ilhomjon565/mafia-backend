@@ -134,6 +134,112 @@ async function tgApi(method, body) {
     return await r.json().catch(() => null);
   } catch { return null; }
 }
+// ==================== TELEGRAM GURUHIGA XONA E'LONI ====================
+// Yangi ochiq xona ochilganda guruhga havola + o'yinchilar soni bilan e'lon ketadi.
+// Son o'zgarsa YANGI xabar emas — o'sha xabar tahrirlanadi (guruh spamlanmaydi).
+// Xabar ID si o'yin holati ichida (Redis) saqlanadi — backend qayta ishga tushsa ham yo'qolmaydi.
+const TG_GROUP_CHAT_ID = process.env.TG_GROUP_CHAT_ID || '';
+const SITE_URL = (process.env.FRONTEND_URL || 'https://mafia-game.uz').replace(/\/+$/, '');
+const TG_EDIT_THROTTLE_MS = 4000;      // Telegram tahrir limiti — bir xabarga ~4s da bir marta
+const tgEditTimers = new Map();        // gameId -> { timer, dirty }
+
+function tgGroupOn() { return !!(TG_ADMIN_BOT_TOKEN && TG_GROUP_CHAT_ID); }
+function tgEsc(v) {
+  return String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function tgRoomUrl(gameId) { return SITE_URL + '/game/' + gameId; }
+function tgRoomKb(g) {
+  return g.status === 'waiting'
+    ? { inline_keyboard: [[{ text: '\u{1F3AE} Xonaga qo\u2018shilish', url: tgRoomUrl(g.id) }]] }
+    : { inline_keyboard: [] };
+}
+function tgRoomText(g) {
+  const n = (g.players || []).filter(p => !p.isBot).length;
+  const max = g.totalPlayers || g.maxPlayers || 8;
+  const name = tgEsc(g.name || 'Mafia xonasi');
+  if (g.status === 'finished') {
+    return `\u{1F3C1} <b>${name}</b>\n\n${tgEsc(winnerMessage(g.winner))}\n\u{1F465} ${n} o'yinchi qatnashdi`;
+  }
+  if (g.status === 'playing') {
+    return `\u25B6\uFE0F <b>${name}</b> — o'yin boshlandi\n\n\u{1F465} ${n} o'yinchi o'ynayapti`;
+  }
+  return `\u{1F3AD} <b>${name}</b> — yangi xona ochildi!\n\n`
+       + `\u{1F465} O'yinchilar: <b>${n}/${max}</b>\n`
+       + `\u{1F517} ${tgRoomUrl(g.id)}\n\n`
+       + `Bo'sh joy bor — qo'shiling \u{1F447}`;
+}
+
+// xona ochilganda — bir marta
+async function tgRoomAnnounce(gameId) {
+  if (!tgGroupOn()) return;
+  const g = await getG(gameId);
+  if (!g || g.isPrivate || g.vsBots || g.tgMessageId) return;
+  const r = await tgApi('sendMessage', {
+    chat_id: TG_GROUP_CHAT_ID, text: tgRoomText(g), parse_mode: 'HTML',
+    disable_web_page_preview: true, reply_markup: tgRoomKb(g),
+  });
+  if (!r?.ok) return;
+  await withLock(gameId, async () => {
+    const g2 = await getG(gameId);
+    if (!g2) { await tgApi('deleteMessage', { chat_id: TG_GROUP_CHAT_ID, message_id: r.result.message_id }); return; }
+    g2.tgMessageId = r.result.message_id;
+    g2.tgText = tgRoomText(g2);
+    await saveG(gameId, g2);
+  });
+}
+
+// holat o'zgardi — xabarni yangilash (throttle + coalescing)
+function tgRoomTouch(gameId) {
+  if (!tgGroupOn()) return;
+  const t = tgEditTimers.get(gameId);
+  if (t) { t.dirty = true; return; }
+  tgEditTimers.set(gameId, { dirty: false, timer: setTimeout(() => {
+    const cur = tgEditTimers.get(gameId);
+    tgEditTimers.delete(gameId);
+    if (cur?.dirty) tgRoomTouch(gameId);
+  }, TG_EDIT_THROTTLE_MS) });
+  tgRoomFlush(gameId).catch(() => {});
+}
+
+async function tgRoomFlush(gameId) {
+  if (!tgGroupOn()) return;
+  const g = await getG(gameId);
+  if (!g || !g.tgMessageId) return;
+  const text = tgRoomText(g);
+  if (text === g.tgText) return;       // o'zgarish yo'q — Telegram'ni bezovta qilmaymiz
+  const r = await tgApi('editMessageText', {
+    chat_id: TG_GROUP_CHAT_ID, message_id: g.tgMessageId, text,
+    parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: tgRoomKb(g),
+  });
+  if (!r?.ok) return;
+  await withLock(gameId, async () => {
+    const g2 = await getG(gameId);
+    if (g2) { g2.tgText = text; await saveG(gameId, g2); }
+  });
+}
+
+// o'yin tugadi — e'lonni yakuniy holatga keltiramiz
+async function tgRoomFinish(gameId) {
+  if (!tgGroupOn()) return;
+  const t = tgEditTimers.get(gameId);
+  if (t) { clearTimeout(t.timer); tgEditTimers.delete(gameId); }
+  const g = await getG(gameId);
+  if (!g || !g.tgMessageId) return;
+  await tgApi('editMessageText', {
+    chat_id: TG_GROUP_CHAT_ID, message_id: g.tgMessageId, text: tgRoomText(g),
+    parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: { inline_keyboard: [] },
+  });
+}
+
+// xona hech kim kirmay o'chdi / admin yopdi — e'lonni guruhdan olib tashlaymiz
+async function tgRoomCancel(gameId, messageId) {
+  if (!tgGroupOn()) return;
+  const t = tgEditTimers.get(gameId);
+  if (t) { clearTimeout(t.timer); tgEditTimers.delete(gameId); }
+  if (!messageId) return;
+  await tgApi('deleteMessage', { chat_id: TG_GROUP_CHAT_ID, message_id: messageId });
+}
+
 async function approveDevice(deviceId) {
   if (deviceId) await redis.set(`admin:approved:${deviceId}`, '1', 'EX', 7200).catch(() => {}); // 2 soat
 }
@@ -728,6 +834,7 @@ app.post('/api/games', authMiddleware, limitByUser(30), async (req, res) => {
     };
     await saveG(game.id, state);
     scheduleEmptyCheck(game.id); // 2 daqiqa ichida hech kim kirmasa o'chadi
+    tgRoomAnnounce(game.id).catch(() => {}); // Telegram guruhiga e'lon (ochiq xonalar)
     res.json(game);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1119,6 +1226,7 @@ async function deleteIfEmpty(gameId) {
   if (g.status === 'waiting' && (g.players || []).length === 0) {
     if (timers.has(gameId)) { clearTimeout(timers.get(gameId)); timers.delete(gameId); }
     io.to(`game:${gameId}`).emit('game_closed', { message: 'Xona bo\'sh qolgani uchun yopildi' });
+    tgRoomCancel(gameId, g.tgMessageId).catch(() => {}); // e'lonni guruhdan olib tashlaymiz
     await redis.del(`game:${gameId}`).catch(() => {});
     await prisma.game.delete({ where: { id: gameId } }).catch(() => {});
   }
@@ -1691,6 +1799,7 @@ async function beginGame(gameId) {
   logEvent(g, '🎭', 'O\'yin boshlandi — rollar tarqatildi');
   await saveG(gameId, g);
   prisma.game.update({ where: { id: gameId }, data: { status: 'playing', startedAt: new Date() } }).catch(() => {});
+  tgRoomTouch(gameId); // guruhdagi e'lon: "o'yin boshlandi"
   const mafiaList = g.players.filter(p => sideOf(p.role) === 'mafia').map(p => ({ socketId: p.socketId, username: p.username, role: p.role }));
   g.players.forEach(p => {
     if (isBot(p)) return; // botlarga socket xabari yuborilmaydi
@@ -1812,6 +1921,7 @@ async function endGame(gameId, winner) {
   await saveG(gameId, g);
   prisma.game.update({ where: { id: gameId }, data: { status: 'finished', winner, endedAt: new Date() } }).catch(() => {});
   await recordStats(g, winner);
+  tgRoomFinish(gameId).catch(() => {}); // guruhdagi e'lonni yakunlash
   io.to(`game:${gameId}`).emit('game_over', {
     winner, players: g.players, log: g.log,
     message: winnerMessage(winner)
@@ -1999,6 +2109,7 @@ io.on('connection', (socket) => {
 
       io.to(key).emit('game_state', { ...g, players: publicPlayers(g.players) });
       io.to(key).emit('player_joined', { username: player.username, total: g.players.length });
+      tgRoomTouch(gameId); // guruhdagi e'londa o'yinchilar sonini yangilash
 
       // 🤖 botlar o'yini — foydalanuvchi kirishi bilan avtomatik boshlanadi
       if (g.vsBots && g.status === 'waiting') {
@@ -2355,6 +2466,7 @@ io.on('connection', (socket) => {
         await saveG(data.gameId, g);
         io.to(`game:${data.gameId}`).emit('game_state', { ...g, players: publicPlayers(g.players) });
         io.to(`game:${data.gameId}`).emit('player_left', { username: data.username });
+        tgRoomTouch(data.gameId); // guruhdagi e'londa sonni yangilash
         // xona bo'sh qoldi — 2 daqiqada hech kim kirmasa o'chadi
         if (g.players.length === 0) scheduleEmptyCheck(data.gameId);
       } else if (g.status === 'playing') {

@@ -1151,6 +1151,9 @@ app.post('/api/admin/games/:id/stop', authMiddleware, adminMiddleware, async (re
     await prisma.game.update({ where: { id }, data: { status: 'finished', endedAt: new Date() } }).catch(() => {});
     io.to(`game:${id}`).emit('game_closed', { message: 'Admin tomonidan xona yopildi' });
     if (timers.has(id)) { clearTimeout(timers.get(id)); timers.delete(id); }
+    // guruhdagi e'lonni olib tashlaymiz (redis o'chishidan OLDIN o'qiymiz)
+    const stopG = await getG(id);
+    tgRoomCancel(id, stopG?.tgMessageId).catch(() => {});
     await redis.del(`game:${id}`).catch(() => {});
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1162,6 +1165,8 @@ app.delete('/api/admin/games/:id', authMiddleware, adminMiddleware, async (req, 
     const id = req.params.id;
     io.to(`game:${id}`).emit('game_closed', { message: 'Admin xonani o\'chirdi' });
     if (timers.has(id)) { clearTimeout(timers.get(id)); timers.delete(id); }
+    const delG = await getG(id);
+    tgRoomCancel(id, delG?.tgMessageId).catch(() => {});
     await redis.del(`game:${id}`).catch(() => {});
     await prisma.game.delete({ where: { id } }).catch(() => {});
     res.json({ ok: true });

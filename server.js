@@ -139,6 +139,8 @@ async function tgApi(method, body) {
 // Son o'zgarsa YANGI xabar emas — o'sha xabar tahrirlanadi (guruh spamlanmaydi).
 // Xabar ID si o'yin holati ichida (Redis) saqlanadi — backend qayta ishga tushsa ham yo'qolmaydi.
 const TG_GROUP_CHAT_ID = process.env.TG_GROUP_CHAT_ID || '';
+// Botga /start bosgan odam shu ikki joyga yo'naltiriladi
+const TG_GROUP_LINK = process.env.TG_GROUP_LINK || 'https://t.me/uzbekistan_mafia_games';
 const SITE_URL = (process.env.FRONTEND_URL || 'https://mafia-game.uz').replace(/\/+$/, '');
 const TG_EDIT_THROTTLE_MS = 4000;      // Telegram tahrir limiti — bir xabarga ~4s da bir marta
 const tgEditTimers = new Map();        // gameId -> { timer, dirty }
@@ -168,6 +170,58 @@ function tgRoomText(g) {
        + `\u{1F465} O'yinchilar: <b>${n}/${max}</b>\n`
        + `\u{1F517} ${tgRoomUrl(g.id)}\n\n`
        + `Bo'sh joy bor — qo'shiling \u{1F447}`;
+}
+
+// Botga /start bosgan foydalanuvchiga javob — Telegram profilidagi tilga qarab uz/ru/en.
+const TG_WELCOME = {
+  uz: {
+    text: (name) =>
+      `🎭 <b>Salom, ${name}!</b>\n\n` +
+      `<b>Mafia Game UZ</b> — onlayn Mafiya o'yini. Kunduzi shahar ovoz beradi, kechasi mafiya ov qiladi.\n\n` +
+      `👥 5–20 o'yinchi · 🎭 12 xil rol · 🎤 ovozli chat\n` +
+      `🆓 Butunlay bepul, dastur o'rnatish shart emas.\n\n` +
+      `Quyidagi tugmalardan foydalaning 👇`,
+    play: "🎮 O'ynash — mafia-game.uz",
+    group: '💬 Guruhga qo‘shilish',
+  },
+  ru: {
+    text: (name) =>
+      `🎭 <b>Привет, ${name}!</b>\n\n` +
+      `<b>Mafia Game UZ</b> — онлайн-игра «Мафия». Днём город голосует, ночью мафия охотится.\n\n` +
+      `👥 5–20 игроков · 🎭 12 ролей · 🎤 голосовой чат\n` +
+      `🆓 Полностью бесплатно, ничего устанавливать не нужно.\n\n` +
+      `Воспользуйтесь кнопками ниже 👇`,
+    play: '🎮 Играть — mafia-game.uz',
+    group: '💬 Вступить в группу',
+  },
+  en: {
+    text: (name) =>
+      `🎭 <b>Hi, ${name}!</b>\n\n` +
+      `<b>Mafia Game UZ</b> — the classic Mafia party game, online. By day the town votes, by night the mafia hunts.\n\n` +
+      `👥 5–20 players · 🎭 12 roles · 🎤 voice chat\n` +
+      `🆓 Completely free, nothing to install.\n\n` +
+      `Use the buttons below 👇`,
+    play: '🎮 Play — mafia-game.uz',
+    group: '💬 Join the group',
+  },
+};
+
+async function tgStart(msg) {
+  const code = String(msg.from?.language_code || '').slice(0, 2).toLowerCase();
+  const L = TG_WELCOME[code === 'ru' ? 'ru' : code === 'en' ? 'en' : 'uz'];
+  const name = tgEsc(msg.from?.first_name || msg.from?.username || '');
+  await tgApi('sendMessage', {
+    chat_id: msg.chat.id,
+    text: L.text(name),
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: L.play, url: SITE_URL }],
+        [{ text: L.group, url: TG_GROUP_LINK }],
+      ],
+    },
+  });
 }
 
 // xona ochilganda — bir marta
@@ -333,6 +387,17 @@ async function tgPoll() {
     if (j?.ok && Array.isArray(j.result)) {
       for (const u of j.result) {
         tgOffset = u.update_id + 1;
+
+        // Shaxsiy chatda /start (yoki oddiy xabar) — saytga va guruhga yo'naltiramiz.
+        // Guruh/kanal xabarlariga javob bermaymiz: bot guruhda admin, spam qilmasin.
+        const m = u.message;
+        if (m?.chat?.type === 'private' && typeof m.text === 'string') {
+          if (/^\/(start|help)\b/i.test(m.text.trim()) || !m.text.startsWith('/')) {
+            await tgStart(m).catch(() => {});
+          }
+          continue;
+        }
+
         const cb = u.callback_query;
         if (cb?.data) {
           const [action, rid] = String(cb.data).split(':');

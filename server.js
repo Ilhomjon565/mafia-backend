@@ -10,7 +10,10 @@ import { PrismaClient } from '@prisma/client';
 import { OAuth2Client } from 'google-auth-library';
 import crypto from 'crypto';
 
-dotenv.config();
+// override: true — .env HAR DOIM ustun. Busiz pm2 (yoki shell) dan kelgan bo'sh
+// qiymat .env dagi to'g'ri qiymatni bosib qolardi (2026-09-15: TG_ADMIN_* shunday
+// bo'sh ko'ringan va admin tasdiqlash "disabled" bo'lib qolgandi).
+dotenv.config({ override: true });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'mafia-dev-secret';
 // maxfiy admin kalit — admin panel/API'ni yashiradi. .env'da bo'ladi (repoда yo'q).

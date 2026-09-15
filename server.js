@@ -2041,9 +2041,11 @@ const MAX_CONN_PER_IP = parseInt(process.env.MAX_CONN_PER_IP || '30');   // saxi
 // har socket ~10-40 KB, 3000 ta ~ 100 MB. Chegaradan oshsa YANGI ulanish rad etiladi,
 // mavjud o'yinlar buzilmaydi.
 const MAX_TOTAL_SOCKETS = parseInt(process.env.MAX_TOTAL_SOCKETS || '3000');
-// Bitta IP dan 10 soniyada nechta YANGI ulanish. Ochiq ulanishlar soni emas —
-// qayta-qayta ulanib uzayotgan bot shu bilan to'xtaydi.
-const MAX_HANDSHAKE_PER_IP = parseInt(process.env.MAX_HANDSHAKE_PER_IP || '25');
+// Bitta IP dan 10 soniyada nechta TOKENLI ulanish urinishi (ochiq ulanishlar soni emas).
+// Faqat auth'dan o'tganlar hisoblanadi — pastdagi io.use() izohiga qarang.
+// Backend restartida bitta CGNAT IP ostidagi o'nlab mijoz bir vaqtda qayta ulanadi,
+// shuning uchun saxiy: 60/10s = 6/s.
+const MAX_HANDSHAKE_PER_IP = parseInt(process.env.MAX_HANDSHAKE_PER_IP || '60');
 const HANDSHAKE_WINDOW_MS = 10000;
 // Socket faqat tizimga kirgan foydalanuvchiga kerak (o'yinga kirish, chat, ovoz —
 // hammasi auth talab qiladi). Shu sababli tokensiz ulanish UMUMAN qabul qilinmaydi:
@@ -2098,18 +2100,11 @@ io.use((socket, next) => {
     return next(new Error('server_busy'));
   }
 
-  // (2) Bitta IP dan ulanish TEZLIGI (qayta-qayta ulanuvchi bot)
-  if (isPublicIp(ip)) {
-    const now = Date.now();
-    let h = handshakes.get(ip);
-    if (!h || now - h.t >= HANDSHAKE_WINDOW_MS) { h = { t: now, c: 0 }; handshakes.set(ip, h); }
-    if (++h.c > MAX_HANDSHAKE_PER_IP) {
-      shield.handshake++;
-      return next(new Error('too_many_attempts'));
-    }
-  }
-
-  // (3) Token tekshiruvi
+  // (2) Token tekshiruvi — ATAYLAB tezlik chegarasidan OLDIN.
+  // JWT tekshiruvi HMAC bo'lib mikrosoniyalar oladi (DB ga bormaydi), ya'ni arzon.
+  // Tokensiz bot shu yerda tugaydi va IP ning "ulanish tezligi" byudjetini
+  // ISROF QILMAYDI — aks holda bir CGNAT IP ostidagi bot flood'i o'sha IP dagi
+  // real o'yinchilarni ham bloklab qo'yardi (2026-09-15 sinovida aynan shunday bo'ldi).
   try {
     const token = socket.handshake.auth?.token;
     if (token) {
@@ -2127,6 +2122,18 @@ io.use((socket, next) => {
   if (SOCKET_REQUIRE_AUTH && !socket.data.auth) {
     shield.noAuth++;
     return next(new Error('unauthorized'));
+  }
+
+  // (3) Bitta IP dan ulanish TEZLIGI — endi faqat TOKENLI urinishlar hisoblanadi.
+  // Ya'ni haqiqiy hisobdan qayta-qayta ulanib uzayotgan mijoz/skript to'xtaydi.
+  if (isPublicIp(ip)) {
+    const now = Date.now();
+    let h = handshakes.get(ip);
+    if (!h || now - h.t >= HANDSHAKE_WINDOW_MS) { h = { t: now, c: 0 }; handshakes.set(ip, h); }
+    if (++h.c > MAX_HANDSHAKE_PER_IP) {
+      shield.handshake++;
+      return next(new Error('too_many_attempts'));
+    }
   }
 
   // (4) Bitta IP dan OCHIQ ulanishlar soni

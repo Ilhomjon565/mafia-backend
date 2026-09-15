@@ -755,7 +755,28 @@ app.get('/api/me/rank', authMiddleware, async (req, res) => {
 
 // ==================== GAME REST ROUTES ====================
 
-app.get('/health', (_, res) => res.json({ status: 'ok' }));
+// Oddiy holat — watchdog va nginx uchun. Batafsil raqamlar faqat admin kaliti bilan:
+// ochiq ko'rsatilsa hujumchi himoya chegaralarini o'lchab olardi.
+app.get('/health', (req, res) => {
+  const base = { status: 'ok' };
+  const key = req.query.key || req.headers['x-admin-key'];
+  if (!ADMIN_ACCESS_KEY || key !== ADMIN_ACCESS_KEY) return res.json(base);
+  const mem = process.memoryUsage();
+  res.json({
+    ...base,
+    uptimeSec: Math.round(process.uptime()),
+    sockets: { ochiq: io.engine.clientsCount, chegara: MAX_TOTAL_SOCKETS, ipLar: ipConns.size },
+    ramMb: { rss: Math.round(mem.rss / 1048576), heap: Math.round(mem.heapUsed / 1048576) },
+    // rad etilgan ulanishlar (server ishga tushgandan beri)
+    radEtilgan: {
+      tokensiz: shield.noAuth,          // SOCKET_REQUIRE_AUTH
+      ipChegarasi: shield.perIp,        // MAX_CONN_PER_IP
+      tezUlanish: shield.handshake,     // MAX_HANDSHAKE_PER_IP
+      serverToldi: shield.total,        // MAX_TOTAL_SOCKETS
+      bekorTurgan: shield.idle,         // IDLE_SOCKET_MS
+    },
+  });
+});
 
 // 🟢 Presence (live users) — har qurilma 15s'da bir marta "men shu yerdaman" deydi.
 // Auth qilganlar va qilmaganlar alohida hisoblanadi (qurilma ID bo'yicha).
@@ -2012,11 +2033,42 @@ async function findBotGameByHost(hostUsername) {
 }
 
 // ==================== SOCKET HIMOYASI ====================
-const ipConns = new Map();           // ip -> ulanishlar soni
-const MAX_CONN_PER_IP = 30;          // saxiy (umumiy/CGNAT IP'lar uchun)
+const ipConns = new Map();           // ip -> ochiq ulanishlar soni
+const MAX_CONN_PER_IP = parseInt(process.env.MAX_CONN_PER_IP || '30');   // saxiy (CGNAT uchun)
+
+// --- Socket flood himoyasi (env orqali sozlanadi, kod o'zgartirmasdan) ---
+// Butun serverdagi ochiq socketlar chegarasi. Node xotirasini himoya qiladi:
+// har socket ~10-40 KB, 3000 ta ~ 100 MB. Chegaradan oshsa YANGI ulanish rad etiladi,
+// mavjud o'yinlar buzilmaydi.
+const MAX_TOTAL_SOCKETS = parseInt(process.env.MAX_TOTAL_SOCKETS || '3000');
+// Bitta IP dan 10 soniyada nechta YANGI ulanish. Ochiq ulanishlar soni emas —
+// qayta-qayta ulanib uzayotgan bot shu bilan to'xtaydi.
+const MAX_HANDSHAKE_PER_IP = parseInt(process.env.MAX_HANDSHAKE_PER_IP || '25');
+const HANDSHAKE_WINDOW_MS = 10000;
+// Socket faqat tizimga kirgan foydalanuvchiga kerak (o'yinga kirish, chat, ovoz —
+// hammasi auth talab qiladi). Shu sababli tokensiz ulanish UMUMAN qabul qilinmaydi:
+// bot avval Google orqali ro'yxatdan o'tmasa, socketni ocha olmaydi.
+// Biror narsa buzilsa: .env da SOCKET_REQUIRE_AUTH=0 qilib pm2 restart — kod tegilmaydi.
+const SOCKET_REQUIRE_AUTH = process.env.SOCKET_REQUIRE_AUTH !== '0';
+// Ulangan, lekin o'yinga kirmagan socket qancha yashaydi (lurker/zombi tozalash)
+const IDLE_SOCKET_MS = parseInt(process.env.IDLE_SOCKET_MS || '120000');
+
+const handshakes = new Map();        // ip -> { t, c }
+// hisoblagichlar cheksiz o'smasin
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, h] of handshakes) if (now - h.t > HANDSHAKE_WINDOW_MS * 3) handshakes.delete(ip);
+  for (const [ip, n] of ipConns) if (n <= 0) ipConns.delete(ip);
+}, 60000).unref?.();
+
+// rad etilgan ulanishlar statistikasi — /health orqali ko'rinadi
+const shield = { noAuth: 0, perIp: 0, handshake: 0, total: 0, idle: 0 };
 function socketIp(socket) {
   const h = socket.handshake.headers || {};
   return h['cf-connecting-ip'] || (h['x-forwarded-for'] || '').split(',')[0].trim() || socket.handshake.address || 'unknown';
+}
+function clearIdle(socket) {
+  if (socket?.data?.idleTimer) { clearTimeout(socket.data.idleTimer); socket.data.idleTimer = null; }
 }
 // har socket uchun: umumiy flood + event bo'yicha cheklov. Ruxsat bo'lsa true.
 function guard(socket, key, max, windowMs) {
@@ -2034,8 +2086,30 @@ function guard(socket, key, max, windowMs) {
   return ++b.c <= max;
 }
 
-// ulanishda: token (ixtiyoriy) tekshirish + IP bo'yicha ulanish chegarasi
+// Ulanish qabul qilinishidan oldingi to'rt qatlamli filtr.
+// Tartib ARZONdan QIMMATga: avval umumiy chegara, keyin IP, keyin JWT tekshiruvi.
 io.use((socket, next) => {
+  const ip = socketIp(socket);
+  socket.data.ip = ip;
+
+  // (1) Server bo'yicha umumiy chegara — xotirani himoya qiladi
+  if (io.engine.clientsCount >= MAX_TOTAL_SOCKETS) {
+    shield.total++;
+    return next(new Error('server_busy'));
+  }
+
+  // (2) Bitta IP dan ulanish TEZLIGI (qayta-qayta ulanuvchi bot)
+  if (isPublicIp(ip)) {
+    const now = Date.now();
+    let h = handshakes.get(ip);
+    if (!h || now - h.t >= HANDSHAKE_WINDOW_MS) { h = { t: now, c: 0 }; handshakes.set(ip, h); }
+    if (++h.c > MAX_HANDSHAKE_PER_IP) {
+      shield.handshake++;
+      return next(new Error('too_many_attempts'));
+    }
+  }
+
+  // (3) Token tekshiruvi
   try {
     const token = socket.handshake.auth?.token;
     if (token) {
@@ -2050,12 +2124,15 @@ io.use((socket, next) => {
       } catch {}
     }
   } catch {}
-  const ip = socketIp(socket);
-  socket.data.ip = ip;
-  // IP-cheklov faqat ishonchli ommaviy IP'da (proxy/local bo'lsa hammani bloklamaymiz)
+  if (SOCKET_REQUIRE_AUTH && !socket.data.auth) {
+    shield.noAuth++;
+    return next(new Error('unauthorized'));
+  }
+
+  // (4) Bitta IP dan OCHIQ ulanishlar soni
   if (isPublicIp(ip)) {
     const n = (ipConns.get(ip) || 0) + 1;
-    if (n > MAX_CONN_PER_IP) return next(new Error('too_many_connections'));
+    if (n > MAX_CONN_PER_IP) { shield.perIp++; return next(new Error('too_many_connections')); }
     ipConns.set(ip, n);
   }
   next();
@@ -2063,6 +2140,12 @@ io.use((socket, next) => {
 
 io.on('connection', (socket) => {
   console.log(`✅ ${socket.id}`);
+  // Ulangan, lekin hech qaysi o'yinga kirmagan socketni tozalaymiz:
+  // bot ulanib jim turib xotira egallashi mumkin emas.
+  socket.data.idleTimer = setTimeout(() => {
+    if (!socketData.has(socket.id)) { shield.idle++; try { socket.disconnect(true); } catch {} }
+  }, IDLE_SOCKET_MS);
+  socket.data.idleTimer.unref?.();
 
   socket.on('join_game', ({ gameId, userId, username }) => withLock(gameId, async () => {
     try {
@@ -2093,7 +2176,7 @@ io.on('connection', (socket) => {
         if (existing) {
           existing.socketId = socket.id;
           existing.connected = true;
-          socketData.set(socket.id, { userId, username: existing.username, gameId });
+          clearIdle(socket); socketData.set(socket.id, { userId, username: existing.username, gameId });
           socket.join(key);
           await saveG(gameId, g);
           socket.emit('game_state', { ...g, players: publicPlayers(g.players) });
@@ -2133,7 +2216,7 @@ io.on('connection', (socket) => {
       if (existing) {
         existing.socketId = socket.id;
         existing.connected = true;
-        socketData.set(socket.id, { userId, username: existing.username, gameId });
+        clearIdle(socket); socketData.set(socket.id, { userId, username: existing.username, gameId });
         socket.join(key);
         await saveG(gameId, g);
         socket.emit('game_state', { ...g, players: publicPlayers(g.players) });
@@ -2158,7 +2241,7 @@ io.on('connection', (socket) => {
       if (!Array.isArray(g.everPlayers)) g.everPlayers = [];
       if (!g.everPlayers.includes(player.username)) g.everPlayers.push(player.username);
       await saveG(gameId, g);
-      socketData.set(socket.id, { userId: player.userId, username: player.username, gameId });
+      clearIdle(socket); socketData.set(socket.id, { userId: player.userId, username: player.username, gameId });
       socket.join(key);
 
       io.to(key).emit('game_state', { ...g, players: publicPlayers(g.players) });
@@ -2485,6 +2568,7 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', async () => {
     console.log(`❌ ${socket.id}`);
+    clearIdle(socket);
     // IP ulanish hisobini kamaytiramiz (faqat hisoblangan ommaviy IP uchun)
     const ip = socket.data?.ip;
     if (ip && isPublicIp(ip)) { const n = (ipConns.get(ip) || 1) - 1; if (n <= 0) ipConns.delete(ip); else ipConns.set(ip, n); }

@@ -158,7 +158,8 @@ function tgRoomText(g) {
   const max = g.totalPlayers || g.maxPlayers || 8;
   const name = tgEsc(g.name || 'Mafia xonasi');
   if (g.status === 'finished') {
-    return `\u{1F3C1} <b>${name}</b>\n\n${tgEsc(winnerMessage(g.winner))}\n\u{1F465} ${n} o'yinchi qatnashdi`;
+    const ever = Array.isArray(g.everPlayers) ? g.everPlayers.length : n;
+    return `\u{1F3C1} <b>${name}</b>\n\n${tgEsc(winnerMessage(g.winner))}\n\u{1F465} ${Math.max(n, ever)} o'yinchi qatnashdi`;
   }
   if (g.status === 'playing') {
     return `\u25B6\uFE0F <b>${name}</b> — o'yin boshlandi\n\n\u{1F465} ${n} o'yinchi o'ynayapti`;
@@ -245,19 +246,24 @@ function tgTime(v) {
 // Xona o'chirilgandagi e'lon matni — xabar O'CHIRILMAYDI, shu holatga tahrirlanadi,
 // ya'ni guruhda xona haqidagi ma'lumot tarix bo'lib qoladi.
 function tgRoomClosedText(g, reason) {
-  const players = (g.players || []).filter(p => !p.isBot);
+  const inRoom = (g.players || []).filter(p => !p.isBot).length;
   const max = g.totalPlayers || g.maxPlayers || 8;
-  const names = players.map(p => tgEsc(p.username)).slice(0, 12);
-  const more = players.length - names.length;
+  const ever = Array.isArray(g.everPlayers) ? g.everPlayers : [];
+  const names = ever.map(tgEsc).slice(0, 12);
+  const more = ever.length - names.length;
   const wasPlaying = g.status === 'playing';
   const lines = [
     `\u{1F5D1} <b>${tgEsc(g.name || 'Mafia xonasi')}</b> — xona o'chirildi`,
     '',
     `\u{1F4CB} Sabab: ${tgEsc(reason)}`,
     `\u{1F4CA} Holati: ${wasPlaying ? "o'yin ketayotgan edi" : 'kutish (boshlanmagan)'}`,
-    `\u{1F465} O'yinchilar: <b>${players.length}/${max}</b>`,
+    `\u{1F465} Yopilganda xonada: <b>${inRoom}/${max}</b>`,
   ];
-  if (names.length) lines.push(`   ${names.join(', ')}${more > 0 ? ` va yana ${more} ta` : ''}`);
+  if (ever.length) {
+    lines.push(`\u{1F464} Qatnashganlar (${ever.length}): ${names.join(', ')}${more > 0 ? ` va yana ${more} ta` : ''}`);
+  } else {
+    lines.push('\u{1F464} Xonaga hech kim kirmagan');
+  }
   if (wasPlaying && g.round) lines.push(`\u{1F504} Raund: ${g.round}`);
   lines.push(`\u{1F551} Ochilgan: ${tgTime(g.createdAt)}`);
   lines.push(`\u{1F551} Yopilgan: ${tgTime(Date.now())}`);
@@ -2148,6 +2154,9 @@ io.on('connection', (socket) => {
         role: null, isAlive: true, connected: true, isHost, joinedAt: Date.now()
       };
       g.players.push(player);
+      // xonada bo'lib o'tganlar ro'yxati — chiqib ketsa ham qoladi (Telegram e'loni uchun)
+      if (!Array.isArray(g.everPlayers)) g.everPlayers = [];
+      if (!g.everPlayers.includes(player.username)) g.everPlayers.push(player.username);
       await saveG(gameId, g);
       socketData.set(socket.id, { userId: player.userId, username: player.username, gameId });
       socket.join(key);

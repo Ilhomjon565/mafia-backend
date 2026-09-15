@@ -150,9 +150,11 @@ function tgEsc(v) {
   return String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 function tgRoomUrl(gameId) { return SITE_URL + '/game/' + gameId; }
+// Guruhdagi tugma uchun — kim guruh orqali kelganini ajratish
+function tgRoomUrlRef(gameId) { return tgRoomUrl(gameId) + '?ref=tggroup'; }
 function tgRoomKb(g) {
   return g.status === 'waiting'
-    ? { inline_keyboard: [[{ text: '\u{1F3AE} Xonaga qo\u2018shilish', url: tgRoomUrl(g.id) }]] }
+    ? { inline_keyboard: [[{ text: '\u{1F3AE} Xonaga qo\u2018shilish', url: tgRoomUrlRef(g.id) }]] }
     : { inline_keyboard: [] };
 }
 function tgRoomText(g) {
@@ -207,6 +209,11 @@ const TG_WELCOME = {
 };
 
 async function tgStart(msg) {
+  // /start bosgan UNIKAL Telegram foydalanuvchilari (saytga o'tmaganlar ham) —
+  // admin panelda "botni ochganlar" soni shundan olinadi.
+  if (msg.from?.id) {
+    redis.sadd('tg:started', String(msg.from.id)).catch(() => {});
+  }
   const code = String(msg.from?.language_code || '').slice(0, 2).toLowerCase();
   const L = TG_WELCOME[code === 'ru' ? 'ru' : code === 'en' ? 'en' : 'uz'];
   const name = tgEsc(msg.from?.first_name || msg.from?.username || '');
@@ -217,7 +224,7 @@ async function tgStart(msg) {
     disable_web_page_preview: true,
     reply_markup: {
       inline_keyboard: [
-        [{ text: L.play, url: SITE_URL }],
+        [{ text: L.play, url: `${SITE_URL}/?ref=tgbot` }],
         [{ text: L.group, url: TG_GROUP_LINK }],
       ],
     },
@@ -419,6 +426,15 @@ async function tgPoll() {
   setTimeout(tgPoll, 800);
 }
 
+// Ref-manba nomini tozalash: faqat qisqa, xavfsiz belgi. Noma'lum bo'lsa 'direct'.
+const REF_KNOWN = ['tgbot', 'tggroup', 'direct'];
+function normRef(v) {
+  const s = String(v || '').trim().toLowerCase().slice(0, 24);
+  if (!s) return 'direct';
+  if (REF_KNOWN.includes(s)) return s;
+  return /^[a-z0-9_-]{1,24}$/.test(s) ? s : 'direct';
+}
+
 // ==================== SETTINGS ====================
 
 const DEFAULT_SETTINGS = {
@@ -586,6 +602,9 @@ app.post('/api/auth/google', limitAuth, async (req, res) => {
   try {
     const { credential } = req.body;
     if (!credential) return res.status(400).json({ error: 'Google credential yo\'q' });
+    // Reklama manbasi: bot/guruh havolasidagi ?ref= frontendda saqlanib, shu yerga keladi.
+    // Faqat YANGI akkauntga yoziladi — keyin o'zgarmaydi.
+    const refSource = normRef(req.body.ref);
 
     // ID tokenni Google bilan tekshirish
     let payload;
@@ -627,6 +646,7 @@ app.post('/api/auth/google', limitAuth, async (req, res) => {
           email,
           password: randomPass,
           avatar: picture,
+          refSource,
           isAdmin: userCount === 0,
           items: DEFAULT_ITEMS,
           stats: { create: {} }
@@ -858,6 +878,31 @@ app.post('/api/presence', async (req, res) => {
     else { await redis.zadd('presence:anon', now, deviceId); await redis.zrem('presence:auth', deviceId); }
     res.json({ ok: true });
   } catch { res.json({ ok: true }); }
+});
+
+// ==================== OCHIQ STATISTIKA (landing sahifasi uchun) ====================
+// Kirmagan mehmon ham ko'radi, shuning uchun faqat zararsiz umumiy raqamlar.
+// Natija 10 soniya Redis'da keshlanadi — ochiq endpoint bazani charchatmasin.
+app.get('/api/stats', async (_, res) => {
+  try {
+    const cached = await redis.get('cache:pubstats').catch(() => null);
+    if (cached) return res.json(JSON.parse(cached));
+
+    const cut = Date.now() - 30000; // oxirgi 30 s da ko'ringan qurilma = onlayn
+    await redis.zremrangebyscore('presence:auth', '-inf', cut).catch(() => {});
+    await redis.zremrangebyscore('presence:anon', '-inf', cut).catch(() => {});
+
+    const [players, gamesPlayed, activeGames, onAuth, onAnon] = await Promise.all([
+      prisma.user.count(),
+      prisma.game.count({ where: { status: 'finished' } }),
+      prisma.game.count({ where: { status: { in: ['waiting', 'playing'] } } }),
+      redis.zcard('presence:auth').catch(() => 0),
+      redis.zcard('presence:anon').catch(() => 0),
+    ]);
+    const data = { players, gamesPlayed, activeGames, online: onAuth + onAnon, onlineAuthed: onAuth };
+    await redis.set('cache:pubstats', JSON.stringify(data), 'EX', 10).catch(() => {});
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // hydrate: redis yo'q bo'lsa postgres dan tiklash (faqat waiting xonalar uchun)
@@ -1122,7 +1167,21 @@ app.get('/api/admin/stats', authMiddleware, adminMiddleware, async (_, res) => {
     ]);
     const mafiaWins = await prisma.game.count({ where: { winner: 'mafia' } });
     const civilWins = await prisma.game.count({ where: { winner: 'civil' } });
-    res.json({ users, banned, admins, totalGames, activeGames, finishedGames, mafiaWins, civilWins });
+
+    // Qayerdan kelgan: ro'yxatdan o'tishda yozilgan refSource bo'yicha
+    const bySource = await prisma.user.groupBy({ by: ['refSource'], _count: { _all: true } });
+    const sources = {};
+    for (const row of bySource) sources[row.refSource || 'direct'] = row._count._all;
+    // Botni ochgan unikal Telegram foydalanuvchilari (saytga o'tmaganlar ham kiradi)
+    const tgStarted = await redis.scard('tg:started').catch(() => 0);
+    // Oxirgi 7 kunda bot orqali kelganlar
+    const weekAgo = new Date(Date.now() - 7 * 864e5);
+    const tgbotWeek = await prisma.user.count({ where: { refSource: 'tgbot', createdAt: { gte: weekAgo } } });
+
+    res.json({
+      users, banned, admins, totalGames, activeGames, finishedGames, mafiaWins, civilWins,
+      sources, tgStarted, tgbotWeek,
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

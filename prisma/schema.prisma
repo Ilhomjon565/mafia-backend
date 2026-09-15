@@ -21,6 +21,7 @@ model User {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
   lastSeen    DateTime?
+  refSource   String?   // qayerdan kelgan: tgbot | tggroup | direct | boshqa (ro'yxatdan o'tishda bir marta yoziladi)
   games       GamePlayer[]
   stats       UserStats?
   history     GameHistory[]

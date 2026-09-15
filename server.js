@@ -2402,7 +2402,10 @@ async function recoverTimers() {
 // ==================== START ====================
 
 const PORT = process.env.PORT || 4000;
-httpServer.listen(PORT, () => {
+// Nginx ortida ishlaganda faqat localhost'ga bog'lanish kerak — aks holda port
+// tashqi tarmoqqa (router port-forward/firewall teshigi orqali) ochiq qolishi mumkin.
+const BIND_HOST = process.env.BIND_HOST || '0.0.0.0';
+httpServer.listen(PORT, BIND_HOST, () => {
   console.log(`
   🎭 MAFIA PLATFORMASI - BACKEND
   ==============================

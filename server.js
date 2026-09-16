@@ -1885,8 +1885,14 @@ async function startPhase(gameId, phase) {
 
   if (timers.has(gameId)) clearTimeout(timers.get(gameId));
   // withLock: taymer va socket hodisasi (oxirgi ovoz) bir vaqtda kelsa, faza ikki marta
-  // yakunlanib qolmasin
-  timers.set(gameId, setTimeout(() => withLock(gameId, () => onPhaseEnd(gameId, phase)), d * 1000));
+  // yakunlanib qolmasin.
+  //
+  // Qo'shimcha vaqt (grace): o'yinchining harakati taymer nolga yetgan paytda
+  // yo'lda bo'lishi mumkin. Mijoz `endsAt` ni ko'rsatadi (taymer halol nolga
+  // tushadi), server esa eng sekin ishtirokchining pingi qadar kechroq yopadi
+  // — aks holda sekin ulanishli odam har safar harakatsiz qolardi.
+  const grace = graceFor(g);
+  timers.set(gameId, setTimeout(() => withLock(gameId, () => onPhaseEnd(gameId, phase)), d * 1000 + grace));
 
   // BOTLAR REJIMI: kunduzi botlar 2–4.5s da ovoz beradi (foydalanuvchi ovoz berganda yakunlanadi)
   if (g.vsBots && phase === 'day_discussion') scheduleBotDay(gameId, g);
@@ -2498,6 +2504,61 @@ async function endGame(gameId, winner) {
 // ==================== SOCKET.IO ====================
 
 const socketData = new Map();
+
+// ==================== PING (ulanish sifati) ====================
+// Ping SERVERDA o'lchanadi, mijoz o'zi xabar qilmaydi: past ping "yaxshi
+// ulanish" belgisi bo'lgani uchun uni soxtalashtirishga sabab bor edi.
+//
+// O'lchov socket.io ack'i orqali: serverdan probe ketadi, mijoz javob
+// qaytaradi, orada o'tgan vaqt — to'liq aylanma (RTT).
+const PING_MS = new Map();   // socketId -> so'nggi RTT (ms)
+const PING_EVERY = 5000;
+const PING_TIMEOUT = 4000;   // javob kelmasa oldingi qiymat saqlanadi
+
+function probePing(socket) {
+  const t0 = Date.now();
+  try {
+    socket.timeout(PING_TIMEOUT).emit('ping_probe', (err) => {
+      if (err) return;  // javob kelmadi — sekin tarmoq; eski qiymatni buzmaymiz
+      PING_MS.set(socket.id, Math.min(9999, Date.now() - t0));
+    });
+  } catch {}
+}
+
+// Faqat O'YINDAGI socketlar o'lchanadi — lobbida turganning pingi kerak emas.
+const pingTimer = setInterval(() => {
+  const byGame = new Map();
+  for (const [sid, d] of socketData) {
+    if (!d?.gameId) continue;
+    const s = io.sockets.sockets.get(sid);
+    if (!s) { PING_MS.delete(sid); continue; }
+    probePing(s);
+    const v = PING_MS.get(sid);
+    if (v === undefined) continue;
+    if (!byGame.has(d.gameId)) byGame.set(d.gameId, {});
+    byGame.get(d.gameId)[sid] = v;
+  }
+  for (const [gameId, map] of byGame) {
+    io.to(`game:${gameId}`).emit('ping_update', { ping: map });
+  }
+}, PING_EVERY);
+pingTimer.unref?.();
+
+// Faza yopilganda sekin ulanishli o'yinchining harakati yo'lda qolib
+// ketmasin: eng sekin ishtirokchining pingi qadar (lekin ko'pi bilan 1.5 s)
+// qo'shimcha vaqt beriladi. Cheklov ATAYLAB qattiq — aks holda bitta yomon
+// ulanish butun xonani kutib turishga majbur qilardi.
+const GRACE_MAX = 1500;
+function graceFor(g) {
+  if (!g?.players) return 0;
+  let worst = 0;
+  for (const p of g.players) {
+    if (!p.isAlive || !p.socketId) continue;
+    const v = PING_MS.get(p.socketId);
+    if (v && v > worst) worst = v;
+  }
+  return Math.min(GRACE_MAX, worst);
+}
 
 // ==================== OVOZLI CHAT (WebRTC signaling) ====================
 // Server faqat signaling qiladi (SDP/ICE almashinuvi). Audio brauzerlar orasida P2P oqadi.
@@ -3165,6 +3226,7 @@ io.on('connection', (socket) => {
   socket.on('disconnect', async () => {
     console.log(`❌ ${socket.id}`);
     clearIdle(socket);
+    PING_MS.delete(socket.id);
     // IP ulanish hisobini kamaytiramiz (faqat hisoblangan ommaviy IP uchun)
     const ip = socket.data?.ip;
     if (ip && isPublicIp(ip)) { const n = (ipConns.get(ip) || 1) - 1; if (n <= 0) ipConns.delete(ip); else ipConns.set(ip, n); }

@@ -101,11 +101,22 @@ function h32(n) {
 //
 // To'plam har 7 daqiqada yangilanadi: xonalar "tugaydi", o'rniga boshqasi
 // "ochiladi" — lobbi jonli ko'rinadi.
+// Ishlatilmagan nom tanlaydi (ro'yxat tugasa oxirgisini qaytaradi).
+function pickName(used, seed) {
+  for (let k = 0; k < ROOM_NAMES.length; k++) {
+    const nm = ROOM_NAMES[(seed + k) % ROOM_NAMES.length];
+    if (!used.has(nm)) { used.add(nm); return nm; }
+  }
+  return ROOM_NAMES[seed % ROOM_NAMES.length];
+}
+
 export function fakeRooms(now = Date.now(), enabled = true) {
   if (!enabled) return [];
   const slot = Math.floor(now / (7 * 60000));
   const count = 5 + (h32(slot) % 6);            // 5-10 ta
   const out = [];
+  // Nomlar takrorlanmasin: lobbida ikkita "Mafia UZ" turgani g'alati ko'rinadi
+  const usedNames = new Set();
   for (let i = 0; i < count; i++) {
     // DIQQAT: `>>>` (unsigned), `>>` EMAS. h32() 32-bitli musbat son qaytaradi,
     // lekin `>>` uni ishorali deb hisoblaydi va 2^31 dan katta qiymatlarda
@@ -127,7 +138,7 @@ export function fakeRooms(now = Date.now(), enabled = true) {
     }
     out.push({
       id: 'c' + (h32(slot * 104729 + i) >>> 0).toString(16).padStart(8, '0') + 'x' + i,
-      name: ROOM_NAMES[(s >>> 7) % ROOM_NAMES.length],
+      name: pickName(usedNames, (s >>> 7)),
       status: playing ? 'playing' : 'waiting',
       totalPlayers: total,
       mafiaCount,

@@ -149,3 +149,12 @@ test('to\'plam vaqt o\'tishi bilan yangilanadi', () => {
 test('FAKE_ONLINE=0 bo\'lsa xona ham yo\'q', () => {
   assert.deepEqual(fakeRooms(Date.now(), false), []);
 });
+
+test('xona nomlari bir vaqtda takrorlanmaydi', () => {
+  for (let k = 0; k < 300; k++) {
+    const rooms = fakeRooms(Date.UTC(2026, 8, 16) + k * 7 * 60000);
+    const names = rooms.map(r => r.name);
+    assert.equal(new Set(names).size, names.length,
+      'takrorlangan nom: ' + names.join(', '));
+  }
+});

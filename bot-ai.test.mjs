@@ -1,0 +1,364 @@
+// bot-ai.js testlari: bot qarorlari HAQIQIY o'yinchiga o'xshashini tekshiradi.
+// Tasodifiylik bor, shuning uchun ehtimolli tekshiruvlar ko'p marta takrorlanadi.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  makePersona, voteDelayMs, fakePing, buildSuspicion,
+  buildVoteWeight, chooseDayVote, chooseNightTarget, weightedPick,
+  makeFillerBots, BOT_NAMES,
+} from './bot-ai.js';
+
+const P = (sid, role) => ({ socketId: sid, username: sid, role });
+const ALIVE = ['a', 'b', 'c', 'd', 'e'].map(s => P(s));
+
+// deterministik "tasodif" — takrorlanadigan test uchun
+function seq(values) { let i = 0; return () => values[i++ % values.length]; }
+
+// ---------- xarakter ----------
+
+test('makePersona bir xil seed uchun bir xil natija beradi', () => {
+  const a = makePersona('u1'), b = makePersona('u1'), c = makePersona('u2');
+  assert.deepEqual(a, b, 'bir xil userId -> bir xil xarakter (server restartida ham)');
+  assert.notDeepEqual(a, c, 'boshqa userId -> boshqa xarakter');
+});
+
+test('xarakter qiymatlari chegaralar ichida', () => {
+  for (let i = 0; i < 200; i++) {
+    const p = makePersona('user' + i);
+    assert.ok(p.speed > 0 && p.speed <= 1);
+    assert.ok(p.activity >= 0.72 && p.activity <= 1);
+    assert.ok(p.bandwagon >= 0.15 && p.bandwagon <= 0.75);
+    assert.ok(p.noise >= 0.04 && p.noise <= 0.2);
+    assert.ok(p.ping >= 24 && p.ping <= 265, 'ping real diapazonda: ' + p.ping);
+  }
+});
+
+test('botlar bir vaqtda ovoz bermaydi', () => {
+  const delays = new Set();
+  for (let i = 0; i < 40; i++) {
+    delays.add(voteDelayMs(makePersona('u' + i), 60000, () => 0.5));
+  }
+  assert.ok(delays.size > 25, 'kechikishlar tarqoq bo\'lishi kerak, bor: ' + delays.size);
+});
+
+test('kechikish faza ichida qoladi', () => {
+  for (const dur of [20000, 45000, 90000]) {
+    for (let i = 0; i < 50; i++) {
+      const d = voteDelayMs(makePersona('x' + i), dur, Math.random);
+      assert.ok(d >= 2500, 'juda tez: ' + d);
+      assert.ok(d <= dur - 3000, `faza tugashidan oldin ovoz berishi kerak (${d} / ${dur})`);
+    }
+  }
+});
+
+test('fakePing tebranadi, lekin haqiqatga o\'xshaydi', () => {
+  const p = makePersona('pinger');
+  const vals = new Set();
+  for (let i = 0; i < 30; i++) vals.add(fakePing(p, Math.random));
+  assert.ok(vals.size > 10, 'ping qotib qolmasligi kerak');
+  for (const v of vals) assert.ok(v >= 12 && v < 400, 'ping haqiqatga o\'xshamaydi: ' + v);
+});
+
+// ---------- shubha ballari ----------
+
+test('tinch aholini chetlatganlar shubha ballini oladi', () => {
+  const events = [
+    { type: 'vote', round: 1, from: 'a', to: 'c' },
+    { type: 'vote', round: 1, from: 'b', to: 'c' },
+    { type: 'vote', round: 1, from: 'd', to: 'e' },
+    { type: 'lynched', round: 1, target: 'c', wasMafia: false },
+  ];
+  const s = buildSuspicion(events, ALIVE);
+  assert.ok(s.a > s.d, 'tinch aholiga ovoz bergan a, e ga ovoz bergan d dan shubhaliroq');
+  assert.ok(s.b > s.d);
+});
+
+test('mafiyani topganlar ishonch qozonadi', () => {
+  const events = [
+    { type: 'vote', round: 1, from: 'a', to: 'c' },
+    { type: 'lynched', round: 1, target: 'c', wasMafia: true },
+  ];
+  const s = buildSuspicion(events, ALIVE);
+  assert.ok(s.a < 0, 'mafiyani topgan odamning bali manfiy bo\'lishi kerak: ' + s.a);
+});
+
+test('shubha faqat NATIJALARdan hisoblanadi, ovoz sonidan emas', () => {
+  // Uch kishi "b" ga ovoz berdi, lekin natija hali yo'q. Mafiya uyushib bir
+  // odamni ayblasa, shahar avtomatik unga qo'shilmasligi kerak.
+  const s = buildSuspicion([
+    { type: 'vote', round: 1, from: 'a', to: 'b' },
+    { type: 'vote', round: 1, from: 'c', to: 'b' },
+    { type: 'vote', round: 1, from: 'd', to: 'b' },
+  ], ALIVE);
+  assert.equal(s.b || 0, 0, 'ovoz olgani uchun shubha ortmasligi kerak (mafiya manipulyatsiyasi)');
+});
+
+test("chetlatilgan mafiyani himoya qilganlar fosh bo'ladi", () => {
+  // "c" mafiya bo'lib chiqdi. "a" unga ovoz bergan, "d" esa bermagan.
+  const s = buildSuspicion([
+    { type: 'vote', round: 1, from: 'a', to: 'c' },
+    { type: 'vote', round: 1, from: 'b', to: 'c' },
+    { type: 'vote', round: 1, from: 'd', to: 'e' },
+    { type: 'lynched', round: 1, target: 'c', wasMafia: true },
+  ], ALIVE);
+  assert.ok(s.d > s.a, "mafiyaga ovoz bermagan d shubhaliroq bo'lishi kerak");
+});
+
+test("komissar tozalagan odam ishonchli bo'ladi", () => {
+  const s = buildSuspicion([
+    { type: 'vote', round: 1, from: 'a', to: 'b' },
+    { type: 'clear', round: 2, from: 'k', target: 'b' },
+  ], ALIVE);
+  assert.ok(s.b <= -2, 'tozalangan odam ishonch olishi kerak: ' + s.b);
+});
+
+test("komissar da'vosi nishonni keskin shubhali qiladi", () => {
+  const s = buildSuspicion([
+    { type: 'claim', round: 2, from: 'k', target: 'd' },
+  ], ALIVE);
+  assert.ok(s.d > 4, "da'vo kuchli signal bo'lishi kerak: " + s.d);
+});
+
+// ---------- kunduzgi ovoz ----------
+
+test('mafiya bot sherigiga HECH QACHON ovoz bermaydi', () => {
+  const ctx = {
+    me: P('a', 'mafia'), alive: ALIVE, mates: ['a', 'b'],
+    suspicion: { b: 99 },              // sherik eng shubhali bo'lsa ham
+    votes: {}, round: 2,
+    persona: { speed: 0.5, activity: 1, bandwagon: 0.3, noise: 0, ping: 50 },
+  };
+  for (let i = 0; i < 300; i++) {
+    const v = chooseDayVote(ctx, Math.random);
+    assert.notEqual(v, 'b', 'mafiya sherigiga ovoz berdi');
+  }
+});
+
+test('komissar tekshirib topgan mafiyaga ovoz beradi', () => {
+  const ctx = {
+    me: P('a', 'komissar'), alive: ALIVE, mates: [],
+    checked: { d: 'mafia', b: 'town' },
+    suspicion: { b: 5, c: 4 },        // jamoatchilik boshqa odamni shubhalaydi
+    votes: {}, round: 2,
+    persona: { speed: 0.5, activity: 1, bandwagon: 0.2, noise: 0, ping: 50 },
+  };
+  let hit = 0;
+  for (let i = 0; i < 200; i++) if (chooseDayVote(ctx, Math.random) === 'd') hit++;
+  assert.ok(hit > 150, 'tekshirilgan mafiyaga ovoz berish ustun bo\'lishi kerak: ' + hit + '/200');
+});
+
+test('komissar tinch deb bilgan odamga ovoz bermaydi (deyarli)', () => {
+  const ctx = {
+    me: P('a', 'komissar'), alive: ALIVE, mates: [],
+    checked: { b: 'town' }, suspicion: { b: 8 },
+    votes: {}, round: 2,
+    persona: { speed: 0.5, activity: 1, bandwagon: 0.2, noise: 0, ping: 50 },
+  };
+  let hit = 0;
+  for (let i = 0; i < 300; i++) if (chooseDayVote(ctx, Math.random) === 'b') hit++;
+  assert.ok(hit < 20, 'tekshirilgan tinch aholiga ovoz berish kamayishi kerak: ' + hit + '/300');
+});
+
+test('bandwagon: ko\'pchilik tanlagan odamga qo\'shiladi', () => {
+  const base = {
+    me: P('a'), alive: ALIVE, mates: [], suspicion: {}, round: 2,
+    votes: { b: 'c', d: 'c', e: 'c' },     // uchtasi c ga ovoz bergan
+  };
+  const high = { ...base, persona: { speed: 0.5, activity: 1, bandwagon: 0.75, noise: 0, ping: 50 } };
+  const low = { ...base, persona: { speed: 0.5, activity: 1, bandwagon: 0.15, noise: 0, ping: 50 } };
+  const count = (ctx) => {
+    let n = 0;
+    for (let i = 0; i < 400; i++) if (chooseDayVote(ctx, Math.random) === 'c') n++;
+    return n;
+  };
+  assert.ok(count(high) > count(low), 'bandwagon yuqori bot ko\'pchilikka ko\'proq qo\'shiladi');
+});
+
+test('AFK: activity past bot ba\'zan umuman ovoz bermaydi', () => {
+  const ctx = {
+    me: P('a'), alive: ALIVE, mates: [], suspicion: {}, votes: {}, round: 2,
+    persona: { speed: 0.5, activity: 0.75, bandwagon: 0.3, noise: 0, ping: 50 },
+  };
+  let skipped = 0;
+  for (let i = 0; i < 400; i++) if (chooseDayVote(ctx, Math.random) === null) skipped++;
+  assert.ok(skipped > 40 && skipped < 200, 'AFK ehtimoli haqiqatga o\'xshash: ' + skipped + '/400');
+});
+
+test('bot o\'ziga ovoz bermaydi', () => {
+  const ctx = {
+    me: P('a'), alive: ALIVE, mates: [], suspicion: { a: 50 },
+    votes: {}, round: 2,
+    persona: { speed: 0.5, activity: 1, bandwagon: 0.3, noise: 0.2, ping: 50 },
+  };
+  for (let i = 0; i < 300; i++) {
+    assert.notEqual(chooseDayVote(ctx, Math.random), 'a', 'bot o\'ziga ovoz berdi');
+  }
+});
+
+// ---------- tungi harakat ----------
+
+test('komissar bir odamni ikki marta tekshirmaydi', () => {
+  const ctx = {
+    role: 'komissar', me: P('a', 'komissar'), alive: ALIVE, mates: [],
+    memory: { checkedSids: ['b', 'c'] }, suspicion: { b: 10, c: 10 },
+  };
+  for (let i = 0; i < 300; i++) {
+    const t = chooseNightTarget(ctx, Math.random);
+    assert.ok(t === 'd' || t === 'e', 'tekshirilmagan odamni tanlashi kerak, tanladi: ' + t);
+  }
+});
+
+test('hammasi tekshirilgan bo\'lsa komissar qotib qolmaydi', () => {
+  const ctx = {
+    role: 'komissar', me: P('a', 'komissar'), alive: ALIVE, mates: [],
+    memory: { checkedSids: ['b', 'c', 'd', 'e'] }, suspicion: {},
+  };
+  const t = chooseNightTarget(ctx, Math.random);
+  assert.ok(t && t !== 'a', 'nishon bo\'lishi kerak');
+});
+
+test('doktor ketma-ket bir odamni davolamaydi', () => {
+  const ctx = {
+    role: 'doctor', me: P('a', 'doctor'), alive: ALIVE, mates: [],
+    memory: { healedLast: 'b' }, killedTargets: ['b'], suspicion: {},
+  };
+  for (let i = 0; i < 200; i++) {
+    assert.notEqual(chooseNightTarget(ctx, Math.random), 'b', 'o\'yin qoidasi buzildi');
+  }
+});
+
+test('mafiya sherigini o\'ldirmaydi', () => {
+  const ctx = {
+    role: 'mafia', me: P('a', 'mafia'), alive: ALIVE, mates: ['a', 'b'],
+    memory: {}, suspicion: {}, voteWeight: { b: 99 },
+  };
+  for (let i = 0; i < 300; i++) {
+    const t = chooseNightTarget(ctx, Math.random);
+    assert.notEqual(t, 'b', 'mafiya sherigini nishonga oldi');
+    assert.notEqual(t, 'a', 'mafiya o\'zini nishonga oldi');
+  }
+});
+
+test('mafiya ishonch qozongan odamni nishonga oladi', () => {
+  // suspicion past = jamoa ishonadi = mafiya uchun xavfli
+  const ctx = {
+    role: 'don', me: P('a', 'don'), alive: ALIVE, mates: ['a'],
+    memory: {}, suspicion: { b: 0, c: 8, d: 8, e: 8 }, voteWeight: {},
+  };
+  let b = 0;
+  for (let i = 0; i < 400; i++) if (chooseNightTarget(ctx, Math.random) === 'b') b++;
+  assert.ok(b > 130, 'ishonchli o\'yinchi ko\'proq nishonga olinishi kerak: ' + b + '/400');
+});
+
+test('escort ketma-ket bir odamni bloklamaydi', () => {
+  const ctx = {
+    role: 'escort', me: P('a', 'escort'), alive: ALIVE, mates: [],
+    memory: { blockedLast: 'c' }, suspicion: { c: 20 },
+  };
+  for (let i = 0; i < 200; i++) {
+    assert.notEqual(chooseNightTarget(ctx, Math.random), 'c');
+  }
+});
+
+test('noma\'lum rol ham nishon qaytaradi (qotib qolmaydi)', () => {
+  const t = chooseNightTarget({
+    role: 'yangi_rol', me: P('a'), alive: ALIVE, mates: [], memory: {}, suspicion: {},
+  }, Math.random);
+  assert.ok(t && t !== 'a');
+});
+
+test('bitta tirik qolganda tungi harakat null bo\'ladi', () => {
+  const t = chooseNightTarget({
+    role: 'mafia', me: P('a', 'mafia'), alive: [P('a')], mates: ['a'], memory: {}, suspicion: {},
+  }, Math.random);
+  assert.equal(t, null);
+});
+
+// ---------- yordamchilar ----------
+
+test('weightedPick vaznga qarab tanlaydi', () => {
+  const items = [{ v: 'x', w: 9 }, { v: 'y', w: 1 }];
+  let x = 0;
+  for (let i = 0; i < 1000; i++) if (weightedPick(items, Math.random) === 'x') x++;
+  assert.ok(x > 820 && x < 970, 'taqsimot vaznga mos emas: ' + x + '/1000');
+});
+
+test('weightedPick bo\'sh/nolga chidamli', () => {
+  assert.equal(weightedPick([], Math.random), null);
+  assert.equal(weightedPick([{ v: 'a', w: 0 }], Math.random), null);
+});
+
+test('buildVoteWeight faol o\'yinchini ajratadi', () => {
+  const w = buildVoteWeight([
+    { type: 'vote', round: 1, from: 'a', to: 'b' },
+    { type: 'vote', round: 2, from: 'a', to: 'c' },
+    { type: 'vote', round: 1, from: 'd', to: 'b' },
+  ]);
+  assert.ok(w.a > w.d, 'ko\'p ovoz bergan a faolroq');
+});
+
+test('bo\'sh tarix bilan ham ishlaydi', () => {
+  assert.deepEqual(buildVoteWeight([]), {});
+  const s = buildSuspicion([], ALIVE);
+  assert.equal(Object.values(s).filter(v => v !== 0).length, 0);
+});
+
+// ---------- xonani to'ldiruvchi botlar ----------
+
+test('botlar soni aniq, ismlar takrorlanmaydi', () => {
+  const bots = makeFillerBots('game123456', 7, ['Ilhomjon']);
+  assert.equal(bots.length, 7);
+  const names = bots.map(b => b.username);
+  assert.equal(new Set(names).size, 7, 'ismlar takrorlandi: ' + names.join(', '));
+});
+
+test('bot ekanini oshkor qiladigan belgi YO\'Q', () => {
+  const bots = makeFillerBots('g1', 12, []);
+  for (const b of bots) {
+    assert.ok(!/bot/i.test(b.username), 'ismda "bot" bor: ' + b.username);
+    assert.ok(!b.username.includes('🤖'), 'ismda robot emojisi bor');
+    assert.ok(!/^bot-/.test(b.socketId), 'socketId bot ekanini ko\'rsatadi: ' + b.socketId);
+    assert.ok(!/bot/i.test(b.publicId), 'publicId bot ekanini ko\'rsatadi: ' + b.publicId);
+    assert.ok(b.publicId.startsWith('c'), 'publicId cuid ga o\'xshashi kerak: ' + b.publicId);
+    assert.ok(b.socketId.length >= 18, 'socketId socket.io formatiga o\'xshamaydi');
+  }
+});
+
+test('server ichida bot sifatida taniladi', () => {
+  const bots = makeFillerBots('g1', 3, []);
+  for (const b of bots) {
+    assert.equal(b.isBot, true, 'server mantiqi shunga tayanadi');
+    assert.ok(String(b.userId).startsWith('bot-'), 'isRealUser() shu prefiksga tayanadi');
+    assert.ok(b.persona && typeof b.persona.speed === 'number', 'xarakter berilishi kerak');
+  }
+});
+
+test('xonaga bir vaqtda kirib qolmaydi', () => {
+  const bots = makeFillerBots('g1', 8, []);
+  const times = new Set(bots.map(b => b.joinedAt));
+  assert.ok(times.size >= 7, 'kirish vaqtlari tarqoq bo\'lishi kerak: ' + times.size);
+  const now = Date.now();
+  for (const b of bots) {
+    assert.ok(b.joinedAt <= now, 'kelajakda kirgan bo\'lib chiqmasin');
+    assert.ok(now - b.joinedAt < 5 * 60 * 1000, 'juda eski ko\'rinmasin');
+  }
+  // ro'yxat kirish vaqti bo'yicha tartiblangan bo'lishi kerak
+  for (let i = 1; i < bots.length; i++) assert.ok(bots[i].joinedAt >= bots[i - 1].joinedAt);
+});
+
+test('host taxallusi takrorlanmaydi', () => {
+  const bots = makeFillerBots('g1', 5, ['Sardor', 'aziz_99']);
+  const names = bots.map(b => b.username.toLowerCase());
+  assert.ok(!names.includes('sardor'), 'host ismi bilan bir xil bot paydo bo\'ldi');
+  assert.ok(!names.includes('aziz_99'));
+});
+
+test('ismlar tugasa ham ishlaydi (zaxira nom)', () => {
+  const bots = makeFillerBots('g1', BOT_NAMES.length + 5, []);
+  assert.equal(bots.length, BOT_NAMES.length + 5);
+  assert.equal(new Set(bots.map(b => b.username)).size, bots.length, 'zaxira nomlar ham takrorlanmasligi kerak');
+});
+
+test('nol bot so\'ralsa bo\'sh ro\'yxat', () => {
+  assert.deepEqual(makeFillerBots('g1', 0, []), []);
+});

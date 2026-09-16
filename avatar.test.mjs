@@ -23,12 +23,13 @@ test('avatar haqiqiy SVG va ixcham', () => {
   }
 });
 
-test('botlarda avatar BOR (avatarsiz o\'yinchi oshkor qiladi)', () => {
+test("botlarda rasm yo'q — taxallusning birinchi harfi ko'rsatiladi", () => {
+  // Foydalanuvchi qarori: soxta o'yinchilarda profil rasmi bo'lmasin.
+  // Mijoz avatarsiz o'yinchi uchun ismning birinchi harfini chizadi —
+  // haqiqiy o'yinchilarning ko'pida ham avatar yo'q, ya'ni bu odatiy ko'rinish.
   for (const b of makeFillerBots('g1', 6, [])) {
-    assert.ok(b.avatar, 'avatar bo\'lishi kerak');
-    assert.ok(b.avatar.startsWith('/api/avatar/'), 'endpoint URL: ' + b.avatar);
-    assert.ok(b.avatar.length < 60, 'URL qisqa bo\'lishi kerak (har xabarda ketadi)');
-    assert.ok(!/bot/i.test(b.avatar), 'URL bot ekanini oshkor qiladi: ' + b.avatar);
+    assert.equal(b.avatar, null, "botda rasm bolmasligi kerak");
+    assert.ok(b.username && b.username.length > 1, 'harf uchun ism kerak');
   }
 });
 

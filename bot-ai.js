@@ -445,7 +445,11 @@ export function makeFillerBots(gameId, count, usedNames = []) {
       userId,
       publicId,
       username: pool[i] || ('mafia' + crypto.randomInt(1000, 9999)),
-      avatar: botAvatarUrl(publicId), role: null, isAlive: true, connected: true, isHost: false,
+      // Rasm YO'Q — mijoz taxallusning birinchi harfini chizadi. Ko'p haqiqiy
+      // o'yinchida ham avatar bo'lmaydi (Google rasm bermasa), shuning uchun
+      // harf odatiy ko'rinish. `avatar.js` va /api/avatar o'z joyida qoladi:
+      // rasm kerak bo'lsa shu qatorni botAvatarUrl(publicId) ga qaytarish kifoya.
+      avatar: null, role: null, isAlive: true, connected: true, isHost: false,
       isBot: true,
       // Haqiqiy qo'shilish vaqti server tomonda yoziladi: botlar xonaga
       // bittalab, 2-9 soniya oralig'ida kiradi (server.js: scheduleBotJoins).

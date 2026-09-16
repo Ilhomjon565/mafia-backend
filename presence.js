@@ -1,50 +1,140 @@
-// ==================== ONLAYN KO'RSATKICHI ====================
+// ==================== SAYT FAOLLIGI KO'RSATKICHLARI ====================
 // Yangi platformaning eng katta muammosi — "bo'sh restoran": o'yinchi kirib,
-// "0 kishi onlayn" ni ko'radi va qaytib ketadi. Shuning uchun ko'rsatkichga
-// bazaviy egri chiziq qo'shiladi.
+// "0 kishi onlayn, 0 xona" ni ko'radi va qaytib ketadi. Shu sababli
+// ko'rsatkichlarga bazaviy qiymat qo'shiladi.
 //
-// NEGA SOAT BO'YICHA, doimiy raqam emas: haqiqiy saytda tunda 03:00 da ham
-// 220 kishi turmaydi. Doimiy raqam birinchi kuzatuvchi odamni shubhalantiradi,
-// soatga qarab o'zgaruvchi raqam esa tabiiy ko'rinadi.
+// IKKI QAT'IY QOIDA:
+//  1. HAQIQIY faollik har doim USTIGA qo'shiladi. Yangi hisob ro'yxatdan
+//     o'tsa — umumiy son bittaga ko'payadi; odam saytga kirsa — onlayn
+//     bittaga ko'payadi. Soxta qism buni yashirmaydi.
+//  2. Son HECH QACHON kamaymaydi. Ilgari kunlik o'sish `% 900` bilan
+//     hisoblanardi va son bir kun 4400, ertasiga 4100 bo'lib TUSHIB ketardi —
+//     buni sezgan odam darhol soxta ekanini tushunadi.
 //
-// QIYMAT VAQTDAN HISOBLANADI (Math.random() yo'q). Bu muhim:
-//  - uchta frontend instansiyasi ham bir xil son ko'rsatadi;
-//  - 10 soniyalik kesh bilan ziddiyat bo'lmaydi;
-//  - sahifa yangilanganda raqam sakramaydi.
-
-// Har soat uchun taxminiy onlayn (indeks = Toshkent vaqti bo'yicha soat)
-export const ONLINE_CURVE = [
-  148, 116, 92, 78, 74, 82,       // 00-05  tun: eng kam 04:00 da
-  98, 124, 146, 158, 164, 170,    // 06-11  ertalab o'sish
-  176, 172, 166, 172, 186, 202,   // 12-17  kunduz
-  218, 231, 234, 226, 204, 176,   // 18-23  kechqurun: eng gavjum 20:00
-];
+// Qiymatlar VAQTdan hisoblanadi (Math.random() yo'q): uchta frontend
+// instansiyasi ham, 10 soniyalik kesh ham bir xil son ko'rsatadi va raqam
+// sahifa yangilanganda sakramaydi.
 
 // Toshkent = UTC+5, yoz/qish o'zgarishi yo'q.
-const TASHKENT_OFFSET_MS = 5 * 3600 * 1000;
+const TZ_MS = 5 * 3600 * 1000;
+// Sayt bitta serverga ko'chgan kun — o'sish shu sanadan hisoblanadi.
+const EPOCH = Date.UTC(2026, 8, 15);
 
-// `enabled` false bo'lsa 0 qaytaradi — ya'ni faqat haqiqiy onlayn ko'rinadi.
+const daysSince = (now) => Math.max(0, Math.floor((now + TZ_MS - EPOCH) / 86400000));
+
+// ---------- onlayn ----------
+
+// Har soat uchun taxminiy onlayn (indeks = Toshkent vaqti bo'yicha soat).
+// Diapazon 50-150: tunda eng kam, kechqurun 20:00 da eng gavjum.
+export const ONLINE_CURVE = [
+  96, 78, 62, 54, 50, 55,        // 00-05  tun
+  64, 78, 88, 95, 99, 103,       // 06-11  ertalab
+  107, 105, 101, 105, 114, 124,  // 12-17  kunduz
+  136, 147, 150, 143, 128, 110,  // 18-23  kechqurun
+];
+
 export function fakeOnlineBase(now = Date.now(), enabled = true) {
   if (!enabled) return 0;
-  const t = new Date(now + TASHKENT_OFFSET_MS);
+  const t = new Date(now + TZ_MS);
   const h = t.getUTCHours(), m = t.getUTCMinutes();
   const a = ONLINE_CURVE[h], b = ONLINE_CURVE[(h + 1) % 24];
   const base = a + (b - a) * (m / 60);   // soatlar orasida silliq o'tish
 
-  // Sekin tebranish: uch xil davrli sinus qo'shiladi, natija uzluksiz —
-  // raqam "tirik" ko'rinadi, lekin sakramaydi. Amplituda ~±10.
+  // Sekin tebranish: uch xil davrli sinus, natija uzluksiz — raqam "tirik"
+  // ko'rinadi, lekin sakramaydi. Amplituda ~±6 (diapazon kichik bo'lgani uchun).
   const min = Math.floor(now / 60000);
-  const wave = Math.sin(min / 7.3) * 4.5 + Math.sin(min / 2.9) * 2.5 + Math.sin(min / 17) * 3;
+  const wave = Math.sin(min / 7.3) * 2.8 + Math.sin(min / 2.9) * 1.6 + Math.sin(min / 17) * 1.8;
 
-  return Math.max(35, Math.round(base + wave));
+  return Math.max(28, Math.round(base + wave));
 }
 
-// Ro'yxatdan o'tganlar soni ham onlayn bilan mos bo'lishi kerak: 220 kishi
-// onlayn bo'lsa, umumiy 300 ta hisob g'alati ko'rinadi. Koeffitsiyent ~23
-// (odatiy o'yin saytlarida onlayn/jami nisbati 3-6%).
+// ---------- ro'yxatdan o'tganlar ----------
+
+// 1300 dan boshlanadi va kundan kunga sekin o'sadi. Kamaymaydi.
 export function fakePlayersBase(now = Date.now(), enabled = true) {
   if (!enabled) return 0;
-  // Kun bo'yi o'zgarmasin: sana bo'yicha sekin o'sadigan son.
-  const days = Math.floor((now + TASHKENT_OFFSET_MS) / 86400000);
-  return 4200 + days * 17 % 900;
+  return 1300 + daysSince(now) * 4;
+}
+
+// ---------- o'ynalgan o'yinlar ----------
+
+// 30 dan boshlanadi. Kun bo'yi ham sekin o'sadi (o'yinlar tugab turadi),
+// lekin hech qachon kamaymaydi: kun ichidagi o'sish soatga bog'langan.
+export function fakeGamesPlayed(now = Date.now(), enabled = true) {
+  if (!enabled) return 0;
+  const d = daysSince(now);
+  const hour = new Date(now + TZ_MS).getUTCHours();
+  return 30 + d * 11 + Math.floor(hour / 2);
+}
+
+// ---------- lobbidagi xonalar ----------
+
+// Xona nomlari — haqiqiy o'yinchilar yozadigan uslubda.
+const ROOM_NAMES = [
+  'Tungi shahar', 'Tez o\'yin', 'Faqat tajribalilar', 'Kim mafiya?',
+  'Do\'stlar davrasi', 'Mafiya 12', 'Kechki o\'yin', 'Toshkent',
+  'Yangi boshlovchilar', 'Klassik', 'Ovozli chat bor', 'Qizg\'in jang',
+  'Sokin xona', 'Tezkor', 'Katta o\'yin', 'Mafia UZ', 'Kim kim?',
+  'Shahar uxlaydi', 'Tunda ov', 'Oltin xona',
+];
+const PLAYER_NAMES = [
+  'Sardor', 'Aziza', 'Bekzod', 'Malika', 'Jasur', 'Nilufar', 'Otabek',
+  'Zuhra', 'Kamola', 'Temur', 'Doston', 'Elyor', 'Javohir', 'Mirzo',
+  'aziz_99', 'bobur7', 'jasurbek', 'temurxon', 'malika_x', 'nodirbek',
+  'Sanjar', 'Ulugbek', 'Xurshid', 'Feruza', 'Sevara', 'sherzod',
+];
+
+// Deterministik hash — bir xil kirish har doim bir xil natija beradi.
+function h32(n) {
+  let x = (n | 0) ^ 0x9e3779b9;
+  x = Math.imul(x ^ (x >>> 16), 0x85ebca6b);
+  x = Math.imul(x ^ (x >>> 13), 0xc2b2ae35);
+  return ((x ^ (x >>> 16)) >>> 0);
+}
+
+// Lobbi uchun soxta xonalar.
+//
+// HAMMASI TO'LGAN yoki JANGDA — ya'ni ularga qo'shilib bo'lmaydi. Bu ataylab:
+// soxta xonaning ID si haqiqiy emas, unga kirmoqchi bo'lgan odam "Xona
+// topilmadi" xatosini ko'rardi. Frontend to'lgan/jangda xonaning tugmasini
+// o'zi bloklaydi, shuning uchun bunday holat yuzaga kelmaydi.
+//
+// To'plam har 7 daqiqada yangilanadi: xonalar "tugaydi", o'rniga boshqasi
+// "ochiladi" — lobbi jonli ko'rinadi.
+export function fakeRooms(now = Date.now(), enabled = true) {
+  if (!enabled) return [];
+  const slot = Math.floor(now / (7 * 60000));
+  const count = 5 + (h32(slot) % 6);            // 5-10 ta
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    const s = h32(slot * 977 + i * 31);
+    const total = [8, 9, 10, 10, 12, 12, 14, 16][s % 8];
+    // 70% jangda, 30% to'lgan va boshlanishini kutmoqda
+    const playing = (s >> 3) % 10 < 7;
+    const mafiaCount = Math.max(1, Math.round(total * 0.3));
+    const players = [];
+    const shift = s % PLAYER_NAMES.length;
+    for (let k = 0; k < total; k++) {
+      players.push({
+        userId: 'c' + (h32(slot * 7919 + i * 101 + k) >>> 0).toString(16).padStart(8, '0') + i + k,
+        username: PLAYER_NAMES[(shift + k * 7) % PLAYER_NAMES.length],
+        isAlive: true,
+      });
+    }
+    out.push({
+      id: 'c' + (h32(slot * 104729 + i) >>> 0).toString(16).padStart(8, '0') + 'x' + i,
+      name: ROOM_NAMES[(s >> 7) % ROOM_NAMES.length],
+      status: playing ? 'playing' : 'waiting',
+      totalPlayers: total,
+      mafiaCount,
+      sheriffCount: 1,
+      doctorCount: 1,
+      civilCount: Math.max(0, total - mafiaCount - 2),
+      hostId: 'fake',
+      createdAt: new Date(now - ((s % 25) + 2) * 60000).toISOString(),
+      phase: playing ? 'day_discussion' : 'waiting',
+      players,               // to'liq — ya'ni xona TO'LGAN
+    });
+  }
+  return out;
 }

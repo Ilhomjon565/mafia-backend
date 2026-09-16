@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import {
   makePersona, voteDelayMs, fakePing, buildSuspicion,
   buildVoteWeight, chooseDayVote, chooseNightTarget, weightedPick,
-  makeFillerBots, BOT_NAMES,
+  makeFillerBots, BOT_NAMES, botAvatar,
 } from './bot-ai.js';
 
 const P = (sid, role) => ({ socketId: sid, username: sid, role });
@@ -333,17 +333,15 @@ test('server ichida bot sifatida taniladi', () => {
   }
 });
 
-test('xonaga bir vaqtda kirib qolmaydi', () => {
+test("qo'shilish vaqti server tomonda beriladi", () => {
+  // Botlar xonaga bittalab kiradi (server.js: scheduleBotJoins), shuning uchun
+  // bu yerda faqat boshlang'ich qiymat bo'ladi.
   const bots = makeFillerBots('g1', 8, []);
-  const times = new Set(bots.map(b => b.joinedAt));
-  assert.ok(times.size >= 7, 'kirish vaqtlari tarqoq bo\'lishi kerak: ' + times.size);
   const now = Date.now();
   for (const b of bots) {
-    assert.ok(b.joinedAt <= now, 'kelajakda kirgan bo\'lib chiqmasin');
-    assert.ok(now - b.joinedAt < 5 * 60 * 1000, 'juda eski ko\'rinmasin');
+    assert.ok(typeof b.joinedAt === "number", "joinedAt bolishi kerak");
+    assert.ok(Math.abs(now - b.joinedAt) < 5000, "kelajakda yoki juda eski bolmasin");
   }
-  // ro'yxat kirish vaqti bo'yicha tartiblangan bo'lishi kerak
-  for (let i = 1; i < bots.length; i++) assert.ok(bots[i].joinedAt >= bots[i - 1].joinedAt);
 });
 
 test('host taxallusi takrorlanmaydi', () => {
@@ -361,4 +359,33 @@ test('ismlar tugasa ham ishlaydi (zaxira nom)', () => {
 
 test('nol bot so\'ralsa bo\'sh ro\'yxat', () => {
   assert.deepEqual(makeFillerBots('g1', 0, []), []);
+});
+
+// ---------- profil rasmi ----------
+
+test('har bot uchun boshqa avatar, lekin har doim bir xil', () => {
+  const a1 = botAvatar('seed-1'), a2 = botAvatar('seed-1'), b = botAvatar('seed-2');
+  assert.equal(a1, a2, 'bir xil seed -> bir xil rasm (kesh uchun shart)');
+  assert.notEqual(a1, b, 'boshqa seed -> boshqa rasm');
+});
+
+test('avatar haqiqiy SVG va ixcham', () => {
+  for (let i = 0; i < 40; i++) {
+    const svg = botAvatar('bot' + i);
+    assert.ok(svg.startsWith('<svg '), 'SVG bo\'lishi kerak');
+    assert.ok(svg.endsWith('</svg>'), 'yopilishi kerak');
+    assert.ok(svg.includes('viewBox="0 0 80 80"'));
+    assert.ok(svg.length < 2500, 'juda katta: ' + svg.length);
+    // XSS: seed rasm ichiga tushmasligi kerak
+    assert.ok(!svg.includes('bot' + i), 'seed SVG ichiga chiqib ketdi');
+  }
+});
+
+test('botlarda avatar BOR (avatarsiz o\'yinchi oshkor qiladi)', () => {
+  for (const b of makeFillerBots('g1', 6, [])) {
+    assert.ok(b.avatar, 'avatar bo\'lishi kerak');
+    assert.ok(b.avatar.startsWith('/api/avatar/'), 'endpoint URL: ' + b.avatar);
+    assert.ok(b.avatar.length < 60, 'URL qisqa bo\'lishi kerak (har xabarda ketadi)');
+    assert.ok(!/bot/i.test(b.avatar), 'URL bot ekanini oshkor qiladi: ' + b.avatar);
+  }
 });

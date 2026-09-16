@@ -11,10 +11,10 @@ import { OAuth2Client } from 'google-auth-library';
 import crypto from 'crypto';
 import {
   makePersona, voteDelayMs, fakePing, buildSuspicion, buildVoteWeight,
-  chooseDayVote, chooseNightTarget, makeFillerBots, BOT_NAMES,
+  chooseDayVote, chooseNightTarget, makeFillerBots, BOT_NAMES, botAvatar,
 } from './bot-ai.js';
 // Onlayn ko'rsatkichi egri chizig'i — alohida modulda, testlari presence.test.mjs da
-import { fakeOnlineBase, fakePlayersBase } from './presence.js';
+import { fakeOnlineBase, fakePlayersBase, fakeGamesPlayed, fakeRooms } from './presence.js';
 // FAKE_ONLINE=0 — soxta qo'shimchani butunlay o'chiradi (faqat haqiqiy onlayn)
 const FAKE_ONLINE = process.env.FAKE_ONLINE !== '0';
 import {
@@ -1055,11 +1055,14 @@ app.get('/api/stats', async (_, res) => {
     ]);
     // Haqiqiy onlayn ustiga bazaviy egri chiziq qo'shiladi — real o'yinchilar
     // kelganda raqam ular bilan birga o'sadi.
-    const fake = fakeOnlineBase(Date.now(), FAKE_ONLINE);
+    // Haqiqiy faollik har doim USTIGA qo'shiladi: yangi hisob ro'yxatdan
+    // o'tsa umumiy son bittaga ko'payadi, odam kirsa onlayn bittaga ko'payadi.
+    const t = Date.now();
     const data = {
-      players: players + fakePlayersBase(Date.now(), FAKE_ONLINE),
-      gamesPlayed, activeGames,
-      online: onAuth + onAnon + fake,
+      players: players + fakePlayersBase(t, FAKE_ONLINE),
+      gamesPlayed: gamesPlayed + fakeGamesPlayed(t, FAKE_ONLINE),
+      activeGames: activeGames + fakeRooms(t, FAKE_ONLINE).length,
+      online: onAuth + onAnon + fakeOnlineBase(t, FAKE_ONLINE),
       onlineAuthed: onAuth,
     };
     await redis.set('cache:pubstats', JSON.stringify(data), 'EX', 10).catch(() => {});
@@ -1124,7 +1127,13 @@ app.get('/api/games', async (_, res) => {
         players: (state?.players || []).map(p => ({ userId: p.userId, username: p.username, isAlive: p.isAlive }))
       };
     }));
-    const list = enriched.filter(Boolean);
+    // Lobbi bo'sh ko'rinmasin: soxta xonalar qo'shiladi. Ularning HAMMASI
+    // to'lgan yoki jangda — ya'ni qo'shilib bo'lmaydi (frontend bunday
+    // xonaning tugmasini o'zi bloklaydi). Sabab: soxta xona ID si haqiqiy
+    // emas, unga kirmoqchi bo'lgan odam "Xona topilmadi" xatosini ko'rardi.
+    // Haqiqiy xonalar tepada turadi — odamlar bir-birini topa olsin.
+    const real = enriched.filter(Boolean);
+    const list = [...real, ...fakeRooms(Date.now(), FAKE_ONLINE)];
     await redis.set('cache:games', JSON.stringify(list), 'EX', 3).catch(() => {});
     res.json(list);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1190,11 +1199,13 @@ app.post('/api/games', authMiddleware, limitByUser(30), async (req, res) => {
     const fillers = wantBots > 0 ? makeFillerBots(game.id, wantBots, [req.user.username]) : [];
 
     const state = {
-      ...game, players: fillers, phase: 'waiting', roleConfig: roleConfig || null,
+      ...game, players: [], phase: 'waiting', roleConfig: roleConfig || null,
       dayVotes: {}, nightActions: {}, round: 0, durations: settings.durations, log: [],
       botEvents: [], kicked: {},
     };
     await saveG(game.id, state);
+    // Botlar bittalab, 2-9 soniya oralig'ida qo'shiladi
+    if (fillers.length) scheduleBotJoins(game.id, fillers);
     scheduleEmptyCheck(game.id); // 2 daqiqa ichida ODAM kirmasa o'chadi
     tgRoomAnnounce(game.id).catch(() => {}); // Telegram guruhiga e'lon (ochiq xonalar)
     res.json(game);
@@ -1309,6 +1320,24 @@ app.get('/api/games/:id', async (req, res) => {
     if (!g) return res.status(404).json({ error: 'Xona topilmadi yoki tugagan' });
     res.json(publicGame(g));
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ==================== AVATAR RASMLARI ====================
+// Xonani to'ldiruvchi o'yinchilarning profil rasmi. Avatar SVG sifatida
+// generatsiya qilinadi (identicon uslubi) va BIR YIL keshlanadi — brauzer
+// uni bir marta oladi.
+//
+// Nega data URI emas: u ~1.5 KB va har `game_state` xabari bilan qayta-qayta
+// ketardi. Nega tashqi xizmat emas: CSP'ga yangi manba kerak bo'lardi va
+// o'sha xizmat o'chsa avatarlar yo'qolardi.
+//
+// Auth talab qilinmaydi: rasm maxfiy emas, va `<img>` tegi sarlavha yubormaydi.
+app.get('/api/avatar/:seed', (req, res) => {
+  const seed = String(req.params.seed || '').slice(0, 64).replace(/[^A-Za-z0-9_-]/g, '');
+  if (!seed) return res.status(400).end();
+  res.set('Content-Type', 'image/svg+xml; charset=utf-8');
+  res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  res.send(botAvatar(seed));
 });
 
 // ==================== ICE SERVERLAR (ovozli chat) ====================
@@ -1678,6 +1707,7 @@ function scheduleAbandonCheck(gameId) {
 
 async function deleteIfEmpty(gameId) {
   emptyTimers.delete(gameId);
+  cancelBotJoins(gameId);
   const g = await getG(gameId);
   if (!g) return;
   // faqat hali boshlanmagan (waiting) va HAQIQIY odam yo'q xonalar o'chiriladi.
@@ -2446,6 +2476,39 @@ async function endNightStep(gameId, idx) {
 
 // ==================== BOTLAR BILAN O'YIN ====================
 const botDeleteTimers = new Map();
+// Xonaga qo'shilishni kutayotgan botlarning taymerlari (gameId -> [Timeout])
+const botJoinTimers = new Map();
+
+// Botlar xonaga BIRDAN emas, bittalab qo'shiladi: 2-9 soniya oralig'ida.
+// Xona egasi "odamlar kelayotganini" ko'radi — bir zumda to'lgan xona
+// darhol soxta ekanini bildirardi.
+function scheduleBotJoins(gameId, bots) {
+  cancelBotJoins(gameId);
+  const timers = [];
+  let delay = 0;
+  for (const bot of bots) {
+    delay += 2000 + crypto.randomInt(7000);   // 2-9 s
+    timers.push(setTimeout(() => withLock(gameId, async () => {
+      const g = await getG(gameId);
+      // O'yin boshlangan, xona o'chirilgan yoki to'lgan bo'lsa — qo'shmaymiz.
+      // Xona egasi bu botni allaqachon chiqarib yuborgan bo'lishi ham mumkin.
+      if (!g || g.status !== 'waiting') return;
+      if ((g.players || []).length >= g.totalPlayers) return;
+      if (g.players.some(p => p.userId === bot.userId)) return;
+      if (g.kicked?.[bot.userId]) return;
+      bot.joinedAt = Date.now();
+      g.players.push(bot);
+      await saveG(gameId, g);
+      logEvent(g, '👋', `${bot.username} o'yinga qo'shildi`, 'playerJoined', { name: bot.username });
+      io.to(`game:${gameId}`).emit('game_state', publicGame(g));
+    }), delay));
+  }
+  botJoinTimers.set(gameId, timers);
+}
+function cancelBotJoins(gameId) {
+  for (const t of botJoinTimers.get(gameId) || []) clearTimeout(t);
+  botJoinTimers.delete(gameId);
+}
 function isBot(p) { return p && p.isBot === true; }
 const clamp01 = (v) => (Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0.7);
 function botDelayMs() { return 2000 + Math.floor(Math.random() * 2500); } // 2.0–4.5s
@@ -2464,6 +2527,7 @@ async function beginGame(gameId) {
   const g = await getG(gameId);
   if (!g || g.status !== 'waiting') return;
   cancelEmptyCheck(gameId);
+  cancelBotJoins(gameId);   // qolgan botlar endi qo'shilmaydi
   g.players = assignRoles(g.players, g.roleConfig);
   g.status = 'playing';
   g.round = 0; g.nightActions = {}; g.dayVotes = {}; g.log = []; g.secretLog = [];

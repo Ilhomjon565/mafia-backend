@@ -25,7 +25,31 @@ import {
 // bo'sh ko'ringan va admin tasdiqlash "disabled" bo'lib qolgandi).
 dotenv.config({ override: true });
 
-const JWT_SECRET = process.env.JWT_SECRET || 'mafia-dev-secret';
+// JWT_SECRET — production'da MAJBURIY. Ilgari zaxira qiymat ('mafia-dev-secret')
+// ishlatilardi: `.env` yuklanmay qolsa (bu loyihada bir marta bo'lgan) server
+// JIMGINA hammaga ma'lum sir bilan ishlab ketardi va istalgan odam o'ziga
+// `isAdmin: true` tokenini yasay olardi. Endi bunday holatda server ishga
+// tushmaydi — jim ishlashdan ko'ra yiqilish xavfsizroq.
+// Dev'da (NODE_ENV != production) har ishga tushishda tasodifiy sir olinadi:
+// eski tokenlar bekor bo'ladi, lekin zaif sir hech qachon ishlatilmaydi.
+const JWT_SECRET = (() => {
+  const v = process.env.JWT_SECRET;
+  if (v && v.length >= 32) return v;
+  if (process.env.NODE_ENV === 'production') {
+    console.error(v
+      ? 'FATAL: JWT_SECRET juda qisqa (kamida 32 belgi kerak).'
+      : "FATAL: JWT_SECRET topilmadi. /srv/mafia/backend.env ni tekshiring.");
+    process.exit(1);
+  }
+  const tmp = crypto.randomBytes(32).toString('hex');
+  console.warn("OGOHLANTIRISH: JWT_SECRET topilmadi — vaqtinchalik tasodifiy sir olindi (faqat dev).");
+  return tmp;
+})();
+// Parol hash kuchi. 8 -> 12: 2026 yil tavsiyasi 10-14 oralig'ida. Hash ichida
+// round soni saqlanadi, shuning uchun ESKI parollar ham ishlaydi — ular keyingi
+// marta parol o'zgartirilganda yangi kuchga o'tadi.
+const BCRYPT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12');
+
 // maxfiy admin kalit — admin panel/API'ni yashiradi. .env'da bo'ladi (repoda yo'q).
 const ADMIN_ACCESS_KEY = process.env.ADMIN_ACCESS_KEY || '';
 // Telegram orqali admin kirishini tasdiqlash (token/chat .env'da)
@@ -622,7 +646,7 @@ app.post('/api/register', limitAuth, async (req, res) => {
 
     // birinchi foydalanuvchi avtomatik admin
     const userCount = await prisma.user.count();
-    const hash = await bcrypt.hash(password, 8);
+    const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     const user = await prisma.user.create({
       data: {
         username, password: hash,
@@ -715,7 +739,7 @@ app.post('/api/auth/google', limitAuth, async (req, res) => {
       }
       const userCount = await prisma.user.count();
       const username = await uniqueUsername(fullName.replace(/\s+/g, '') || email.split('@')[0]);
-      const randomPass = await bcrypt.hash(Math.random().toString(36) + Date.now(), 8);
+      const randomPass = await bcrypt.hash(Math.random().toString(36) + Date.now(), BCRYPT_ROUNDS);
       user = await prisma.user.create({
         data: {
           username,
@@ -1265,8 +1289,39 @@ const ICE_STUN = [
 let iceCache = { at: 0, servers: null };
 // TURN credentiallari pullik resurs — faqat tizimga kirgan foydalanuvchiga beriladi
 // (ilgari ochiq edi va istalgan odam relay sifatida ishlata olardi)
-app.get('/api/ice', authMiddleware, limitByUser(30), async (_, res) => {
+// --- O'Z TURN serverimiz (coturn, `use-auth-secret` rejimi) ---
+// TURN NIMA UCHUN KERAK: STUN faqat NAT ni "teshish" mumkin bo'lganda yordam beradi.
+// Simmetrik NAT va CGNAT ortida (mobil operatorlar — O'zbekistonda odatiy hol)
+// to'g'ridan-to'g'ri kanal QURILMAYDI va ovoz umuman ulanmaydi. TURN bunday
+// juftlikda trafikni server orqali uzatadi.
+//
+// Credential VAQTINCHALIK: coturn REST API sxemasi bo'yicha
+//   username = <tugash vaqti unix>:<userId>,  password = base64(HMAC-SHA1(sir, username))
+// Sir faqat serverda va coturn'da turadi, mijozga chiqmaydi. Shu sababli
+// o'g'irlangan credential 12 soatdan keyin o'zi o'ladi va kim olganini bilib
+// olish mumkin (username ichida userId bor).
+const TURN_SECRET = process.env.TURN_SECRET || '';
+const TURN_HOST = process.env.TURN_HOST || '';
+const TURN_TTL = parseInt(process.env.TURN_TTL || '43200');   // 12 soat
+function coturnServers(userId) {
+  if (!TURN_SECRET || !TURN_HOST) return null;
+  const username = `${Math.floor(Date.now() / 1000) + TURN_TTL}:${userId || 'anon'}`;
+  const credential = crypto.createHmac('sha1', TURN_SECRET).update(username).digest('base64');
+  return [
+    { urls: `turn:${TURN_HOST}:3478?transport=udp`, username, credential },
+    { urls: `turn:${TURN_HOST}:3478?transport=tcp`, username, credential },
+    // 5349/TLS — faqat TCP/443 chiqadigan qattiq tarmoqlar uchun zaxira yo'l
+    { urls: `turns:${TURN_HOST}:5349?transport=tcp`, username, credential },
+  ];
+}
+
+app.get('/api/ice', authMiddleware, limitByUser(30), async (req, res) => {
   try {
+    // 1) O'z coturn'imiz bo'lsa — birinchi navbatda u (tashqi xizmatga bog'liq emas)
+    const own = coturnServers(req.user?.userId);
+    if (own) return res.json({ iceServers: [...ICE_STUN, ...own] });
+
+    // 2) Aks holda Cloudflare TURN (agar kalitlar berilgan bo'lsa)
     const keyId = process.env.CF_TURN_KEY_ID, token = process.env.CF_TURN_API_TOKEN;
     if (!keyId || !token) return res.json({ iceServers: ICE_STUN });
     // Cloudflare vaqtinchalik credential beradi (ttl 24h) — 6 soat keshda ushlaymiz

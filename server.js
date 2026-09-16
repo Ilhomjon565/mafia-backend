@@ -209,12 +209,31 @@ function tgRoomKb(g) {
     : { inline_keyboard: [] };
 }
 function tgRoomText(g) {
-  const n = (g.players || []).filter(p => !p.isBot).length;
+  // DIQQAT: botlar ham HISOBGA OLINADI. Ilgari ular chiqarib tashlanardi va
+  // guruhda "1/14 o'yinchi" ko'rinardi — xonada esa 14 kishi o'ynayotgan
+  // bo'lardi. Xabar o'yin haqida haqiqatni aytishi kerak: kim ko'rsa,
+  // xonaga kirib o'sha manzarani ko'radi.
+  const n = (g.players || []).length;
   const max = g.totalPlayers || g.maxPlayers || 8;
   const name = tgEsc(g.name || 'Mafia xonasi');
   if (g.status === 'finished') {
     const ever = Array.isArray(g.everPlayers) ? g.everPlayers.length : n;
-    return `\u{1F3C1} <b>${name}</b>\n\n${tgEsc(winnerMessage(g.winner))}\n\u{1F465} ${Math.max(n, ever)} o'yinchi qatnashdi`;
+    const total = Math.max(n, ever);
+    // Davomiylik va mafiya tarkibi — guruhda o'qigan odam natijani tushunsin.
+    // O'yin tugagach rollar baribir ochiq, shuning uchun sir oshkor bo'lmaydi.
+    const mins = (g.startedAt && g.endedAt)
+      ? Math.max(1, Math.round((new Date(g.endedAt) - new Date(g.startedAt)) / 60000))
+      : null;
+    const mafia = (g.players || []).filter(p => sideOf(p.role) === 'mafia').map(p => tgEsc(p.username));
+    const lines = [
+      `\u{1F3C1} <b>${name}</b>`,
+      '',
+      tgEsc(winnerMessage(g.winner)),
+      `\u{1F465} ${total} o'yinchi qatnashdi`,
+    ];
+    if (mins) lines.push(`⏱ ${mins} daqiqa`);
+    if (mafia.length) lines.push(`\u{1F3AD} Mafiya: ${mafia.join(', ')}`);
+    return lines.join('\n');
   }
   if (g.status === 'playing') {
     return `\u25B6\uFE0F <b>${name}</b> — o'yin boshlandi\n\n\u{1F465} ${n} o'yinchi o'ynayapti`;
@@ -358,7 +377,7 @@ function tgTime(v) {
 // Xona o'chirilgandagi e'lon matni — xabar O'CHIRILMAYDI, shu holatga tahrirlanadi,
 // ya'ni guruhda xona haqidagi ma'lumot tarix bo'lib qoladi.
 function tgRoomClosedText(g, reason) {
-  const inRoom = (g.players || []).filter(p => !p.isBot).length;
+  const inRoom = (g.players || []).length;
   const max = g.totalPlayers || g.maxPlayers || 8;
   const ever = Array.isArray(g.everPlayers) ? g.everPlayers : [];
   const names = ever.map(tgEsc).slice(0, 12);
@@ -2521,9 +2540,14 @@ function scheduleBotJoins(gameId, bots) {
       if (g.kicked?.[bot.userId]) return;
       bot.joinedAt = Date.now();
       g.players.push(bot);
+      // Qatnashganlar ro'yxati (Telegram e'lonida ismlar ko'rsatiladi) —
+      // botlar ham oddiy o'yinchi sifatida tushadi.
+      if (!Array.isArray(g.everPlayers)) g.everPlayers = [];
+      if (!g.everPlayers.includes(bot.username)) g.everPlayers.push(bot.username);
       await saveG(gameId, g);
       logEvent(g, '👋', `${bot.username} o'yinga qo'shildi`, 'playerJoined', { name: bot.username });
       io.to(`game:${gameId}`).emit('game_state', publicGame(g));
+      tgRoomTouch(gameId);   // guruhdagi e'londa o'yinchilar soni yangilanadi
     }), delay));
   }
   botJoinTimers.set(gameId, timers);

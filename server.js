@@ -14,6 +14,9 @@ import {
   SELECTABLE_ROLES, MAFIA_VOTERS, normalizeRoleConfig, assignRoles, chooseMafiaTarget, resolveNightDeaths,
   NIGHT_STEPS, nightStepByPhase, stepHasActor, nightStepComplete,
 } from './rules.js';
+import {
+  RATING_START, eloDelta, applyElo, xpForGame, levelFromXp, levelProgress, tierOf, tierProgress,
+} from './progression.js';
 
 
 // override: true — .env HAR DOIM ustun. Busiz pm2 (yoki shell) dan kelgan bo'sh
@@ -792,7 +795,7 @@ app.get('/api/me', authMiddleware, async (req, res) => {
       shopPrices: ECONOMY.prices,
       dailyBonus: ECONOMY.dailyBonus,
       dailyLimit, roomsToday, roomsLeft: Math.max(0, dailyLimit - roomsToday),
-      stats: u.stats || { gamesPlayed: 0, gamesWon: 0, winRate: 0, rating: 1000 }
+      stats: u.stats || { gamesPlayed: 0, gamesWon: 0, winRate: 0, rating: RATING_START, xp: 0 }
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -909,10 +912,14 @@ app.get('/api/leaderboard', async (req, res) => {
     });
     res.json({
       total, page, limit, pages: Math.max(1, Math.ceil(total / limit)),
+      // Liga va daraja SERVERDA hisoblanadi: chegaralar bitta joyda
+      // (progression.js) turishi kerak, aks holda frontend bilan
+      // bir-biriga mos kelmay qoladi.
       players: rows.map((s, i) => ({
         rank: (page - 1) * limit + i + 1,
         username: s.user.username, rating: s.rating,
-        gamesPlayed: s.gamesPlayed, gamesWon: s.gamesWon, winRate: s.winRate
+        gamesPlayed: s.gamesPlayed, gamesWon: s.gamesWon, winRate: s.winRate,
+        xp: s.xp || 0, level: levelFromXp(s.xp || 0), tier: tierOf(s.rating),
       }))
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -928,7 +935,10 @@ app.get('/api/me/rank', authMiddleware, async (req, res) => {
     const total = await prisma.userStats.count();
     res.json({
       rank: higher + 1, total, rating,
-      gamesPlayed: s?.gamesPlayed ?? 0, gamesWon: s?.gamesWon ?? 0, winRate: s?.winRate ?? 0
+      gamesPlayed: s?.gamesPlayed ?? 0, gamesWon: s?.gamesWon ?? 0, winRate: s?.winRate ?? 0,
+      // Daraja chizig'i va liga — interfeys shularni chizadi
+      ...levelProgress(s?.xp ?? 0),
+      ...tierProgress(rating),
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1333,7 +1343,7 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) =>
         coins: u.coins ?? 0,
         roomLimit: overrides[u.id] != null ? parseInt(overrides[u.id]) : null, // null = default ishlatiladi
         defaultRoomLimit,
-        stats: u.stats || { gamesPlayed: 0, gamesWon: 0, winRate: 0, rating: 1000 }
+        stats: u.stats || { gamesPlayed: 0, gamesWon: 0, winRate: 0, rating: RATING_START, xp: 0 }
       }))
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1421,7 +1431,7 @@ app.get('/api/admin/users/:id', authMiddleware, adminMiddleware, async (req, res
       coins: u.coins ?? 0, lastBonusAt: u.lastBonusAt,
       items: normItems(u.items),
       roomLimit: overrides[u.id] != null ? parseInt(overrides[u.id]) : null,
-      stats: u.stats || { gamesPlayed: 0, gamesWon: 0, winRate: 0, rating: 1000 },
+      stats: u.stats || { gamesPlayed: 0, gamesWon: 0, winRate: 0, rating: RATING_START, xp: 0 },
       summary,
       activities: activities.map(a => ({ type: a.type, item: a.item, amount: a.amount, detail: a.detail, gameId: a.gameId, createdAt: a.createdAt })),
       history: history.map(h => ({ role: h.role, won: h.won, winner: h.winner, coins: h.coins, createdAt: h.createdAt })),
@@ -2371,21 +2381,65 @@ function scheduleBotDay(gameId, g) {
 
 async function recordStats(g, winner) {
   if (g.vsBots) return; // botlar bilan o'yin reyting/tangaga ta'sir qilmaydi (farm oldini olish)
-  for (const p of g.players) {
-    if (!isRealUser(p.userId)) continue;
+
+  // Elo uchun raqiblarning O'RTACHA reytingi kerak, shuning uchun avval
+  // hamma ishtirokchining joriy holatini BITTA so'rovda olamiz. Ilgari har
+  // o'yinchi uchun alohida upsert+findUnique+update qilinardi — 12 kishilik
+  // xonada 36 ta so'rov; endi 1 ta o'qish va har kishiga 1 ta yozish.
+  const real = g.players.filter((p) => isRealUser(p.userId));
+  if (!real.length) return;
+
+  const ids = real.map((p) => p.userId);
+  let statsById = new Map();
+  try {
+    const rows = await prisma.userStats.findMany({ where: { userId: { in: ids } } });
+    statsById = new Map(rows.map((r) => [r.userId, r]));
+  } catch {}
+
+  const ratingOf = (id) => statsById.get(id)?.rating ?? RATING_START;
+  const totalRating = ids.reduce((s, id) => s + ratingOf(id), 0);
+
+  for (const p of real) {
     const won = isWinner(p.role, winner, p.isAlive);
     const reward = won ? ECONOMY.winReward : ECONOMY.loseReward;
+    const prev = statsById.get(p.userId);
+    const rating = prev?.rating ?? RATING_START;
+    const gamesPlayed = prev?.gamesPlayed ?? 0;
+
+    // Raqib kuchi = QOLGANLARNING o'rtachasi (o'zini qo'shmaymiz — aks holda
+    // o'yinchi qisman o'zi bilan o'ynagan bo'lib chiqadi va delta kichrayadi).
+    const others = ids.length - 1;
+    const opponent = others > 0 ? (totalRating - rating) / others : RATING_START;
+
+    const delta = eloDelta({ rating, opponent, won, gamesPlayed });
+    const nextRating = applyElo(rating, delta);
+    const gainedXp = xpForGame({ won, survived: !!p.isAlive, rounds: g.round || 0 });
+    const nextXp = (prev?.xp ?? 0) + gainedXp;
+
+    const nextPlayed = gamesPlayed + 1;
+    const nextWon = (prev?.gamesWon ?? 0) + (won ? 1 : 0);
+
     try {
       await prisma.userStats.upsert({
         where: { userId: p.userId },
-        create: { userId: p.userId, gamesPlayed: 1, gamesWon: won ? 1 : 0, winRate: won ? 100 : 0, rating: 1000 + (won ? 25 : -15) },
-        update: { gamesPlayed: { increment: 1 }, gamesWon: { increment: won ? 1 : 0 }, rating: { increment: won ? 25 : -15 } }
+        create: {
+          userId: p.userId, gamesPlayed: 1, gamesWon: won ? 1 : 0,
+          winRate: won ? 100 : 0, rating: nextRating, xp: gainedXp,
+        },
+        update: {
+          gamesPlayed: nextPlayed, gamesWon: nextWon, rating: nextRating, xp: nextXp,
+          winRate: Math.round((nextWon / nextPlayed) * 1000) / 10,
+        },
       });
-      const s = await prisma.userStats.findUnique({ where: { userId: p.userId } });
-      if (s && s.gamesPlayed > 0) {
-        await prisma.userStats.update({
-          where: { userId: p.userId },
-          data: { winRate: Math.round((s.gamesWon / s.gamesPlayed) * 1000) / 10 }
+
+      // Daraja oshgan bo'lsa o'yinchiga alohida xabar — bu eng kuchli
+      // qaytish sababi, natija oynasida ko'rinib turishi kerak.
+      const before = levelFromXp(prev?.xp ?? 0);
+      const after = levelFromXp(nextXp);
+      if (p.socketId) {
+        io.to(p.socketId).emit('progress_update', {
+          xp: nextXp, gainedXp, level: after, levelUp: after > before,
+          rating: nextRating, ratingDelta: delta, tier: tierOf(nextRating),
         });
       }
       // 🪙 tanga mukofoti + o'yin tarixi

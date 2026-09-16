@@ -62,7 +62,11 @@ model UserStats {
   gamesPlayed Int      @default(0)
   gamesWon    Int      @default(0)
   winRate     Float    @default(0)
+  // Mahorat o'lchovi (Elo) — tushishi mumkin, reyting jadvali shunga quriladi
   rating      Int      @default(1000)
+  // Tajriba — hech qachon kamaymaydi, darajani beradi (progression.js)
+  xp          Int      @default(0)
+  @@index([rating])
 }
 
 model Game {

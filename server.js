@@ -708,11 +708,17 @@ async function saveSettings(s) {
 // aks holda umumiy sozlamadagi qiymatni qaytaradi
 async function userDailyLimit(userId, settings) {
   const def = (settings || await getSettings()).dailyRoomLimit || 2;
+  let base = def;
   try {
     const v = await redis.hget('roomlimits', String(userId));
-    if (v != null && v !== '') return Math.max(0, parseInt(v));
+    if (v != null && v !== '') base = Math.max(0, parseInt(v));
   } catch {}
-  return def;
+  // Do'kondan olingan qo'shimcha xonalar (faqat bugunga)
+  try {
+    const extra = parseInt((await redis.get(roomSlotKey(userId))) || '0');
+    if (extra > 0) base += extra;
+  } catch {}
+  return base;
 }
 
 // ==================== AUTH HELPERS ====================
@@ -1062,6 +1068,7 @@ app.get('/api/me', authMiddleware, async (req, res) => {
       },
       completion: profileState(u),
       verified: profileState(u).verified,
+      perks: await readPerks(u.id),
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1157,6 +1164,35 @@ app.delete('/api/me/telegram', authMiddleware, limitByUser(10), async (req, res)
 app.post('/api/shop/buy', authMiddleware, limitByUser(40), async (req, res) => {
   try {
     const { item } = req.body;
+
+    // ===== Hisob imkoniyatlari (o'yin buyumi emas) =====
+    if (PERK_KEYS.includes(item)) {
+      const price = ECONOMY.prices[item];
+      const userId = req.user.userId;
+      const out = await withLock(`user:${userId}`, async () => {
+        const u = await prisma.user.findUnique({ where: { id: userId }, select: { coins: true } });
+        if (!u) return { err: 404 };
+        if ((u.coins ?? 0) < price) return { err: 402 };
+        const upd = await prisma.user.update({
+          where: { id: userId }, data: { coins: { decrement: price } }, select: { coins: true },
+        });
+        if (item === 'xpBoost') {
+          await redis.incr(xpBoostKey(userId));
+        } else {
+          // Kun oxirigacha amal qiladi: TTL bugundan ertaga o'tishda tugaydi
+          await redis.incr(roomSlotKey(userId));
+          await redis.expire(roomSlotKey(userId), 36 * 3600);
+        }
+        logActivity(userId, 'shop_buy', { item, amount: -price, detail: `Do'kondan ${item} olindi` });
+        return { coins: upd.coins };
+      });
+      if (out?.err === 404) return res.status(404).json({ error: 'Foydalanuvchi topilmadi' });
+      if (out?.err === 402) return res.status(400).json({ error: 'Tanga yetarli emas' });
+      const perks = await readPerks(req.user.userId);
+      const u2 = await prisma.user.findUnique({ where: { id: req.user.userId }, select: { items: true } });
+      return res.json({ coins: out.coins, items: normItems(u2?.items), perks });
+    }
+
     if (!ITEM_KEYS.includes(item)) return res.status(400).json({ error: 'Noma\'lum buyum' });
     const price = ECONOMY.prices[item];
     const userId = req.user.userId;
@@ -2362,8 +2398,46 @@ const ECONOMY = {
   winReward: 50,
   loseReward: 15,
   dailyBonus: 30,
-  prices: { shield: 60, lupa: 50, life: 100 },
+  // O'yin buyumlari (xonada ishlatiladi) + hisob imkoniyatlari (o'yin
+  // muvozanatiga tegmaydi, shuning uchun narxi ham arzon emas).
+  prices: { shield: 60, lupa: 50, life: 100, xpBoost: 120, roomSlot: 80 },
 };
+
+// ==================== HISOB IMKONIYATLARI (PERK) ====================
+// Nega `items` ichida emas: `items` — xona ichida sarflanadigan buyumlar
+// (qalqon, lupa, jon) va o'yin dvigateli aynan shu uch kalitni biladi.
+// Imkoniyatlar esa o'yindan TASHQARIDA ishlaydi:
+//   xpBoost   — keyingi tugagan o'yinda XP ikki barobar (bir marta);
+//   roomSlot  — BUGUN bitta qo'shimcha xona yaratish huquqi.
+// Ikkisi ham Redis'da: roomSlot kun bilan chegaralangan (TTL), xpBoost esa
+// ishlatilmaguncha turadi. Shu sababli baza sxemasi o'zgarmadi.
+const PERK_KEYS = ['xpBoost', 'roomSlot'];
+const dayKeySuffix = () => new Date(Date.now() + 5 * 3600 * 1000).toISOString().slice(0, 10);
+const xpBoostKey = (userId) => `perk:xpboost:${userId}`;
+const roomSlotKey = (userId) => `perk:roomslot:${userId}:${dayKeySuffix()}`;
+
+async function readPerks(userId) {
+  try {
+    const [xp, rooms] = await Promise.all([
+      redis.get(xpBoostKey(userId)),
+      redis.get(roomSlotKey(userId)),
+    ]);
+    return { xpBoost: Math.max(0, parseInt(xp || '0')), roomSlot: Math.max(0, parseInt(rooms || '0')) };
+  } catch {
+    return { xpBoost: 0, roomSlot: 0 };
+  }
+}
+
+// XP kuchaytirgich BIR MARTA ishlaydi: o'yin tugagach sarflanadi.
+// `decr` atomik — ikkita o'yin bir vaqtda tugasa ham ikki marta
+// ishlatilmaydi (manfiyga tushsa 0 ga qaytariladi).
+async function consumeXpBoost(userId) {
+  try {
+    const left = await redis.decr(xpBoostKey(userId));
+    if (left < 0) { await redis.set(xpBoostKey(userId), '0'); return false; }
+    return true;
+  } catch { return false; }
+}
 function normItems(it) {
   const out = { shield: 0, lupa: 0, life: 0 };
   if (it) for (const k of ITEM_KEYS) out[k] = Math.max(0, parseInt(it[k]) || 0);
@@ -3382,7 +3456,11 @@ async function recordStats(g, winner) {
 
     const delta = eloDelta({ rating, opponent, won, gamesPlayed });
     const nextRating = applyElo(rating, delta);
-    const gainedXp = xpForGame({ won, survived: !!p.isAlive, rounds: g.round || 0 });
+    let gainedXp = xpForGame({ won, survived: !!p.isAlive, rounds: g.round || 0 });
+    // Do'kondan olingan kuchaytirgich — faqat bitta o'yinga va faqat
+    // XP ga ta'sir qiladi. Reyting (Elo) TEGILMAYDI: tangaga reyting
+    // sotilsa, jadval ma'nosini yo'qotadi.
+    if (await consumeXpBoost(p.userId)) gainedXp *= 2;
     const nextXp = (prev?.xp ?? 0) + gainedXp;
 
     const nextPlayed = gamesPlayed + 1;

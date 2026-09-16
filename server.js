@@ -2054,8 +2054,14 @@ async function startPhase(gameId, phase) {
   const grace = graceFor(g);
   timers.set(gameId, setTimeout(() => withLock(gameId, () => onPhaseEnd(gameId, phase)), d * 1000 + grace));
 
-  // BOTLAR REJIMI: kunduzi botlar 2–4.5s da ovoz beradi (foydalanuvchi ovoz berganda yakunlanadi)
-  if (g.vsBots && phase === 'day_discussion') scheduleBotDay(gameId, g);
+  // Kunduzi botlar ovoz beradi — har birining o'z vaqtida (bot-ai.js).
+  //
+  // DIQQAT: shart ILGARI `g.vsBots` edi, ya'ni faqat "Botlar bilan o'ynash"
+  // rejimida ishlardi. Xonani to'ldiruvchi botlar va botlarning o'zaro
+  // o'yinlari `vsBots: false` — natijada ular kunduzi UMUMAN ovoz bermasdi
+  // va o'yin faqat taymer bilan aylanardi (jonli saytda ko'rilgan:
+  // `dayVotes: 0`, hech kim chetlatilmaydi).
+  if (phase === 'day_discussion' && (g.players || []).some(isBot)) scheduleBotDay(gameId, g);
 }
 
 async function onPhaseEnd(gameId, phase) {
@@ -2454,8 +2460,10 @@ async function startNightStep(gameId, idx) {
 
   if (timers.has(gameId)) clearTimeout(timers.get(gameId));
 
-  if (g.vsBots) {
-    // BOTLAR REJIMI: botlar 2–4.5s da harakat qiladi.
+  // Xonada bot bo'lsa — ular tungi harakatni bajaradi. Shart ilgari
+  // `g.vsBots` edi va to'ldiruvchi botlar kechasi ham harakatsiz qolardi.
+  if ((g.players || []).some(isBot)) {
+    // Botlar kechikish bilan harakat qiladi (bot-ai.js).
     // Agar bu bosqich roli foydalanuvchida bo'lsa — vaqt chegarasi yo'q (u bajarmaguncha kutamiz).
     const actors = g.players.filter(p => p.isAlive && step.roles.includes(p.role));
     // uzilib qolgan odam aktyor sanalmasin — aks holda uni abadiy kutardik

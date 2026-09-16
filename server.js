@@ -2524,6 +2524,18 @@ const PING_MS = new Map();   // socketId -> so'nggi RTT (ms)
 const PING_EVERY = 3000;
 const PING_TIMEOUT = 2500;   // javob kelmasa oldingi qiymat saqlanadi
 
+// So'nggi namunalar oynasi. Ko'rsatiladigan qiymat — oynadagi ENG KICHIK namuna.
+//
+// Nega minimum, o'rtacha emas: o'lchovga tarmoq kechikishidan tashqari server
+// va brauzerning band bo'lishi ham qo'shiladi (o'yin taxtasi chizilayotganda
+// javob kechikadi). Bu qo'shimchalar faqat QO'SHILADI — hech qachon
+// ayirilmaydi. Shuning uchun minimum haqiqiy tarmoq kechikishiga eng yaqin
+// baho, o'rtacha esa bitta tasodifiy sakrashdan butunlay ko'tarilib ketadi.
+// (Sinovda ketma-ket namunalar: 78, 191, 78, 82, 104, 73 — 191 aynan shunday
+// sakrash edi va ekranda "ping ko'tarilib ketdi" bo'lib ko'rinardi.)
+const PING_HIST = new Map();  // socketId -> so'nggi namunalar
+const PING_WINDOW = 5;
+
 function probePing(socket) {
   return new Promise((resolve) => {
     const t0 = Date.now();
@@ -2531,7 +2543,11 @@ function probePing(socket) {
       socket.timeout(PING_TIMEOUT).emit('ping_probe', (err) => {
         if (err) return resolve(null);  // javob kelmadi — eski qiymatni buzmaymiz
         const ms = Math.min(9999, Date.now() - t0);
-        PING_MS.set(socket.id, ms);
+        const hist = PING_HIST.get(socket.id) || [];
+        hist.push(ms);
+        if (hist.length > PING_WINDOW) hist.shift();
+        PING_HIST.set(socket.id, hist);
+        PING_MS.set(socket.id, Math.min(...hist));
         resolve(ms);
       });
     } catch { resolve(null); }
@@ -2552,7 +2568,7 @@ async function pingCycle() {
     for (const [sid, d] of socketData) {
       if (!d?.gameId) continue;
       const s = io.sockets.sockets.get(sid);
-      if (!s) { PING_MS.delete(sid); continue; }
+      if (!s) { PING_MS.delete(sid); PING_HIST.delete(sid); continue; }
       targets.push([sid, d.gameId, s]);
     }
     if (!targets.length) return;
@@ -3263,6 +3279,7 @@ io.on('connection', (socket) => {
     console.log(`❌ ${socket.id}`);
     clearIdle(socket);
     PING_MS.delete(socket.id);
+    PING_HIST.delete(socket.id);
     // IP ulanish hisobini kamaytiramiz (faqat hisoblangan ommaviy IP uchun)
     const ip = socket.data?.ip;
     if (ip && isPublicIp(ip)) { const n = (ipConns.get(ip) || 1) - 1; if (n <= 0) ipConns.delete(ip); else ipConns.set(ip, n); }

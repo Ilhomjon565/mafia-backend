@@ -15,6 +15,8 @@
 // har bot boshqacha o'ynaydi va tashqaridan qarab bot ekanini aytish qiyin.
 
 import crypto from 'crypto';
+// Profil rasmlari alohida modulda (9 xil turkum) — avatar.js
+import { botAvatarUrl } from './avatar.js';
 
 // ---------- yordamchi ----------
 
@@ -420,62 +422,6 @@ export function fakeSocketId() {
 // chiqadigan ID oddiy foydalanuvchi ID'sidan farq qilmasligi kerak.
 export function fakePublicId() {
   return 'c' + crypto.randomBytes(12).toString('hex');
-}
-
-// ---------- profil rasmi ----------
-// Botlarda avatar BO'LMASA bu ularni oshkor qiladi: haqiqiy o'yinchilarning
-// ko'pi Google orqali kiradi va profil rasmi bilan keladi, avatarsiz o'yinchi
-// esa ro'yxatda darhol ajralib turadi.
-//
-// Tashqi xizmat (DiceBear va h.k.) ishlatilmaydi: u CSP'ga yangi manba
-// qo'shishni talab qiladi, tashqi so'rov qiladi va o'sha xizmat o'chsa
-// avatarlar yo'qoladi. O'rniga SVG data URI generatsiya qilinadi — u rasm
-// sifatida saqlanadi, tashqi so'rov yo'q, `img-src data:` allaqachon ruxsat.
-//
-// Naqsh identicon uslubida: seed'dan hisoblangan 5x5 simmetrik katakchalar.
-// Har bot uchun boshqa naqsh va rang, lekin har doim BIR XIL (seed barqaror).
-//
-// SVG data URI sifatida XABARGA solinmaydi (~1.5 KB, har `game_state` bilan
-// ketardi). O'rniga server `/api/avatar/:seed` endpointini beradi: xabarda
-// faqat qisqa URL, rasmni brauzer bir marta oladi va bir yil keshlaydi.
-const AVA_PALETTE = [
-  ['#FF3D7F', '#7A1436'], ['#FF8A2A', '#7A3C08'], ['#FFC934', '#6E5208'],
-  ['#2ED3F0', '#0B5B69'], ['#9D7BFF', '#3B2778'],
-  ['#5B8CFF', '#1E3576'], ['#4FE3C0', '#10604F'], ['#FF6FA0', '#7A2544'],
-];
-
-export function botAvatar(seed) {
-  // 6 baytli deterministik "shovqin" — naqsh va rang shundan
-  let h = 2166136261;
-  const bytes = [];
-  for (let i = 0; i < 6; i++) {
-    for (const ch of String(seed) + ':' + i) {
-      h ^= ch.charCodeAt(0);
-      h = Math.imul(h, 16777619);
-    }
-    bytes.push((h >>> 0) % 256);
-  }
-  const [fg, bg] = AVA_PALETTE[bytes[0] % AVA_PALETTE.length];
-
-  // 5x5, chapdan o'ngga simmetrik (identicon shakli)
-  let cells = '';
-  for (let y = 0; y < 5; y++) {
-    for (let x = 0; x < 3; x++) {
-      const on = (bytes[(y + x) % 6] >> ((x + y) % 7)) & 1;
-      if (!on) continue;
-      cells += `<rect x="${x * 16}" y="${y * 16}" width="16" height="16"/>`;
-      if (x < 2) cells += `<rect x="${(4 - x) * 16}" y="${y * 16}" width="16" height="16"/>`;
-    }
-  }
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80">`
-    + `<rect width="80" height="80" fill="${bg}"/>`
-    + `<g fill="${fg}">${cells}</g></svg>`;
-}
-
-// Mijozga yuboriladigan avatar manzili. Seed — `publicId`: u maskalangan,
-// ya'ni URL'da ham bot ekani ko'rinmaydi.
-export function botAvatarUrl(publicId) {
-  return '/api/avatar/' + publicId;
 }
 
 // Xonani to'ldiruvchi botlar. `count` — nechta kerak.

@@ -11,8 +11,9 @@ import { OAuth2Client } from 'google-auth-library';
 import crypto from 'crypto';
 import {
   makePersona, voteDelayMs, fakePing, buildSuspicion, buildVoteWeight,
-  chooseDayVote, chooseNightTarget, makeFillerBots, BOT_NAMES, botAvatar,
+  chooseDayVote, chooseNightTarget, makeFillerBots, BOT_NAMES,
 } from './bot-ai.js';
+import { botAvatar } from './avatar.js';
 // Onlayn ko'rsatkichi egri chizig'i — alohida modulda, testlari presence.test.mjs da
 import {
   fakeOnlineBase, fakePlayersBase, fakeGamesPlayed, fakeRooms, dueBotGameSlot,
@@ -1688,6 +1689,9 @@ function cancelEmptyCheck(gameId) {
 // Ketayotgan o'yinda BARCHA odamlar uzilib qolsa, taymerlar bo'yicha o'yin o'z-o'zidan
 // aylanaverib server resursini yeydi. 3 daqiqa ichida hech kim qaytmasa — yopamiz.
 const ABANDON_MS = 180000;
+// Uzilib qolgan o'yinchini kutish: joriy faza shuncha uzaytiriladi.
+// Har o'yinchi uchun FAQAT BIR MARTA (p.graceUsed).
+const RECONNECT_GRACE_MS = 60000;
 const abandonTimers = new Map();
 function cancelAbandonCheck(gameId) {
   if (abandonTimers.has(gameId)) { clearTimeout(abandonTimers.get(gameId)); abandonTimers.delete(gameId); }
@@ -2250,6 +2254,12 @@ async function processNight(gameId) {
 
   // 6) 👨🏻‍⚕️ Doktor davolash nishoni
   const healTarget = (na.doctor && notBlocked(na.doctor.by)) ? na.doctor.target : null;
+  // Kimni davolagani ESLAB QOLINADI — keyingi kecha o'shani takrorlay olmaydi.
+  // Faqat haqiqatan davolagan bo'lsa (Kezuvchi bloklamagan bo'lsa) yoziladi.
+  if (healTarget) {
+    const doc = find(na.doctor.by);
+    if (doc) { doc.roleData = doc.roleData || {}; doc.roleData.healedLast = healTarget; }
+  }
   // O'zini davolash huquqi HAQIQATAN sodir bo'lganda sarflanadi (bloklangan bo'lsa emas)
   if (healTarget && na.doctor.by === healTarget) {
     const doc = find(na.doctor.by);
@@ -3395,6 +3405,16 @@ io.on('connection', (socket) => {
           if (targetSocketId === socket.id && player.roleData?.selfHeal) {
             socket.emit('game_error', { code: 'selfHealOnce', message: '❌ O\'zingizni faqat bir marta davolaysiz' }); return;
           }
+          // Klassik qoida: KETMA-KET bir odamni davolab bo'lmaydi. Busiz doktor
+          // bitta o'yinchini abadiy himoya qilib, mafiyani ma'nosiz qoldirardi.
+          // Bir kecha oralatib o'sha odamni yana davolash mumkin.
+          if (player.roleData?.healedLast && player.roleData.healedLast === targetSocketId) {
+            socket.emit('game_error', {
+              code: 'healSameTwice',
+              message: "Ketma-ket bir odamni davolab bo'lmaydi",
+            });
+            return;
+          }
           na.doctor = { by: socket.id, target: targetSocketId };
           socket.emit('action_confirmed', { code: 'heal', name: target.username, message: `💚 ${target.username} davolanadi` });
           break;
@@ -3774,7 +3794,30 @@ io.on('connection', (socket) => {
         if (g.players.length === 0) scheduleEmptyCheck(data.gameId);
       } else if (g.status === 'playing') {
         const p = g.players.find(p => p.socketId === socket.id);
-        if (p) { p.connected = false; await saveG(data.gameId, g); }
+        if (p) {
+          p.connected = false;
+          // ---- Qaytishini kutish ----
+          // O'yinchining interneti uzilsa, joriy faza BIR MARTA 60 soniyaga
+          // uzaytiriladi — u qaytib ulgursin. Ikkinchi marta uzilganda kutilmaydi:
+          // aks holda bitta odam qayta-qayta uzilib, butun o'yinni cho'zib
+          // yuborardi va qolganlar zerikib ketardi.
+          if (!p.graceUsed && p.isAlive !== false && g.phaseEndsAt) {
+            p.graceUsed = true;
+            g.phaseEndsAt += RECONNECT_GRACE_MS;
+            if (timers.has(data.gameId)) clearTimeout(timers.get(data.gameId));
+            const left = Math.max(1000, g.phaseEndsAt - Date.now());
+            const ph = g.phase;
+            timers.set(data.gameId, setTimeout(
+              () => withLock(data.gameId, () => onPhaseEnd(data.gameId, ph)),
+              left + graceFor(g)));
+            io.to(`game:${data.gameId}`).emit('phase_extended', {
+              username: p.username,
+              endsAt: g.phaseEndsAt,
+              seconds: Math.round(RECONNECT_GRACE_MS / 1000),
+            });
+          }
+          await saveG(data.gameId, g);
+        }
         io.to(`game:${data.gameId}`).emit('player_offline', { username: data.username });
         io.to(`game:${data.gameId}`).emit('game_state', publicGame(g));
         // hech kim qolmadi — 3 daqiqadan keyin o'yin yopiladi

@@ -17,6 +17,7 @@ import { botAvatar } from './avatar.js';
 // Onlayn ko'rsatkichi egri chizig'i — alohida modulda, testlari presence.test.mjs da
 import {
   fakeOnlineBase, fakePlayersBase, fakeGamesPlayed, fakeRooms, dueBotGameSlot,
+  randomRoomName,
 } from './presence.js';
 // FAKE_ONLINE=0 — soxta qo'shimchani butunlay o'chiradi (faqat haqiqiy onlayn)
 const FAKE_ONLINE = process.env.FAKE_ONLINE !== '0';
@@ -2022,14 +2023,58 @@ async function adjustUserItems(userId, deltas) {
 }
 
 
+// ==================== O'YIN VAQT BUDJETI ====================
+// O'yin 20-30 daqiqada tugashi kerak. Uzoq o'yinda odamlar yarim yo'lda
+// chiqib ketadi, xona "zombi" bo'lib qoladi va guruhda e'lon qilingan
+// natija kechqurun emas, yarim tunda chiqadi.
+//
+// Ikki qatlam ishlaydi:
+//   1) TEZLASHUV — SOFT chegaradan keyin har bir faza qisqara boradi.
+//      Minimumdan pastga tushmaydi: 20 soniyalik kunduz muhokamasida
+//      o'ynash mumkin emas.
+//   2) QAT'IY CHEGARA — HARD chegarada o'yin kunduz boshida yakunlanadi.
+//      Qoida oddiy va tushunarli: mafiya belgilangan vaqtda shaharni
+//      bo'ysundira olmadi — shahar g'olib. Bu mafiyani cho'zishdan
+//      qaytaradi (cho'zish ularga foyda bermaydi).
+// Tezlashuv tufayli qat'iy chegaraga kam holda yetib boriladi.
+const GAME_SOFT_MS = 13 * 60 * 1000;
+const GAME_HARD_MS = 25 * 60 * 1000;
+// Faza uchun eng kichik ma'noli davomiylik (soniya)
+const PHASE_MIN = { day_discussion: 45, day_results: 5, night_results: 5 };
+
+function gameElapsed(g) {
+  const t = g && g.startedAt ? new Date(g.startedAt).getTime() : 0;
+  return t ? Date.now() - t : 0;
+}
+// 1.0 (normal) -> 0.45 (HARD chegarada)
+function timeScale(g) {
+  const e = gameElapsed(g);
+  if (e <= GAME_SOFT_MS) return 1;
+  const k = Math.min(1, (e - GAME_SOFT_MS) / (GAME_HARD_MS - GAME_SOFT_MS));
+  return 1 - 0.55 * k;
+}
 function dur(g, phase) {
-  return (g.durations && g.durations[phase]) || DEFAULT_SETTINGS.durations[phase];
+  const base = (g.durations && g.durations[phase]) || DEFAULT_SETTINGS.durations[phase];
+  const sc = timeScale(g);
+  if (sc >= 1) return base;
+  const min = PHASE_MIN[phase] ?? (base <= 5 ? base : 10);
+  return Math.max(min, Math.round(base * sc));
 }
 
 
 async function startPhase(gameId, phase) {
   const g = await getG(gameId);
   if (!g || g.status === 'finished') return;
+
+  // Vaqt chegarasi KUNDUZ boshida tekshiriladi: tabiiy to'xtash nuqtasi,
+  // o'yinchi tungi harakatini bajarib bo'lgan bo'ladi va natija tushunarli
+  // chiqadi. Tekshiruv har raundda bir marta bo'lgani uchun o'yin
+  // chegaradan ko'pi bilan bitta raundga (2-4 daqiqa) oshadi.
+  if (phase === 'day_discussion' && g.status === 'playing' && gameElapsed(g) >= GAME_HARD_MS) {
+    logEvent(g, '\u23F3', "Vaqt tugadi — mafiya shaharni bo'ysundira olmadi", 'timeUp');
+    await saveG(gameId, g);
+    return endGame(gameId, 'town');
+  }
 
   const d = dur(g, phase);
   const endsAt = Date.now() + d * 1000;
@@ -2587,10 +2632,16 @@ async function startBotGame() {
   const host = bots[0];
   host.isHost = true;
 
+  // Xona nomi o'yinchi yozganday ko'rinadi va HAR XIL bo'ladi. Hozir ochiq
+  // xonalar nomlari beriladi — lobbida ikkita bir xil nom turmasin.
+  const openNames = await prisma.game
+    .findMany({ where: { status: { in: ['waiting', 'playing'] } }, select: { name: true }, take: 60 })
+    .then((rows) => rows.map((r) => r.name))
+    .catch(() => []);
+
   const game = await prisma.game.create({
     data: {
-      // Xona nomi o'yinchi yozganday ko'rinadi
-      name: `${host.username} xonasi`,
+      name: randomRoomName(host.username, openNames),
       status: 'waiting', hostId: host.userId, isPrivate: false,
       totalPlayers, maxPlayers: 20, minPlayers: Math.min(5, totalPlayers),
       mafiaCount, sheriffCount: 1, doctorCount: 1,
@@ -2623,6 +2674,35 @@ async function startBotGame() {
   tgRoomAnnounce(game.id).catch(() => {});
   console.log(`🎲 bot o'yini: ${game.id} (${totalPlayers} o'yinchi, host ${host.username})`);
   return game.id;
+}
+
+// Bot o'yini tugagach — YANGI xona. "Xona yopildi, yangi xona ochildi"
+// zanjiri saytni tirik ko'rsatadi: guruhda ham yangi e'lon paydo bo'ladi.
+// Kunlik chegara bor (BOT_GAMES_MAX) — aks holda zanjir kechasi ham
+// to'xtamasdi. Faol soatlar: 10:00-00:00 (Toshkent).
+const BOT_GAMES_MAX = 26;
+function tashkentHour(now = Date.now()) {
+  return new Date(now + 5 * 3600 * 1000).getUTCHours();
+}
+async function chainNextBotGame() {
+  if (!BOT_GAMES_ON) return;
+  const h = tashkentHour();
+  if (h < 10) return;                       // tunda yangi xona ochilmaydi
+  try {
+    const dayKey = 'botgames:' + new Date(Date.now() + 5 * 3600 * 1000).toISOString().slice(0, 10);
+    const done = await redis.scard(dayKey).catch(() => 0);
+    if (done >= BOT_GAMES_MAX) return;
+    // Slotni band qilamiz (jadval slotlari bilan chalkashmasin: manfiy raqam)
+    const mark = -Date.now();
+    await redis.sadd(dayKey, String(mark)).catch(() => {});
+    await redis.expire(dayKey, 3 * 86400).catch(() => {});
+    // 3-9 daqiqa tanaffus: xona tugagan zahoti yangisi chiqsa sun'iy ko'rinadi
+    const delay = (3 + Math.random() * 6) * 60000;
+    setTimeout(() => { startBotGame().catch(() => {}); }, delay);
+    console.log(`\u{1F501} yangi bot xonasi ${Math.round(delay / 60000)} daqiqadan keyin`);
+  } catch (e) {
+    console.error('chainNextBotGame:', e.message);
+  }
 }
 
 // Jadval bo'yicha tekshirish. Boshlangan slotlar Redis'da belgilanadi —
@@ -2911,6 +2991,8 @@ async function endGame(gameId, winner) {
   prisma.game.update({ where: { id: gameId }, data: { status: 'finished', winner, endedAt: new Date() } }).catch(() => {});
   await recordStats(g, winner);
   tgRoomFinish(gameId).catch(() => {}); // guruhdagi e'lonni yakunlash
+  // Botlar xonasi tugadi — o'rniga yangisi ochiladi
+  if (g.botOnly) chainNextBotGame().catch(() => {});
   io.to(`game:${gameId}`).emit('game_over', {
     winner, players: revealPlayers(g.players), log: fullLog(g),
     message: winnerMessage(winner)

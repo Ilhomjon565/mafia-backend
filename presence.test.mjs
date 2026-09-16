@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   fakeOnlineBase, fakePlayersBase, fakeGamesPlayed, fakeRooms, ONLINE_CURVE,
-  botGameSchedule, dueBotGameSlot,
+  botGameSchedule, dueBotGameSlot, randomRoomName,
 } from './presence.js';
 
 // Toshkent vaqti bo'yicha berilgan soat/daqiqaga to'g'ri keladigan UTC ms
@@ -213,4 +213,44 @@ test('bir kunda hamma slot navbat bilan boshlanadi', () => {
     started.push(due);
   }
   assert.equal(started.length, slots.length, 'hamma o\'yin o\'tkazilishi kerak');
+});
+
+
+// ---------- Xona nomlari ----------
+// Bot xonalari bir xil qolipdan yasalmasin: lobbi ro'yxatiga qaragan odam
+// "bu sayt o'zi nom qo'yayapti" degan xulosaga kelmasligi kerak.
+
+test('xona nomlari HAR XIL bo\'ladi', () => {
+  const seen = new Set();
+  for (let i = 0; i < 200; i++) seen.add(randomRoomName('Bobur', []));
+  assert.ok(seen.size > 25, 'kam xil nom: ' + seen.size);
+});
+
+test('ochiq xonalar nomi takrorlanmaydi', () => {
+  const used = [];
+  for (let i = 0; i < 30; i++) {
+    const nm = randomRoomName('Madina', used);
+    assert.ok(!used.some((u) => u.toLowerCase() === nm.toLowerCase()), 'takror nom: ' + nm);
+    used.push(nm);
+  }
+});
+
+test('nom bo\'sh emas, 40 belgidan uzun emas va robot emojisi bilan boshlanmaydi', () => {
+  // Robot emojisi bilan boshlangan nom serverda "botlar bilan o'ynash"
+  // rejimi deb tushuniladi (vsBots) — bot xonasi u rejimga tushmasligi kerak
+  const ROBOT = String.fromCodePoint(0x1F916);
+  for (let i = 0; i < 300; i++) {
+    const nm = randomRoomName('Sardorbek Ilhomjonov', []);
+    assert.ok(nm.trim().length > 0, 'bo\'sh nom');
+    assert.ok(nm.length <= 40, 'uzun nom: ' + nm);
+    assert.ok(!nm.startsWith(ROBOT), 'emoji bilan boshlandi: ' + nm);
+  }
+});
+
+test('taxallussiz ham nom qaytadi', () => {
+  for (let i = 0; i < 50; i++) {
+    const nm = randomRoomName('', []);
+    assert.ok(nm.trim().length > 2, 'nom juda qisqa: ' + nm);
+    assert.equal(nm, nm.trim(), 'chetida bo\'sh joy bor: [' + nm + ']');
+  }
 });

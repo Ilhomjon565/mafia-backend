@@ -394,18 +394,38 @@ export function buildVoteWeight(events = []) {
 // Taxalluslar ATAYLAB xilma-xil: faqat toza ismlar bo'lsa (Aziz, Bobur, ...)
 // bir xil uslub darhol ko'zga tashlanadi. Haqiqiy o'yinchilar taxallusi
 // aralash bo'ladi — ism, kichik harf, raqam, qisqartma.
+// Bot taxalluslari — FAQAT o'zbek ismlari. Ilgari ro'yxatda ism bo'lmagan
+// taxalluslar ham bor edi ('qora_ot', 'tunchi', 'palvon') — ular o'yinchi
+// ismiga o'xshamas, "sayt o'zi o'ylab topgan" degan taassurot berardi.
+// Raqamli shakllar ('bobur7', 'sardor_01') qoldirildi: ular ham o'zbek
+// ismi, shunchaki odam taxallus qilib yozganday ko'rinadi.
+//
+// Ro'yxat kattaligi muhim: bitta xonada 12 tagacha bot bo'ladi va nom
+// takrorlanmasligi kerak (makeFillerBots band nomlarni chetlab o'tadi).
 export const BOT_NAMES = [
-  'Aziz', 'Bobur', 'Davron', 'Eldor', 'Farrux', 'Gulnoza', 'Hasan', 'Jasur',
-  'Kamol', 'Laziz', 'Madina', 'Nodira', 'Olim', 'Sardor', 'Umid', 'Zafar',
-  'Shoxrux', 'Dilshod', 'Bekzod', 'Nurbek', 'Oybek', 'Rustam', 'Sanjar',
-  'Temur', 'Ulugbek', 'Xurshid', 'Yusuf', 'Zohid', 'Aziza', 'Dildora',
-  'Kamola', 'Malika', 'Nilufar', 'Sevara', 'Zuhra', 'Feruza',
+  // erkak ismlari
+  'Aziz', 'Bobur', 'Davron', 'Eldor', 'Farrux', 'Hasan', 'Husan', 'Jasur',
+  'Kamol', 'Laziz', 'Olim', 'Sardor', 'Umid', 'Zafar', 'Shoxrux', 'Dilshod',
+  'Bekzod', 'Nurbek', 'Oybek', 'Rustam', 'Sanjar', 'Temur', 'Ulugbek',
+  'Xurshid', 'Yusuf', 'Zohid', 'Doston', 'Elyor', 'Javohir', 'Mirzo',
+  'Ravshan', 'Sherali', 'Tohir', 'Anvar', 'Behruz', 'Diyor', 'Farhod',
+  'Gayrat', 'Ilhom', 'Asadbek', 'Ibrohim', 'Muhammad', 'Sherzod', 'Kamron',
+  'Nodirbek', 'Olimjon', 'Umidbek', 'Akmal', 'Bahodir', 'Dilmurod',
+  'Islom', 'Jahongir', 'Mansur', 'Nosir', 'Odil', 'Qahramon', 'Rahim',
+  'Saidaziz', 'Shahzod', 'Tolib', 'Valijon', 'Xolmurod', 'Yodgor', 'Zabur',
+  'Abror', 'Alisher', 'Aslbek', 'Azamat', 'Botir', 'Burhon', 'Erkin',
+  'Fazliddin', 'Gulom', 'Hamid', 'Iskandar', 'Jonibek', 'Karim', 'Lutfulla',
+  'Mardon', 'Nematilla', 'Otabek', 'Polat', 'Ozod', 'Rasul', 'Salim',
+  // ayol ismlari
+  'Gulnoza', 'Madina', 'Nodira', 'Aziza', 'Dildora', 'Kamola', 'Malika',
+  'Nilufar', 'Sevara', 'Zuhra', 'Feruza', 'Gulbahor', 'Dilnoza', 'Durdona',
+  'Hulkar', 'Iroda', 'Jamila', 'Komila', 'Lola', 'Mohira', 'Nafisa',
+  'Ozoda', 'Rayhona', 'Saodat', 'Shahnoza', 'Tursunoy', 'Umida', 'Xadicha',
+  'Yulduz', 'Zarina', 'Zebo', 'Munisa', 'Nargiza', 'Sitora', 'Shirin',
+  // odam taxallus qilib yozadigan shakllar (baribir o'zbek ismi)
   'aziz_99', 'bobur7', 'jasurbek', 'sardor_01', 'temurxon', 'malika_x',
-  'nodirbek', 'shoxrux13', 'davronchik', 'olimjon', 'zafar2007', 'umidbek',
-  'lazizzz', 'kamron', 'sherzod', 'asadbek', 'ibrohim', 'muhammad',
-  'Doston', 'Elyor', 'Javohir', 'Mirzo', 'Ravshan', 'Sherali', 'Tohir',
-  'Vali', 'Anvar', 'Behruz', 'Diyor', 'Farhod', 'Gayrat', 'Ilhom',
-  'xoja', 'palvon', 'mergen', 'qora_ot', 'tunchi', 'oqshom',
+  'shoxrux13', 'zafar2007', 'umidbek_7', 'kamola_uz', 'diyor98', 'aslbek_11',
+  'nilufar_a', 'behruz03', 'islom777', 'sitora_x', 'anvar_tosh', 'laziz2005',
 ];
 
 // Socket.io ID siga o'xshash tasodifiy satr — bot socketId'i "bot-3" bo'lsa,

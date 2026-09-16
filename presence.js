@@ -110,6 +110,51 @@ function pickName(used, seed) {
   return ROOM_NAMES[seed % ROOM_NAMES.length];
 }
 
+// ==================== XONA NOMI GENERATORI ====================
+// Bot o'yinlari uchun. Ilgari nom doim `${host} xonasi` edi va lobbi
+// ro'yxati bir xil qolipdan yasalganday ko'rinardi — odam yozgan nom
+// bunday bir xil bo'lmaydi.
+//
+// Shuning uchun bir nechta QOLIP aralashtiriladi: taxallus + qo'shimcha,
+// shahar nomi, mavzu, raqam. Emoji ishlatilmaydi va nom 🤖 bilan
+// boshlanmaydi — server bot rejimini (vsBots) aynan shu belgidan taniydi.
+const ROOM_TOPICS = [
+  'Tungi shahar', 'Kim mafiya?', 'Kechki o\'yin', 'Klassik', 'Tezkor o\'yin',
+  'Sokin xona', 'Qizg\'in jang', 'Shahar uxlaydi', 'Tunda ov', 'Oltin xona',
+  'Do\'stlar davrasi', 'Faqat tajribalilar', 'Yangi boshlovchilar',
+  'Ovozli chat bor', 'Katta o\'yin', 'Kim kim?', 'Tun bo\'yi',
+  'Oqshom o\'yini', 'Mafiya kechasi', 'Sirli xona', 'Ochiq jang',
+  'Shubhali xona', 'Yarim tunda', 'Toshbo\'ron', 'Jimjit tun',
+];
+const ROOM_CITIES = [
+  'Toshkent', 'Samarqand', 'Buxoro', 'Andijon', 'Farg\'ona', 'Namangan',
+  'Xiva', 'Nukus', 'Qo\'qon', 'Jizzax', 'Navoiy', 'Termiz', 'Guliston',
+  'Urganch', 'Qarshi', 'Chirchiq', 'Marg\'ilon', 'Shahrisabz',
+];
+const ROOM_SUFFIX = ['xonasi', 'davrasi', 'o\'yini', 'jangi', 'kechasi', 'stoli'];
+
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+// `host` — xona ochgan (bot) taxallusi, `used` — hozir ochiq xonalar nomlari.
+// Takrorlanmaslikka 12 marta urinib ko'radi, keyin nom oxiriga raqam qo'shadi.
+export function randomRoomName(host = '', used = []) {
+  const taken = new Set(used.map((n) => String(n || '').trim().toLowerCase()));
+  const h = String(host || '').trim();
+  const make = () => {
+    const r = Math.random();
+    if (h && r < 0.34) return `${h} ${pick(ROOM_SUFFIX)}`;
+    if (r < 0.62) return pick(ROOM_TOPICS);
+    if (r < 0.78) return `${pick(ROOM_CITIES)} ${pick(['mafiyasi', 'kechasi', 'xonasi'])}`;
+    if (r < 0.9) return `${pick(ROOM_TOPICS)} ${2 + Math.floor(Math.random() * 20)}`;
+    return h ? `${h} bilan o\'ynaymiz` : pick(ROOM_TOPICS);
+  };
+  for (let i = 0; i < 12; i++) {
+    const nm = make().slice(0, 40).trim();
+    if (nm && !taken.has(nm.toLowerCase())) return nm;
+  }
+  return `${pick(ROOM_TOPICS)} ${1 + Math.floor(Math.random() * 99)}`.slice(0, 40);
+}
+
 export function fakeRooms(now = Date.now(), enabled = true) {
   if (!enabled) return [];
   const slot = Math.floor(now / (7 * 60000));

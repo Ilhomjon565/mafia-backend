@@ -30,6 +30,10 @@ import {
   RATING_START, TIERS, XP, eloDelta, applyElo, xpForGame,
   levelFromXp, levelProgress, tierOf, tierProgress, xpForLevel,
 } from './progression.js';
+// O'yin tempi va vaqt chegarasi — alohida modulda, testlari pacing.test.mjs da.
+// Bir marta jimgina ishlamay qolgan mantiq (startedAt holatga yozilmagan edi),
+// shuning uchun endi testlar bilan qulflangan.
+import { gameElapsed as pacingElapsed, phaseDuration, isTimeUp, GAME_HARD_MS } from './pacing.js';
 
 
 // override: true — .env HAR DOIM ustun. Busiz pm2 (yoki shell) dan kelgan bo'sh
@@ -1517,7 +1521,16 @@ app.get('/api/games', async (_, res) => {
 //
 // Bir xonaga bir necha odam bossa — hammasi BITTA haqiqiy xonaga tushadi
 // (moslik Redis'da 20 daqiqa saqlanadi).
-app.post('/api/games/:id/open', authMiddleware, limitByUser(20), async (req, res) => {
+// Bitta odam ketma-ket bosib lobbini xonalar bilan to'ldirib yubormasligi
+// kerak: har bosishda haqiqiy xona yaratilardi va bitta foydalanuvchi
+// maxRooms (50) chegarasini yakka o'zi yeb qo'yishi mumkin edi.
+// Shuning uchun ikki to'siq:
+//   1. daqiqada 6 ta so'rov (limitByUser);
+//   2. KUTAYOTGAN bot xonalari 8 tadan oshsa yangisi yaratilmaydi —
+//      odam mavjud bo'sh xonalardan biriga yuboriladi.
+const OPEN_WAITING_CAP = 8;
+
+app.post('/api/games/:id/open', authMiddleware, limitByUser(6), async (req, res) => {
   try {
     const fid = String(req.params.id || '');
     // ID haqiqatan shu paytdagi soxta xonalardan birimi? (o'tgan slot ham
@@ -1537,6 +1550,19 @@ app.post('/api/games/:id/open', authMiddleware, limitByUser(20), async (req, res
     const settings = await getSettings();
     const active = await prisma.game.count({ where: { status: { in: ['waiting', 'playing'] } } });
     if (active >= (settings.maxRooms || 50)) return res.status(503).json({ error: 'tooManyRooms' });
+
+    // Kutayotgan ochiq xonalar juda ko'p bo'lsa — yangisini yaratmaymiz,
+    // eng yangisiga yuboramiz. O'yinchi uchun natija bir xil: u bo'sh joyi
+    // bor xonaga tushadi.
+    const waiting = await prisma.game.findMany({
+      where: { status: 'waiting', isPrivate: false },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true },
+      take: OPEN_WAITING_CAP + 1,
+    }).catch(() => []);
+    if (waiting.length > OPEN_WAITING_CAP) {
+      return res.json({ id: waiting[0].id });
+    }
 
     const id = await startBotGame({ name: room.name, totalPlayers: room.totalPlayers, quick: true });
     if (!id) return res.status(503).json({ error: 'busy' });
@@ -2480,41 +2506,14 @@ async function adjustUserItems(userId, deltas) {
 
 
 // ==================== O'YIN VAQT BUDJETI ====================
-// O'yin 20-30 daqiqada tugashi kerak. Uzoq o'yinda odamlar yarim yo'lda
-// chiqib ketadi, xona "zombi" bo'lib qoladi va guruhda e'lon qilingan
-// natija kechqurun emas, yarim tunda chiqadi.
-//
-// Ikki qatlam ishlaydi:
-//   1) TEZLASHUV — SOFT chegaradan keyin har bir faza qisqara boradi.
-//      Minimumdan pastga tushmaydi: 20 soniyalik kunduz muhokamasida
-//      o'ynash mumkin emas.
-//   2) QAT'IY CHEGARA — HARD chegarada o'yin kunduz boshida yakunlanadi.
-//      Qoida oddiy va tushunarli: mafiya belgilangan vaqtda shaharni
-//      bo'ysundira olmadi — shahar g'olib. Bu mafiyani cho'zishdan
-//      qaytaradi (cho'zish ularga foyda bermaydi).
-// Tezlashuv tufayli qat'iy chegaraga kam holda yetib boriladi.
-const GAME_SOFT_MS = 13 * 60 * 1000;
-const GAME_HARD_MS = 25 * 60 * 1000;
-// Faza uchun eng kichik ma'noli davomiylik (soniya)
-const PHASE_MIN = { day_discussion: 45, day_results: 5, night_results: 5 };
-
+// Hisob-kitob pacing.js da (testlari bor). Bu yerda faqat o'yin holatini
+// shu modulga bog'laydigan ikki yupqa yordamchi qoladi.
 function gameElapsed(g) {
-  const t = g && g.startedAt ? new Date(g.startedAt).getTime() : 0;
-  return t ? Date.now() - t : 0;
-}
-// 1.0 (normal) -> 0.45 (HARD chegarada)
-function timeScale(g) {
-  const e = gameElapsed(g);
-  if (e <= GAME_SOFT_MS) return 1;
-  const k = Math.min(1, (e - GAME_SOFT_MS) / (GAME_HARD_MS - GAME_SOFT_MS));
-  return 1 - 0.55 * k;
+  return pacingElapsed(g && g.startedAt);
 }
 function dur(g, phase) {
   const base = (g.durations && g.durations[phase]) || DEFAULT_SETTINGS.durations[phase];
-  const sc = timeScale(g);
-  if (sc >= 1) return base;
-  const min = PHASE_MIN[phase] ?? (base <= 5 ? base : 10);
-  return Math.max(min, Math.round(base * sc));
+  return phaseDuration(base, phase, gameElapsed(g));
 }
 
 
@@ -2526,7 +2525,7 @@ async function startPhase(gameId, phase) {
   // o'yinchi tungi harakatini bajarib bo'lgan bo'ladi va natija tushunarli
   // chiqadi. Tekshiruv har raundda bir marta bo'lgani uchun o'yin
   // chegaradan ko'pi bilan bitta raundga (2-4 daqiqa) oshadi.
-  if (phase === 'day_discussion' && g.status === 'playing' && gameElapsed(g) >= GAME_HARD_MS) {
+  if (phase === 'day_discussion' && g.status === 'playing' && isTimeUp(gameElapsed(g))) {
     logEvent(g, '\u23F3', "Vaqt tugadi — mafiya shaharni bo'ysundira olmadi", 'timeUp');
     await saveG(gameId, g);
     return endGame(gameId, 'town');
@@ -3280,8 +3279,14 @@ async function beginGame(gameId) {
   g.roleSetup = g.players.reduce((acc, p) => { acc[p.role] = (acc[p.role] || 0) + 1; return acc; }, {});
   for (const p of g.players) { p.items = await loadUserItems(p.userId); p.shieldActive = false; }
   logEvent(g, '🎭', 'O\'yin boshlandi — rollar tarqatildi', 'gameStarted');
+  // DIQQAT: `startedAt` HOLATGA ham yoziladi, faqat bazaga emas.
+  // Ilgari u faqat Postgres'da bo'lardi va Redis'dagi `g.startedAt`
+  // `null` bo'lib qolardi. Natijada unga tayangan uchta narsa JIMGINA
+  // ishlamasdi: vaqt chegarasi (25 daqiqa), fazalarning tezlashuvi va
+  // Telegram natijasidagi "⏱ N daqiqa" qatori.
+  g.startedAt = Date.now();
   await saveG(gameId, g);
-  prisma.game.update({ where: { id: gameId }, data: { status: 'playing', startedAt: new Date() } }).catch(() => {});
+  prisma.game.update({ where: { id: gameId }, data: { status: 'playing', startedAt: new Date(g.startedAt) } }).catch(() => {});
   tgRoomTouch(gameId); // guruhdagi e'lon: "o'yin boshlandi"
   g.players.forEach(p => {
     if (isBot(p)) return; // botlarga socket xabari yuborilmaydi
@@ -3533,6 +3538,8 @@ async function endGame(gameId, winner) {
   if (timers.has(gameId)) { clearTimeout(timers.get(gameId)); timers.delete(gameId); }
   cancelAbandonCheck(gameId);
   cancelEmptyCheck(gameId);
+  cancelBotJoins(gameId);   // qo'shilishni kutayotgan botlar endi kerak emas
+  cancelBotStart(gameId);   // "10-15 soniyada boshlash" taymeri ham
   setTimeout(() => redis.del(`game:${gameId}`, `chat:${gameId}`).catch(() => {}), 60000);
 }
 

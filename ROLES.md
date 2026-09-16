@@ -75,6 +75,19 @@ Har bir holat aniq yakunlanadi — oʻyin hech qachon muzlab qolmaydi:
 
 Tirik Boʻri shahar gʻalabasiga toʻsqinlik qilmaydi — u tomon emas, omon qolish roli.
 
+### Vaqt chegarasi
+
+Oʻyin **20–30 daqiqada** tugashi kerak: uzoq oʻyinda oʻyinchilar yarim yoʻlda chiqib
+ketadi va xona "zombi" boʻlib qoladi. Ikki qatlam ishlaydi:
+
+| Qatlam | Qachon | Nima boʻladi |
+|---|---|---|
+| Tezlashuv | 13-daqiqadan keyin | Har faza asta qisqaradi (kunduz muhokamasi **45 soniyadan** pastga tushmaydi, tungi bosqichlar **10 soniyadan**) |
+| Qatʼiy chegara | 25-daqiqada, **kunduz boshida** | Oʻyin yakunlanadi: mafiya belgilangan vaqtda shaharni boʻysundira olmadi — **shahar gʻolib** |
+
+Tekshiruv kunduz boshida boʻlgani uchun oʻyin chegaradan koʻpi bilan bitta raundga
+oshadi. Qoida mafiyani choʻzishdan qaytaradi: vaqt oʻtishi ularga foyda bermaydi.
+
 ## Rol balansi
 
 - Oʻyin kamida **5 kishi** bilan boshlanadi. 3–4 kishida birinchi ovozning oʻzidayoq
@@ -95,6 +108,16 @@ Tirik Boʻri shahar gʻalabasiga toʻsqinlik qilmaydi — u tomon emas, omon qol
 | 🛡️ Qalqon | Bir kechaga oʻlimdan himoyalaydi (Komissar oʻqidan tashqari) |
 | 🔍 Lupa | Bitta **tirik** oʻyinchining rolini ochadi (oʻzini tanlab boʻlmaydi) |
 | ❤️ Qoʻshimcha jon | Oʻlimdan bir marta qutqaradi — tunda ham, kunduzgi ovozda ham |
+
+### Hisob imkoniyatlari (oʻyin ichida ishlamaydi)
+
+| Imkoniyat | Taʼsir |
+|---|---|
+| ⚡ XP kuchaytirgich | Keyingi tugagan oʻyinda **XP ikki barobar**. Reytingga (Elo) taʼsir qilmaydi |
+| 🏠 Qoʻshimcha xona | **Bugun** bitta ortiq xona yaratish huquqi |
+
+**Reyting sotilmaydi.** Doʻkondagi hech narsa Elo ochkosiga taʼsir qilmaydi — aks holda
+jadval oʻyin mahoratini emas, tanga sarfini koʻrsatardi.
 
 ## Ochiqlik qoidasi
 

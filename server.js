@@ -152,15 +152,17 @@ function signupAllowed(ip, max) {
 //
 // Kesh JUDA kichik (bir nechta kalit) va TTL sekundlar bilan o'lchanadi —
 // shuning uchun alohida tozalash jarayoni kerak emas.
-const mem = new Map();
+// Nomi ATAYLAB `hotCache`: `/health` ichida `const mem = process.memoryUsage()`
+// bor va global `mem` uni soyalab, kelajakda chalkashtirib yuborardi.
+const hotCache = new Map();
 function memGet(key) {
-  const v = mem.get(key);
+  const v = hotCache.get(key);
   if (!v) return null;
-  if (v.exp <= Date.now()) { mem.delete(key); return null; }
+  if (v.exp <= Date.now()) { hotCache.delete(key); return null; }
   return v.val;
 }
-function memSet(key, val, ttlMs) { mem.set(key, { val, exp: Date.now() + ttlMs }); }
-function memClear() { mem.clear(); }
+function memSet(key, val, ttlMs) { hotCache.set(key, { val, exp: Date.now() + ttlMs }); }
+function memClear() { hotCache.clear(); }
 
 // ==================== HUJUM REJIMI (PANIC) ====================
 // Katta so'rov to'lqini kelganda sayt butunlay yiqilib qolmasligi kerak.

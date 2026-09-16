@@ -15,7 +15,8 @@ import {
   NIGHT_STEPS, nightStepByPhase, stepHasActor, nightStepComplete,
 } from './rules.js';
 import {
-  RATING_START, eloDelta, applyElo, xpForGame, levelFromXp, levelProgress, tierOf, tierProgress,
+  RATING_START, TIERS, XP, eloDelta, applyElo, xpForGame,
+  levelFromXp, levelProgress, tierOf, tierProgress, xpForLevel,
 } from './progression.js';
 
 
@@ -923,6 +924,14 @@ app.get('/api/leaderboard', async (req, res) => {
       }))
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Liga chegaralari (public). /reyting sahifasidagi jadval shundan chiziladi —
+// chegaralar frontendda TAKRORLANMASIN, aks holda biri o'zgarganda ikkinchisi
+// jimgina noto'g'ri ko'rsatib turardi.
+app.get('/api/tiers', (_req, res) => {
+  res.set('Cache-Control', 'public, max-age=3600');
+  res.json({ start: RATING_START, tiers: TIERS });
 });
 
 // joriy foydalanuvchining reytingdagi o'rni

@@ -1,7 +1,7 @@
 // presence.js testlari: onlayn ko'rsatkichi tabiiy ko'rinishi kerak.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fakeOnlineBase, fakePlayersBase, ONLINE_CURVE } from './presence.js';
+import { fakeOnlineBase, fakePlayersBase, fakeGamesPlayed, fakeRooms, ONLINE_CURVE } from './presence.js';
 
 // Toshkent vaqti bo'yicha berilgan soat/daqiqaga to'g'ri keladigan UTC ms
 const at = (hour, min = 0) => Date.UTC(2026, 8, 16, hour - 5, min, 0);
@@ -77,4 +77,75 @@ test('jami o\'yinchilar soni kundan kunga o\'sadi yoki saqlanadi', () => {
   const d2 = fakePlayersBase(at(12) + 86400000);
   assert.ok(d2 !== d1 || d2 === d1, 'kun almashsa qiymat qayta hisoblanadi');
   assert.ok(d1 > 1000 && d1 < 20000, 'haqiqatga o\'xshash: ' + d1);
+});
+
+// ---------- lobbidagi soxta xonalar ----------
+
+test('soxta xonalarda BARCHA maydonlar bor', () => {
+  // Bir vaqtda `>>` (ishorali siljitish) tufayli ba'zi xonalar NOMSIZ qolgan edi:
+  // h32() 2^31 dan katta son qaytarsa `s >> 7` manfiy bo'lib, manfiy indeks
+  // undefined berardi. Shuning uchun ko'p vaqt oralig'ida tekshiramiz.
+  const need = ['id', 'name', 'status', 'totalPlayers', 'mafiaCount', 'sheriffCount',
+                'doctorCount', 'civilCount', 'hostId', 'createdAt', 'phase', 'players'];
+  for (let k = 0; k < 400; k++) {
+    const t = Date.UTC(2026, 8, 16) + k * 7 * 60000;
+    const rooms = fakeRooms(t);
+    assert.ok(rooms.length >= 5 && rooms.length <= 10, 'xonalar soni: ' + rooms.length);
+    for (const r of rooms) {
+      for (const f of need) {
+        assert.ok(r[f] !== undefined && r[f] !== null, `${f} yo'q (vaqt ${k}): ` + JSON.stringify(r).slice(0, 120));
+      }
+      assert.ok(typeof r.name === 'string' && r.name.length > 2, 'nom bo\'sh: ' + r.name);
+    }
+  }
+});
+
+test('soxta xonalarga QO\'SHILIB BO\'LMAYDI (hammasi to\'lgan)', () => {
+  // Soxta xona ID si haqiqiy emas — unga kirmoqchi bo'lgan odam xato ko'rardi.
+  // Frontend to'lgan yoki jangdagi xonaning tugmasini bloklaydi.
+  for (let k = 0; k < 200; k++) {
+    for (const r of fakeRooms(Date.UTC(2026, 8, 16) + k * 7 * 60000)) {
+      const full = r.players.length >= r.totalPlayers;
+      assert.ok(full || r.status === 'playing',
+        `xona qo'shilishga ochiq qolgan: ${r.name} ${r.players.length}/${r.totalPlayers} ${r.status}`);
+    }
+  }
+});
+
+test('ikki xil holat ham uchraydi (hammasi bir xil emas)', () => {
+  const statuses = new Set();
+  const names = new Set();
+  const sizes = new Set();
+  for (let k = 0; k < 120; k++) {
+    for (const r of fakeRooms(Date.UTC(2026, 8, 16) + k * 7 * 60000)) {
+      statuses.add(r.status); names.add(r.name); sizes.add(r.totalPlayers);
+    }
+  }
+  assert.equal(statuses.size, 2, 'waiting va playing ikkisi ham bo\'lishi kerak: ' + [...statuses]);
+  assert.ok(names.size > 10, 'nomlar xilma-xil bo\'lsin: ' + names.size);
+  assert.ok(sizes.size > 3, 'xona o\'lchamlari xilma-xil bo\'lsin: ' + sizes.size);
+});
+
+test('o\'yinchi ismlari va ID lari to\'g\'ri', () => {
+  for (const r of fakeRooms(Date.UTC(2026, 8, 16))) {
+    assert.equal(r.players.length, r.totalPlayers, 'xona to\'lgan bo\'lishi kerak');
+    for (const p of r.players) {
+      assert.ok(p.username && p.username.length > 1, 'ism: ' + p.username);
+      assert.ok(!/bot/i.test(p.username), 'ismda "bot": ' + p.username);
+      assert.ok(p.userId && p.userId.startsWith('c'), 'userId cuid ga o\'xshasin: ' + p.userId);
+    }
+  }
+});
+
+test('to\'plam vaqt o\'tishi bilan yangilanadi', () => {
+  const t = Date.UTC(2026, 8, 16, 12);
+  const a = fakeRooms(t).map(r => r.id).join();
+  const b = fakeRooms(t + 60000).map(r => r.id).join();     // 1 daqiqadan keyin
+  const c = fakeRooms(t + 8 * 60000).map(r => r.id).join(); // 8 daqiqadan keyin
+  assert.equal(a, b, 'bir necha daqiqa ichida o\'zgarmasligi kerak (kesh uchun)');
+  assert.notEqual(a, c, '7 daqiqadan keyin yangilanishi kerak');
+});
+
+test('FAKE_ONLINE=0 bo\'lsa xona ham yo\'q', () => {
+  assert.deepEqual(fakeRooms(Date.now(), false), []);
 });

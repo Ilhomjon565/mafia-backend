@@ -107,10 +107,14 @@ export function fakeRooms(now = Date.now(), enabled = true) {
   const count = 5 + (h32(slot) % 6);            // 5-10 ta
   const out = [];
   for (let i = 0; i < count; i++) {
+    // DIQQAT: `>>>` (unsigned), `>>` EMAS. h32() 32-bitli musbat son qaytaradi,
+    // lekin `>>` uni ishorali deb hisoblaydi va 2^31 dan katta qiymatlarda
+    // MANFIY natija beradi. JS'da manfiy son bilan `%` ham manfiy chiqadi,
+    // natijada `ROOM_NAMES[-5]` = undefined bo'lib, xonalar nomsiz qolardi.
     const s = h32(slot * 977 + i * 31);
     const total = [8, 9, 10, 10, 12, 12, 14, 16][s % 8];
     // 70% jangda, 30% to'lgan va boshlanishini kutmoqda
-    const playing = (s >> 3) % 10 < 7;
+    const playing = ((s >>> 3) % 10) < 7;
     const mafiaCount = Math.max(1, Math.round(total * 0.3));
     const players = [];
     const shift = s % PLAYER_NAMES.length;
@@ -123,7 +127,7 @@ export function fakeRooms(now = Date.now(), enabled = true) {
     }
     out.push({
       id: 'c' + (h32(slot * 104729 + i) >>> 0).toString(16).padStart(8, '0') + 'x' + i,
-      name: ROOM_NAMES[(s >> 7) % ROOM_NAMES.length],
+      name: ROOM_NAMES[(s >>> 7) % ROOM_NAMES.length],
       status: playing ? 'playing' : 'waiting',
       totalPlayers: total,
       mafiaCount,

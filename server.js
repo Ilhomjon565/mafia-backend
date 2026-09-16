@@ -2575,15 +2575,25 @@ async function pingCycle() {
 
     await Promise.all(targets.map(([, , s]) => probePing(s)));
 
+    // DIQQAT: `ping` maydonining shakli O'ZGARMAYDI (socketId -> son).
+    // Transport ALOHIDA maydonda yuboriladi — eski mijoz yangi serverga
+    // ulanganda ping ko'rsatkichi ishlashda davom etsin.
     const byGame = new Map();
-    for (const [sid, gameId] of targets) {
+    const trByGame = new Map();
+    for (const [sid, gameId, s] of targets) {
       const v = PING_MS.get(sid);
       if (v === undefined) continue;
-      if (!byGame.has(gameId)) byGame.set(gameId, {});
+      if (!byGame.has(gameId)) { byGame.set(gameId, {}); trByGame.set(gameId, {}); }
       byGame.get(gameId)[sid] = v;
+      // WebSocket o'rniga long-polling'ga tushib qolgan mijozda har xabar
+      // to'liq HTTP so'rov bo'ladi va ping tabiiy ravishda bir necha barobar
+      // yomon chiqadi. Ba'zi korporativ/mobil tarmoqlar WebSocket'ni bloklaydi
+      // va socket.io jimgina pollingda qoladi — buni ko'rsatmasak, sababni
+      // tarmoqdan qidirib vaqt yo'qotiladi.
+      trByGame.get(gameId)[sid] = s.conn?.transport?.name || '?';
     }
     for (const [gameId, map] of byGame) {
-      io.to(`game:${gameId}`).emit('ping_update', { ping: map });
+      io.to(`game:${gameId}`).emit('ping_update', { ping: map, transport: trByGame.get(gameId) });
     }
   } finally {
     pingBusy = false;

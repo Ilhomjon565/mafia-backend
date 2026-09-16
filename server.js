@@ -2577,9 +2577,13 @@ async function startBotGame() {
   const active = await prisma.game.count({ where: { status: { in: ['waiting', 'playing'] } } });
   if (active >= (settings.maxRooms || 50)) return null;
 
-  const totalPlayers = 8 + crypto.randomInt(5);          // 8-12 o'yinchi
+  const totalPlayers = 9 + crypto.randomInt(4);          // 9-12 joylik xona
   const mafiaCount = Math.max(1, Math.round(totalPlayers * 0.3));
-  const bots = makeFillerBots('seed' + Date.now().toString(36), totalPlayers, []);
+  // 2-3 joy ODAM uchun bo'sh qoladi: bot o'yini "yopiq tomosha" emas, unga
+  // kirib o'ynash mumkin bo'lishi kerak. Odam kirmasa botlar o'zlari o'ynaydi.
+  const freeSeats = 2 + crypto.randomInt(2);
+  const botCount = Math.max(5, totalPlayers - freeSeats);
+  const bots = makeFillerBots('seed' + Date.now().toString(36), botCount, []);
   const host = bots[0];
   host.isHost = true;
 
@@ -2602,11 +2606,12 @@ async function startBotGame() {
   };
   await saveG(game.id, state);
 
-  // Qolgan botlar bittalab kiradi (2-9 s), oxirgisidan keyin o'yin boshlanadi
+  // Qolgan botlar bittalab kiradi (2-9 s), keyin xona bir muddat OCHIQ turadi —
+  // lobbi ro'yxatini ko'rgan odam kirib ulgursin. Odam kirmasa ham o'yin
+  // baribir boshlanadi.
   const rest = bots.slice(1);
   scheduleBotJoins(game.id, rest);
-  // Kutish vaqtining yuqori chegarasi: 9 s * bot soni + zaxira
-  const startAfter = rest.length * 9000 + 6000;
+  const startAfter = rest.length * 9000 + 45000;
   setTimeout(() => withLock(game.id, async () => {
     const g = await getG(game.id);
     if (!g || g.status !== 'waiting') return;
@@ -2815,7 +2820,17 @@ async function recordStats(g, winner) {
   } catch {}
 
   const ratingOf = (id) => statsById.get(id)?.rating ?? RATING_START;
-  const totalRating = ids.reduce((s, id) => s + ratingOf(id), 0);
+
+  // RAQIB KUCHI. Xonada botlar bo'lsa, ular ham TO'LA QONLI raqib sifatida
+  // hisoblanadi (reytingi RATING_START deb olinadi) — aks holda 1 odam + 11 bot
+  // bo'lgan o'yinda "raqib yo'q" bo'lib chiqardi.
+  //
+  // MUHIM: "Botlar bilan o'ynash" tugmasi bosilgan o'yin (vsBots) yuqorida
+  // butunlay chetlab o'tiladi — u reytingga ta'sir qilmaydi. Bu yerda gap
+  // oddiy xonalar haqida: u yerda bot odam o'rnini to'ldiradi va o'yin
+  // haqiqiy hisoblanadi.
+  const botCount = g.players.filter((p) => !isRealUser(p.userId)).length;
+  const totalRating = ids.reduce((s, id) => s + ratingOf(id), 0) + botCount * RATING_START;
 
   for (const p of real) {
     const won = isWinner(p.role, winner, p.isAlive);
@@ -2826,7 +2841,8 @@ async function recordStats(g, winner) {
 
     // Raqib kuchi = QOLGANLARNING o'rtachasi (o'zini qo'shmaymiz — aks holda
     // o'yinchi qisman o'zi bilan o'ynagan bo'lib chiqadi va delta kichrayadi).
-    const others = ids.length - 1;
+    // Botlar ham "qolganlar" ichida.
+    const others = ids.length - 1 + botCount;
     const opponent = others > 0 ? (totalRating - rating) / others : RATING_START;
 
     const delta = eloDelta({ rating, opponent, won, gamesPlayed });

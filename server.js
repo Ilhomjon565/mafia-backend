@@ -143,6 +143,109 @@ function signupAllowed(ip, max) {
   return h.count <= max;
 }
 
+// ==================== IXCHAM XOTIRA KESHI ====================
+// /api/games ni har bir mijoz 6 soniyada, /api/stats ni 20 soniyada so'raydi.
+// Redis keshi bazani himoya qilardi, lekin HAR so'rov baribir Redis'ga borardi
+// (tarmoq + JSON). 1-3 soniyalik xotira keshi shu yo'lni ham qisqartiradi:
+// 200 o'yinchi bo'lsa sekundiga ~33 so'rov keladi va ularning faqat bittasi
+// ish qiladi. Hujumda ham shu kesh zarbaning katta qismini yutadi.
+//
+// Kesh JUDA kichik (bir nechta kalit) va TTL sekundlar bilan o'lchanadi —
+// shuning uchun alohida tozalash jarayoni kerak emas.
+const mem = new Map();
+function memGet(key) {
+  const v = mem.get(key);
+  if (!v) return null;
+  if (v.exp <= Date.now()) { mem.delete(key); return null; }
+  return v.val;
+}
+function memSet(key, val, ttlMs) { mem.set(key, { val, exp: Date.now() + ttlMs }); }
+function memClear() { mem.clear(); }
+
+// ==================== HUJUM REJIMI (PANIC) ====================
+// Katta so'rov to'lqini kelganda sayt butunlay yiqilib qolmasligi kerak.
+//
+// NEGA JARAYON RESTART QILINMAYDI: restart butun jonli o'yinlarni o'ldiradi
+// va hujumchi aynan shuni xohlaydi — bir to'lqin yuborib hammani o'yindan
+// chiqarib yuborish. Shuning uchun bu yerda TRAFIK to'siladi, o'yin emas:
+//   1. har sekundda kelgan so'rovlar sanaladi;
+//   2. chegaradan oshsa PANIC yoqiladi: TOKENSIZ so'rovlar darhol 429 bilan
+//      (tanasiz javob — eng arzon yo'l) rad etiladi, keshlar BIR MARTA
+//      tozalanadi va adminga Telegram xabari ketadi;
+//   3. o'yinchilar (haqiqiy tokenli so'rovlar) ishlashda davom etadi;
+//   4. to'lqin tinsa PANIC o'zi o'chadi.
+// Jarayon haqiqatan javob bermay qolsa — uni watchdog qayta ishga tushiradi
+// (u /health ni tekshiradi), ya'ni restart qarori o'lchovga tayanadi.
+const PANIC_RPS = parseInt(process.env.PANIC_RPS || '300');          // so'rov/sekund
+const PANIC_HOLD_MS = parseInt(process.env.PANIC_HOLD_MS || '45000');
+const panic = {
+  on: false, until: 0, win: Date.now(), hits: 0,
+  peakRps: 0, entered: 0, blocked: 0, manual: false,
+};
+
+function panicFlush() {
+  // Ortiqcha keshlar bir marta tozalanadi: hujum paytida eskirgan javob
+  // tarqatib o'tirishdan ko'ra toza holatdan boshlash yaxshiroq.
+  memClear();
+  redis.del('cache:games', 'cache:pubstats', 'cache:board').catch(() => {});
+}
+
+function panicEnter(rps, manual = false) {
+  panic.on = true;
+  panic.manual = manual;
+  panic.until = Date.now() + PANIC_HOLD_MS;
+  panic.entered++;
+  panicFlush();
+  console.error(`\u{1F6E1} PANIC yoqildi: ${rps} so'rov/sek — tokensiz so'rovlar to'sildi`);
+  if (TG_ADMIN_BOT_TOKEN && TG_ADMIN_CHAT_ID) {
+    tgApi('sendMessage', {
+      chat_id: TG_ADMIN_CHAT_ID,
+      text: `\u{1F6E1} <b>Hujum shubhasi</b>\n${rps} so'rov/sekund keldi.\n`
+          + `Tokensiz so'rovlar ${Math.round(PANIC_HOLD_MS / 1000)} soniya to'sildi, kesh tozalandi.\n`
+          + `O'yinlar to'xtatilmadi.`,
+      parse_mode: 'HTML',
+    }).catch(() => {});
+  }
+}
+
+function panicLeave() {
+  if (!panic.on) return;
+  console.log(`\u2705 PANIC o'chdi (to'silgan so'rov: ${panic.blocked})`);
+  panic.on = false;
+  panic.manual = false;
+}
+
+// So'rov PANIC paytida o'tishga haqlimi? Faqat haqiqiy tokenli so'rov va
+// tekshiruv yo'li. Token HMAC bilan tekshiriladi — mikrosoniyalar oladi.
+function panicAllowed(req) {
+  if (req.path === '/health') return true;
+  const h = req.headers.authorization || '';
+  if (!h.startsWith('Bearer ')) return false;
+  try { jwt.verify(h.slice(7), JWT_SECRET); return true; } catch { return false; }
+}
+
+function panicMiddleware(req, res, next) {
+  const now = Date.now();
+  if (now - panic.win >= 1000) {
+    const rps = panic.hits;
+    if (rps > panic.peakRps) panic.peakRps = rps;
+    panic.win = now;
+    panic.hits = 0;
+    if (!panic.on && rps > PANIC_RPS) panicEnter(rps);
+  }
+  panic.hits++;
+
+  if (panic.on) {
+    if (!panic.manual && now > panic.until) panicLeave();
+    else if (!panicAllowed(req)) {
+      panic.blocked++;
+      res.setHeader('Retry-After', '30');
+      return res.status(429).end();   // tanasiz javob: hujumga eng arzon qarshilik
+    }
+  }
+  next();
+}
+
 const prisma = new PrismaClient();
 const redis = new Redis({
   host: process.env.REDIS_HOST || 'localhost',
@@ -155,6 +258,8 @@ const redis = new Redis({
 app.use(cors());
 app.use(express.json({ limit: '800kb' })); // avatar (base64) sig'adi, lekin ulkan payload floodini cheklaydi
 app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); next(); });
+// PANIC eng oldinda: to'lqin kelganda hech qanday qimmat ish bajarilmasin
+app.use(panicMiddleware);
 app.use(limitGlobal); // umumiy IP xavfsizlik to'ri (saxiy — CGNAT'ni hisobga olib)
 
 // 🕵️ Admin panelni yashirish: maxfiy kalitsiz BARCHA /api/admin/* — 404 (mavjud emasdek).
@@ -1031,6 +1136,10 @@ app.get('/health', (req, res) => {
     ramMb: { rss: Math.round(mem.rss / 1048576), heap: Math.round(mem.heapUsed / 1048576) },
     // rad etilgan ulanishlar (server ishga tushgandan beri)
     radEtilgan: {
+      panic: panic.on ? 'YONIQ' : 'o\'chiq',
+      panicSoni: panic.entered,
+      panicToSilgan: panic.blocked,
+      eng_yuqori_rps: panic.peakRps,
       tokensiz: shield.noAuth,          // SOCKET_REQUIRE_AUTH
       ipChegarasi: shield.perIp,        // MAX_CONN_PER_IP
       tezUlanish: shield.handshake,     // MAX_HANDSHAKE_PER_IP
@@ -1062,8 +1171,11 @@ app.post('/api/presence', async (req, res) => {
 // Natija 10 soniya Redis'da keshlanadi — ochiq endpoint bazani charchatmasin.
 app.get('/api/stats', async (_, res) => {
   try {
+    // 1-qadam: xotira keshi (Redis'ga ham bormaydi)
+    const hot = memGet('stats');
+    if (hot) return res.json(hot);
     const cached = await redis.get('cache:pubstats').catch(() => null);
-    if (cached) return res.json(JSON.parse(cached));
+    if (cached) { const v = JSON.parse(cached); memSet('stats', v, 3000); return res.json(v); }
 
     const cut = Date.now() - 30000; // oxirgi 30 s da ko'ringan qurilma = onlayn
     await redis.zremrangebyscore('presence:auth', '-inf', cut).catch(() => {});
@@ -1089,6 +1201,7 @@ app.get('/api/stats', async (_, res) => {
       onlineAuthed: onAuth,
     };
     await redis.set('cache:pubstats', JSON.stringify(data), 'EX', 10).catch(() => {});
+    memSet('stats', data, 3000);
     res.json(data);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1128,9 +1241,14 @@ async function saveG(gameId, g) {
 // barcha aktiv xonalar ro'yxati
 app.get('/api/games', async (_, res) => {
   try {
-    // qisqa keshlash: ko'p klient poll qilsa ham og'ir ish 3s da bir marta bajariladi
+    // Ikki qatlamli kesh: xotira (1.5s) -> Redis (3s) -> haqiqiy ish.
+    // Xotira qatlami uchta frontend instansiyasi uchun alohida, lekin u
+    // shunchaki Redis so'rovini tejaydi — ma'lumot baribir 3 soniyada
+    // yangilanadi, ya'ni instansiyalar bir-biridan uzoqlashib ketmaydi.
+    const hot = memGet('games');
+    if (hot) return res.json(hot);
     const cached = await redis.get('cache:games').catch(() => null);
-    if (cached) return res.json(JSON.parse(cached));
+    if (cached) { const v = JSON.parse(cached); memSet('games', v, 1500); return res.json(v); }
 
     const games = await prisma.game.findMany({
       where: { status: { in: ['waiting', 'playing'] }, isPrivate: false },
@@ -1158,6 +1276,7 @@ app.get('/api/games', async (_, res) => {
     const real = enriched.filter(Boolean);
     const list = [...real, ...fakeRooms(Date.now(), FAKE_ONLINE)];
     await redis.set('cache:games', JSON.stringify(list), 'EX', 3).catch(() => {});
+    memSet('games', list, 1500);
     res.json(list);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1468,6 +1587,35 @@ app.get('/api/ice', authMiddleware, limitByUser(30), async (req, res) => {
 // ==================== ADMIN ROUTES ====================
 
 // 🟢 hozir saytda turgan qurilmalar soni (auth qilgan / qilmagan alohida)
+// ===== HUJUM REJIMI: holat va qo'lda boshqarish =====
+// Admin hujumni o'zi ko'rib qalqonni yoqishi/o'chirishi mumkin. Keshni
+// tozalash ham shu yerda: "kesh bir marta tozalansin" degan holat aynan shu.
+app.get('/api/admin/panic', authMiddleware, adminMiddleware, (_, res) => {
+  res.json({
+    on: panic.on,
+    manual: panic.manual,
+    secondsLeft: panic.on && !panic.manual ? Math.max(0, Math.round((panic.until - Date.now()) / 1000)) : null,
+    threshold: PANIC_RPS,
+    holdSeconds: Math.round(PANIC_HOLD_MS / 1000),
+    entered: panic.entered,
+    blocked: panic.blocked,
+    peakRps: panic.peakRps,
+  });
+});
+
+app.post('/api/admin/panic', authMiddleware, adminMiddleware, (req, res) => {
+  const on = !!req.body?.on;
+  if (on) panicEnter(0, true);        // qo'lda yoqilgan qalqon o'zi o'chmaydi
+  else panicLeave();
+  res.json({ ok: true, on: panic.on, manual: panic.manual });
+});
+
+// Keshni qo'lda tozalash — noto'g'ri/eskirgan javob tarqalib qolsa
+app.post('/api/admin/flush-cache', authMiddleware, adminMiddleware, (_, res) => {
+  panicFlush();
+  res.json({ ok: true });
+});
+
 app.get('/api/admin/live', authMiddleware, adminMiddleware, async (_, res) => {
   try {
     const cut = Date.now() - 30000; // oxirgi 30s ichida "ko'ringan" qurilmalar = onlayn
@@ -3365,6 +3513,15 @@ io.use((socket, next) => {
   if (SOCKET_REQUIRE_AUTH && !socket.data.auth) {
     shield.noAuth++;
     return next(new Error('unauthorized'));
+  }
+
+  // (2.5) HUJUM REJIMIDA chegaralar qattiqlashadi: bitta IP dan 3 tadan
+  // ko'p ulanish ochib bo'lmaydi. Oddiy o'yinchiga 1-2 ulanish yetarli
+  // (varaq + zaxira), shuning uchun u sezmaydi; bir IP dan yuzlab socket
+  // ochayotgan skript esa shu yerda to'xtaydi.
+  if (panic.on && isPublicIp(ip) && (ipConns.get(ip) || 0) >= 3) {
+    shield.perIp++;
+    return next(new Error('too_many_connections'));
   }
 
   // (3) Bitta IP dan ulanish TEZLIGI — endi faqat TOKENLI urinishlar hisoblanadi.

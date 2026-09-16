@@ -2521,37 +2521,64 @@ const socketData = new Map();
 // O'lchov socket.io ack'i orqali: serverdan probe ketadi, mijoz javob
 // qaytaradi, orada o'tgan vaqt — to'liq aylanma (RTT).
 const PING_MS = new Map();   // socketId -> so'nggi RTT (ms)
-const PING_EVERY = 5000;
-const PING_TIMEOUT = 4000;   // javob kelmasa oldingi qiymat saqlanadi
+const PING_EVERY = 3000;
+const PING_TIMEOUT = 2500;   // javob kelmasa oldingi qiymat saqlanadi
 
 function probePing(socket) {
-  const t0 = Date.now();
-  try {
-    socket.timeout(PING_TIMEOUT).emit('ping_probe', (err) => {
-      if (err) return;  // javob kelmadi — sekin tarmoq; eski qiymatni buzmaymiz
-      PING_MS.set(socket.id, Math.min(9999, Date.now() - t0));
-    });
-  } catch {}
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    try {
+      socket.timeout(PING_TIMEOUT).emit('ping_probe', (err) => {
+        if (err) return resolve(null);  // javob kelmadi — eski qiymatni buzmaymiz
+        const ms = Math.min(9999, Date.now() - t0);
+        PING_MS.set(socket.id, ms);
+        resolve(ms);
+      });
+    } catch { resolve(null); }
+  });
 }
 
-// Faqat O'YINDAGI socketlar o'lchanadi — lobbida turganning pingi kerak emas.
-const pingTimer = setInterval(() => {
-  const byGame = new Map();
-  for (const [sid, d] of socketData) {
-    if (!d?.gameId) continue;
-    const s = io.sockets.sockets.get(sid);
-    if (!s) { PING_MS.delete(sid); continue; }
-    probePing(s);
-    const v = PING_MS.get(sid);
-    if (v === undefined) continue;
-    if (!byGame.has(d.gameId)) byGame.set(d.gameId, {});
-    byGame.get(d.gameId)[sid] = v;
+// DIQQAT: avval HAMMA probe javobini kutamiz, keyin tarqatamiz.
+// Ilgari probe yuborilib, o'sha zahoti PING_MS o'qilardi — ya'ni har doim
+// OLDINGI siklning qiymati ketardi: birinchi ping ~10 soniyadan keyin
+// ko'rinardi va ko'rsatilgan son doim bir sikl eskirgan bo'lardi.
+let pingBusy = false;
+async function pingCycle() {
+  if (pingBusy) return;  // sekin tarmoqda sikllar ustma-ust tushmasin
+  pingBusy = true;
+  try {
+    // Faqat O'YINDAGI socketlar — lobbida turganning pingi kerak emas.
+    const targets = [];
+    for (const [sid, d] of socketData) {
+      if (!d?.gameId) continue;
+      const s = io.sockets.sockets.get(sid);
+      if (!s) { PING_MS.delete(sid); continue; }
+      targets.push([sid, d.gameId, s]);
+    }
+    if (!targets.length) return;
+
+    await Promise.all(targets.map(([, , s]) => probePing(s)));
+
+    const byGame = new Map();
+    for (const [sid, gameId] of targets) {
+      const v = PING_MS.get(sid);
+      if (v === undefined) continue;
+      if (!byGame.has(gameId)) byGame.set(gameId, {});
+      byGame.get(gameId)[sid] = v;
+    }
+    for (const [gameId, map] of byGame) {
+      io.to(`game:${gameId}`).emit('ping_update', { ping: map });
+    }
+  } finally {
+    pingBusy = false;
   }
-  for (const [gameId, map] of byGame) {
-    io.to(`game:${gameId}`).emit('ping_update', { ping: map });
-  }
-}, PING_EVERY);
+}
+
+const pingTimer = setInterval(pingCycle, PING_EVERY);
 pingTimer.unref?.();
+
+// Xonaga kirgan odam ping ko'rinishini kutib o'tirmasin — darhol bir sikl.
+function pingSoon() { setTimeout(() => { pingCycle().catch(() => {}); }, 400); }
 
 // Faza yopilganda sekin ulanishli o'yinchining harakati yo'lda qolib
 // ketmasin: eng sekin ishtirokchining pingi qadar (lekin ko'pi bilan 1.5 s)
@@ -2748,7 +2775,7 @@ io.on('connection', (socket) => {
           remapSocketId(g, existing.socketId, socket.id); // ovoz/harakatlarni yangi socketga ko'chiramiz
           existing.socketId = socket.id;
           existing.connected = true;
-          clearIdle(socket); socketData.set(socket.id, { userId, username: existing.username, gameId });
+          clearIdle(socket); pingSoon(); socketData.set(socket.id, { userId, username: existing.username, gameId });
           socket.join(key);
           await saveG(gameId, g);
           socket.emit('game_state', publicGame(g));
@@ -2789,7 +2816,7 @@ io.on('connection', (socket) => {
         remapSocketId(g, existing.socketId, socket.id);
         existing.socketId = socket.id;
         existing.connected = true;
-        clearIdle(socket); socketData.set(socket.id, { userId, username: existing.username, gameId });
+        clearIdle(socket); pingSoon(); socketData.set(socket.id, { userId, username: existing.username, gameId });
         socket.join(key);
         await saveG(gameId, g);
         socket.emit('game_state', publicGame(g));
@@ -2823,7 +2850,7 @@ io.on('connection', (socket) => {
       if (!Array.isArray(g.everPlayers)) g.everPlayers = [];
       if (!g.everPlayers.includes(player.username)) g.everPlayers.push(player.username);
       await saveG(gameId, g);
-      clearIdle(socket); socketData.set(socket.id, { userId: player.userId, username: player.username, gameId });
+      clearIdle(socket); pingSoon(); socketData.set(socket.id, { userId: player.userId, username: player.username, gameId });
       socket.join(key);
 
       io.to(key).emit('game_state', publicGame(g));

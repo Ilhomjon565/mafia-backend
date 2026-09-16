@@ -933,12 +933,20 @@ app.get('/api/me/rank', authMiddleware, async (req, res) => {
     // mendan yuqori reytingli o'yinchilar soni + 1 = mening o'rnim
     const higher = await prisma.userStats.count({ where: { rating: { gt: rating } } });
     const total = await prisma.userStats.count();
+    // DIQQAT: levelProgress ham, tierProgress ham `left` va `percent`
+    // qaytaradi. Ikkovini bitta obyektga yoysak biri ikkinchisini bosib
+    // ketadi va interfeys "keyingi darajagacha" o'rniga liga ochkosini
+    // ko'rsatib qo'yadi. Shuning uchun nomlari ATAYLAB ajratilgan.
+    const lv = levelProgress(s?.xp ?? 0);
+    const tr = tierProgress(rating);
     res.json({
       rank: higher + 1, total, rating,
       gamesPlayed: s?.gamesPlayed ?? 0, gamesWon: s?.gamesWon ?? 0, winRate: s?.winRate ?? 0,
-      // Daraja chizig'i va liga — interfeys shularni chizadi
-      ...levelProgress(s?.xp ?? 0),
-      ...tierProgress(rating),
+      // daraja
+      level: lv.level, xp: lv.xp, into: lv.into, need: lv.need,
+      xpLeft: lv.left, percent: lv.percent,
+      // liga
+      tier: tr.tier, next: tr.next, tierPercent: tr.percent, tierLeft: tr.left,
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });

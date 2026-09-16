@@ -1,35 +1,104 @@
-# Mafia — Rollar va qoidalar (performance_arts)
+# Mafia — Rollar va qoidalar
 
-Ushbu hujjat o'yin rollari va mexanikasining yagona manbasi (source of truth).
+Ushbu hujjat oʻyin rollari va mexanikasining yagona manbasi (source of truth).
+Mexanikaning sof mantiqiy qismi `rules.js` da, testlari `rules.test.mjs` da
+(`npm test` bilan ishga tushadi) — hujjat va kod bir-biriga mos boʻlishi shart.
 
 ## Tomonlar
 
-### 1) 👨🏼 Tinch aholi tomoni (Town)
-- **👨🏼 Tinch aholi** — Maxsus kuchi yo'q. Maqsad: mafiyani topib, kunduzgi ovozda osish.
-- **💃 Kezuvchi (Ma'shuqa)** — Bir kechada bitta o'yinchini "band qiladi" (uxlatadi → o'sha kecha harakatini bekor qiladi). Komissar bilan birga bo'la olmaydi, Komissarni uxlata olmaydi.
-- **👮🏻‍♂ Serjant** — Komissarga yordamchi. Komissar harakatlaridan xabardor bo'ladi. Komissar o'lsa, uning o'rnini egallaydi (Komissarga aylanadi).
-- **🕵🏻‍♂ Komissar Kattani** — Shaharning asosiy himoyachisi. Tunda o'yinchini tekshiradi (mafiyami?). Mafiyani topsa kunduzgi ovozда osishga harakat qiladi / otadi. **Birinchi tunda tekshirmasdan otish taqiqlanadi.**
-- **👨🏻‍⚕ Doktor** — Komissar o'zini e'lon qilgandan keyin uni davolaydi. O'zini faqat **bir marta** davolay oladi.
-- **🧙‍♂ Daydi** — Tunda bitta o'yinchi oldiga boradi (shisha butilka uchun) va qotillikka guvoh bo'ladi.
-- **🧞‍♂️ Afsungar** — Tunda o'ldirilsa, o'ldirgan o'yinchini **o'zi bilan olib ketadi** (ikkalasi o'ladi). Kunduzi ovozда o'ldirilsa, o'zi xohlagan bitta o'yinchini o'ldiradi.
+### 1) 👨🏼 Tinch aholi tomoni (town)
 
-### 2) 🤵🏼 Mafiya tomoni (Mafia)
-- **🤵🏻 Don** — Mafiya boshlig'i. Tunda kimni o'ldirishni hal qiladi.
-- **🤵🏼 Mafiya** — Tunda Don bilan birga nishonni tanlaydi.
-- **👨‍💼 Advokat** — Tunda kimnидir himoya qiladi. Agar Mafiyani tanlasa, Komissar tekshirganda u **Tinch aholi** bo'lib ko'rinadi. Maqsad — Mafiya g'alabasi.
+| Rol | Tunda | Izoh |
+|---|---|---|
+| 👨🏼 **Tinch aholi** | — | Maxsus kuchi yoʻq. Yagona quroli — mantiq va ovoz. |
+| 💃 **Kezuvchi** | Bitta oʻyinchini band qiladi | Band qilingan oʻyinchining oʻsha kechagi harakati bekor boʻladi. **Komissarni band qila olmaydi.** Oʻzini tanlay olmaydi. |
+| 👮🏻‍♂ **Serjant** | — | Komissarning tekshiruv natijalarini koʻradi. Komissar oʻlsa (tunda ham, kunduzi ovoz bilan ham) **avtomatik Komissarga aylanadi**. |
+| 🕵🏻‍♂ **Komissar** | Tekshiradi **yoki** otadi | Tekshiruv natijasi kunduzi keladi. **Birinchi tunda otish taqiqlanadi**. Oʻzini tekshira ham, ota ham olmaydi. Komissar oʻqini doktor ham, qalqon ham, qoʻshimcha jon ham toʻxtata olmaydi. |
+| 👨🏻‍⚕ **Doktor** | Bitta oʻyinchini oʻlimdan qutqaradi | Oʻzini butun oʻyin davomida **faqat bir marta** davolay oladi. Bu huquq davolash HAQIQATAN sodir boʻlganda sarflanadi — Kezuvchi bloklasa yoʻqolmaydi. |
+| 🧙‍♂ **Daydi** | Bitta oʻyinchi oldiga boradi | Oʻsha uyda qotillik sodir boʻlsa — **kim oʻldirganini koʻradi**. Qotil va Komissar yakka harakat qilgani uchun ularning **ismi** koʻrsatiladi; mafiya jamoa boʻlib oʻldirgani uchun faqat "Mafiya" yorligʻi beriladi. Qurbon qutqarilgan boʻlsa (doktor/qalqon/qoʻshimcha jon) Daydi **hech narsa koʻrmaydi** — u faqat oʻlimga guvoh boʻladi. Natija kunduzi keladi. |
+| 🧞‍♂ **Afsungar** | — | Tunda oʻldirilsa — **oʻldirganni oʻzi bilan olib ketadi**. Kunduzi ovoz bilan chiqarilsa — **oʻzi tanlagan** bitta oʻyinchini olib ketadi (tanlash uchun natija fazasi 15 soniyaga choʻziladi; tanlamasa hech kim oʻlmaydi). Qasos oddiy oʻlim kabi hisoblanadi: qalqon, doktor va qoʻshimcha jon undan ham himoya qiladi. |
 
-### 3) Betaraf (Neutral)
-- **🔪 Qotil** — Tunda atrofdagilarni o'ldiradi. **Faqat yakkama-yakka qolsa g'olib bo'ladi.**
-- **🐺 Bo'ri** — Ikki tomonlama; reenkarnatsiya qiladi:
-  - Mafiya (Don) o'ldirsa → keyingi kecha **Mafiya** bo'ladi.
-  - Komissar o'ldirsa → **Serjant**ga aylanadi.
-  - Qotil o'ldirsa → **o'ladi**.
+### 2) 🤵🏼 Mafiya tomoni (mafia)
 
-## Ochiq savollar (aniqlanishi kerak)
-1. Har o'yinda qaysi rollar / nechtadan? (o'yinchi soniga qarab jadval? host tanlaydimi? random pool?)
-2. Tungi harakatlar tartibi (masalan: Kezuvchi blok → Advokat himoya → Don/Mafiya o'ldirish → Komissar otish/tekshirish → Doktor davolash → Daydi/Afsungar effektlari)?
-3. G'alaba shartlari aniq formulasi (Town / Mafia / Qotil / Bo'ri holatlari).
-4. Komissarning "otish" — kunduzi ovozда maxsus huquqmi yoki tunda otishmi?
-5. Kezuvchi bloki qaysi rollarga ta'sir qiladi?
+| Rol | Tunda | Izoh |
+|---|---|---|
+| 🤵🏻 **Don** | Nishonga ovoz beradi | Mafiya boshligʻi. Kelishuv boʻlmasa **yakuniy qarorni Don qabul qiladi**. |
+| 🤵🏼 **Mafiya** | Nishonga ovoz beradi | Don bilan birga nishonni tanlaydi. |
+| 👨‍💼 **Advokat** | Bitta oʻyinchini himoya qiladi | Himoyalangan mafiya Komissar tekshirganda **Tinch aholi** boʻlib koʻrinadi. Oʻldirish ovoziga **qatnashmaydi** (alohida bosqichda harakat qiladi). |
 
-> Eslatma: hozirgi backend faqat 4 rol (mafia/sheriff/doctor/civil) bilan ishlaydi. Bu to'liq qayta qurishni talab qiladi.
+**Nishon tanlash tartibi:** hamma bir xil nishonni tanlasa — oʻsha oʻladi. Kelisha olmasa
+Don qarori kuchga kiradi. Don yoʻq (oʻlgan yoki uzilib qolgan) boʻlsa — koʻpchilik ovozi;
+ovozlar teng boʻlsa hech kim oʻlmaydi. Uzilib qolgan mafiya kutilmaydi.
+
+### 3) Betaraf (neutral)
+
+| Rol | Tunda | Gʻalaba sharti |
+|---|---|---|
+| 🔪 **Qotil** | Bitta oʻyinchini oʻldiradi | **Faqat yakkama-yakka qolsa** gʻolib. U tirik ekan boshqa hech kim yakuniy gʻalaba qila olmaydi. |
+| 🐺 **Boʻri** | — | Omon qolish roli. Mafiya oʻldirsa → **Mafiya** boʻladi; Komissar otsa → **Serjant** boʻladi (xonada Serjant allaqachon boʻlsa → **Tinch aholi**); Qotil oʻldirsa → **oʻladi**. Kunduzgi ovozda chiqarilsa yoki Afsungar oʻzi bilan olib ketsa — qayta tugʻilmaydi, oddiy oʻladi. Oʻyin oxirida tirik boʻlsa — gʻolib hisoblanadi. Faqat boʻri(lar) qolsa — boʻri tomoni yutadi. |
+
+## Tungi bosqichlar tartibi
+
+Tun navbat bilan oʻtadi; har bosqichda faqat oʻsha rol harakat qiladi:
+
+1. 🤵 **Mafiya** — nishon tanlash
+2. 🕵🏻‍♂ **Komissar** — tekshirish yoki otish
+3. 👨🏻‍⚕ **Doktor** — davolash
+4. 💃 **Kezuvchi** — band qilish
+5. 👨‍💼 **Advokat** — himoya
+6. 🔪 **Qotil** — oʻldirish
+7. 🧙‍♂ **Daydi** — borish
+
+Rol oʻyinda boʻlmasa, bosqich qisqa oʻtib ketadi. Qaysi rollar oʻyinda ekani
+oʻyin boshida **hammaga ochiq** koʻrsatiladi (klassik mafiyada host eʼlon qilganidek) —
+busiz bosqich tezligidan baribir bilinardi.
+
+**Natijalar hal qilinish tartibi:** Kezuvchi bloki → Advokat himoyasi → Mafiya oʻqi →
+Qotil oʻqi → Komissar (tekshirish/otish) → Doktor davolashi → oʻlimlar hisoblanadi →
+Daydi guvohligi → Serjant koʻtarilishi.
+
+Bir oʻyinchiga bir kechada ikki hujum tushsa, qalqon/doktor/qoʻshimcha jon **bir marta**
+ishlaydi (ikkalasini ham toʻxtatadi va buyum bir marta sarflanadi).
+
+## Gʻalaba shartlari
+
+Har bir holat aniq yakunlanadi — oʻyin hech qachon muzlab qolmaydi:
+
+| Holat | Natija |
+|---|---|
+| Hech kim tirik qolmadi | **Durang** |
+| Faqat qotil(lar) qoldi | **Qotil** |
+| Faqat boʻri(lar) qoldi | **Boʻri** |
+| Qotil tirik | Hali hech kim yutmaydi |
+| Mafiya soni qolganlarga teng yoki koʻp | **Mafiya** |
+| Mafiya ham, qotil ham qolmadi | **Tinch aholi** |
+
+Tirik Boʻri shahar gʻalabasiga toʻsqinlik qilmaydi — u tomon emas, omon qolish roli.
+
+## Rol balansi
+
+- Oʻyin kamida **5 kishi** bilan boshlanadi. 3–4 kishida birinchi ovozning oʻzidayoq
+  gʻolib aniqlanib qoladi va tun mexanikasi umuman ishlamaydi.
+- Mafiya **har doim ozchilik**: `mafiya × 2 < oʻyinchilar soni`.
+- Noyob rollar (Komissar, Don, Doktor, Serjant, Kezuvchi, Daydi, Afsungar, Advokat,
+  Qotil, Boʻri) xonada **faqat bittadan** boʻladi; faqat oddiy Mafiya va Tinch aholi
+  koʻp boʻlishi mumkin.
+- Serjant Komissarsiz tarqatilmaydi.
+- Host qoʻlda tanlagan tarkib **haqiqiy oʻyinchi soniga moslanadi**: kam odam yigʻilsa
+  ortiqcha rollar ahamiyati boʻyicha kesiladi (Boʻri → Afsungar → Daydi → Qotil → …),
+  mafiya ulushi esa ozchilikda qoladi.
+
+## Buyumlar
+
+| Buyum | Taʼsir |
+|---|---|
+| 🛡️ Qalqon | Bir kechaga oʻlimdan himoyalaydi (Komissar oʻqidan tashqari) |
+| 🔍 Lupa | Bitta **tirik** oʻyinchining rolini ochadi (oʻzini tanlab boʻlmaydi) |
+| ❤️ Qoʻshimcha jon | Oʻlimdan bir marta qutqaradi — tunda ham, kunduzgi ovozda ham |
+
+## Ochiqlik qoidasi
+
+Oʻyin davomida **ochiq jurnalda** faqat shahar baribir biladigan narsalar koʻrinadi:
+oʻlimlar, ovoz natijasi, kimdir omon qolgani. Kim kimni davolagani, kim kimni band
+qilgani, Komissar nimani koʻrgani, Boʻri kimga aylangani — **maxfiy jurnalga** yoziladi
+va faqat oʻyin tugagach ochiladi.

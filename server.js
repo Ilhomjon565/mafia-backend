@@ -392,6 +392,55 @@ async function tgStart(msg) {
   if (msg.from?.id) {
     redis.sadd('tg:started', String(msg.from.id)).catch(() => {});
   }
+
+  // ===== Hisobni bog'lash: /start <kod> =====
+  // Kod saytdagi profil sahifasidan olinadi va 10 daqiqa amal qiladi.
+  const payload = String(msg.text || '').split(/\s+/)[1] || '';
+  if (payload && /^[A-Za-z0-9_-]{8,40}$/.test(payload)) {
+    const key = `tglink:${payload}`;
+    // GETDEL: kod BIR MARTA ishlaydi — ikkinchi odam o'sha kod bilan
+    // kelsa hech narsa bog'lanmaydi.
+    let userId = null;
+    try { userId = await redis.getdel(key); } catch { userId = await redis.get(key); await redis.del(key).catch(() => {}); }
+    const tgId = String(msg.from?.id || '');
+    if (!userId) {
+      await tgApi('sendMessage', {
+        chat_id: msg.chat.id,
+        text: '\u23F3 Havola eskirgan yoki allaqachon ishlatilgan.\nSaytdagi profil sahifasidan yangi havola oling.',
+      });
+      return;
+    }
+    try {
+      // Bitta Telegram hisobi — bitta o'yin hisobi. Band bo'lsa aytamiz.
+      const busy = await prisma.user.findFirst({ where: { tgId }, select: { id: true, username: true } });
+      if (busy && busy.id !== userId) {
+        await tgApi('sendMessage', {
+          chat_id: msg.chat.id,
+          text: `\u26A0\uFE0F Bu Telegram hisobi allaqachon <b>${tgEsc(busy.username)}</b> hisobiga bog'langan.`,
+          parse_mode: 'HTML',
+        });
+        return;
+      }
+      const u = await prisma.user.update({
+        where: { id: userId },
+        data: { tgId, tgUsername: msg.from?.username || null, tgLinkedAt: new Date() },
+      });
+      const st = profileState(u);
+      await tgApi('sendMessage', {
+        chat_id: msg.chat.id,
+        text: `\u2705 <b>Hisob bog'landi!</b>\n\nO'yindagi taxallusingiz: <b>${tgEsc(u.username)}</b>\n`
+            + (st.verified
+                ? '\u{1F396} Ma\'lumotlaringiz to\'liq — endi profilingizda "Ishonchli" belgisi turadi.'
+                : `\u{1F4CB} Profil to'liqligi: <b>${st.percent}%</b> — qolgan ma'lumotlarni saytda to'ldirsangiz "Ishonchli" belgisini olasiz.`),
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '\u{1F464} Profilim', url: `${SITE_URL}/profil` }]] },
+      });
+    } catch (e) {
+      console.error('tglink:', e.message);
+      await tgApi('sendMessage', { chat_id: msg.chat.id, text: '\u274C Bog\'lashda xatolik. Keyinroq urinib ko\'ring.' });
+    }
+    return;
+  }
   const code = String(msg.from?.language_code || '').slice(0, 2).toLowerCase();
   const L = TG_WELCOME[code === 'ru' ? 'ru' : code === 'en' ? 'en' : 'uz'];
   const name = tgEsc(msg.from?.first_name || msg.from?.username || '');
@@ -930,6 +979,49 @@ app.post('/api/admin/login', limitAdminLogin, async (req, res) => {
 });
 
 // joriy foydalanuvchi profili + stats
+// ==================== PROFIL TO'LIQLIGI VA ISHONCH ====================
+// Nega kerak: soxta hisob yasab reytingni buzib yuradigan odam o'zi haqida
+// ma'lumot qoldirmaydi. Ma'lumotlari to'liq o'yinchi esa "ishonchli" belgisi
+// oladi va u O'YIN ICHIDA ham ko'rinadi — boshqalar kim bilan o'ynayotganini
+// biladi. Hech qaysi maydon MAJBURIY emas: o'yin uchun faqat taxallus kerak.
+const REGIONS = [
+  'uz-tas', 'uz-tk', 'uz-and', 'uz-buk', 'uz-fer', 'uz-jiz', 'uz-xor',
+  'uz-nam', 'uz-nav', 'uz-qas', 'uz-qar', 'uz-sam', 'uz-sir', 'uz-sur',
+];
+// Tartib MUHIM: ro'yxat foydalanuvchiga "nima qoldi" deb ko'rsatiladi va
+// eng oson qadam boshida turadi.
+//
+// Rasm ATAYLAB ro'yxatda yo'q: Google orqali kirganda u avtomatik keladi,
+// ya'ni "to'ldirish" qadami emas. Beshta maydonning hammasi profil
+// sahifasidagi bitta formada to'ldiriladi.
+const PROFILE_FIELDS = ['fullName', 'birthDate', 'region', 'gender', 'tgId'];
+
+function profileState(u) {
+  const missing = PROFILE_FIELDS.filter((f) => !u?.[f]);
+  const filled = PROFILE_FIELDS.length - missing.length;
+  return {
+    percent: Math.round((filled / PROFILE_FIELDS.length) * 100),
+    filled,
+    total: PROFILE_FIELDS.length,
+    missing,
+    verified: missing.length === 0,
+  };
+}
+
+// Ism: harf, bo'sh joy, apostrof va chiziqcha. Raqam/emoji o'tmaydi —
+// "ismi" o'rniga taxallus yozib qo'yishning ma'nosi yo'q.
+const NAME_RE = /^[\p{L}][\p{L}\s'’\-]{1,59}$/u;
+
+function parseBirthDate(v) {
+  const d = new Date(String(v));
+  if (Number.isNaN(d.getTime())) return null;
+  const age = (Date.now() - d.getTime()) / (365.25 * 86400000);
+  // 8 dan kichik yoshdagi o'yinchi bo'lmaydi, 100 dan katta yosh esa
+  // deyarli har doim xato kiritilgan sana.
+  if (age < 8 || age > 100) return null;
+  return d;
+}
+
 app.get('/api/me', authMiddleware, async (req, res) => {
   try {
     const u = await prisma.user.findUnique({
@@ -958,8 +1050,106 @@ app.get('/api/me', authMiddleware, async (req, res) => {
       shopPrices: ECONOMY.prices,
       dailyBonus: ECONOMY.dailyBonus,
       dailyLimit, roomsToday, roomsLeft: Math.max(0, dailyLimit - roomsToday),
-      stats: u.stats || { gamesPlayed: 0, gamesWon: 0, winRate: 0, rating: RATING_START, xp: 0 }
+      stats: u.stats || { gamesPlayed: 0, gamesWon: 0, winRate: 0, rating: RATING_START, xp: 0 },
+      // profil ma'lumotlari va to'liqlik darajasi
+      profile: {
+        fullName: u.fullName || null,
+        birthDate: u.birthDate ? new Date(u.birthDate).toISOString().slice(0, 10) : null,
+        region: u.region || null,
+        gender: u.gender || null,
+        tgUsername: u.tgUsername || null,
+        tgLinked: !!u.tgId,
+      },
+      completion: profileState(u),
+      verified: profileState(u).verified,
     });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ===== PROFIL MA'LUMOTLARINI SAQLASH =====
+// Faqat kelgan maydonlar yangilanadi (qismli saqlash): foydalanuvchi
+// formani bo'lak-bo'lak to'ldirishi mumkin.
+app.patch('/api/me/profile', authMiddleware, limitByUser(30), async (req, res) => {
+  try {
+    const data = {};
+    const b = req.body || {};
+
+    if (b.fullName !== undefined) {
+      const v = String(b.fullName || '').trim().replace(/\s+/g, ' ');
+      if (!v) data.fullName = null;
+      else if (!NAME_RE.test(v)) return res.status(400).json({ error: 'Ism faqat harflardan iborat bo\'lishi kerak' });
+      else data.fullName = v;
+    }
+    if (b.birthDate !== undefined) {
+      if (!b.birthDate) data.birthDate = null;
+      else {
+        const d = parseBirthDate(b.birthDate);
+        if (!d) return res.status(400).json({ error: 'Tug\'ilgan sana noto\'g\'ri' });
+        data.birthDate = d;
+      }
+    }
+    if (b.region !== undefined) {
+      if (!b.region) data.region = null;
+      else if (!REGIONS.includes(String(b.region))) return res.status(400).json({ error: 'Viloyat noto\'g\'ri' });
+      else data.region = String(b.region);
+    }
+    if (b.gender !== undefined) {
+      if (!b.gender) data.gender = null;
+      else if (!['m', 'f'].includes(String(b.gender))) return res.status(400).json({ error: 'Jins noto\'g\'ri' });
+      else data.gender = String(b.gender);
+    }
+    if (!Object.keys(data).length) return res.status(400).json({ error: 'O\'zgarish yo\'q' });
+
+    const u = await prisma.user.update({ where: { id: req.user.userId }, data });
+    res.json({ ok: true, completion: profileState(u), verified: profileState(u).verified });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ===== TELEGRAM HISOBINI BOG'LASH =====
+// Bir martalik kod: 10 daqiqa amal qiladi va ishlatilgach o'chadi. Kod
+// Telegram deep-link ichida ketadi (`t.me/bot?start=KOD`), ya'ni odam
+// botga bir marta "start" bosadi va hisob bog'lanadi. Parol/kod yozish
+// kerak emas — telefonda eng qulay yo'l.
+//
+// Nega bir martalik: doimiy havola tarqalib ketsa, boshqa odam o'sha
+// havoladan foydalanib O'Z Telegramini begona hisobga bog'lab qo'yardi.
+let TG_BOT_USERNAME = process.env.TG_BOT_USERNAME || '';
+async function tgBotUsername() {
+  if (TG_BOT_USERNAME) return TG_BOT_USERNAME;
+  const r = await tgApi('getMe', {});
+  TG_BOT_USERNAME = r?.result?.username || '';
+  return TG_BOT_USERNAME;
+}
+
+app.post('/api/me/telegram/link', authMiddleware, limitByUser(10), async (req, res) => {
+  try {
+    if (!TG_ADMIN_BOT_TOKEN) return res.status(503).json({ error: 'Telegram bot sozlanmagan' });
+    const u = await prisma.user.findUnique({
+      where: { id: req.user.userId }, select: { tgId: true },
+    });
+    if (u?.tgId) return res.status(409).json({ error: 'Telegram allaqachon bog\'langan' });
+
+    const bot = await tgBotUsername();
+    if (!bot) return res.status(503).json({ error: 'Bot nomi aniqlanmadi' });
+
+    // Kod URL-xavfsiz va taxmin qilib bo'lmaydigan bo'lishi kerak
+    const code = crypto.randomBytes(9).toString('base64url');
+    await redis.set(`tglink:${code}`, req.user.userId, 'EX', 600);
+    res.json({
+      url: `https://t.me/${bot}?start=${code}`,
+      expiresIn: 600,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/me/telegram', authMiddleware, limitByUser(10), async (req, res) => {
+  try {
+    await prisma.user.update({
+      where: { id: req.user.userId },
+      data: { tgId: null, tgUsername: null, tgLinkedAt: null },
+    });
+    const u = await prisma.user.findUnique({ where: { id: req.user.userId } });
+    res.json({ ok: true, completion: profileState(u) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1971,6 +2161,9 @@ function publicPlayers(players, { light = false } = {}) {
       connected: p.connected !== false,
       isHost: p.isHost === true,
       role: p.isAlive ? null : p.role,
+      // Ishonchli belgisi — ma'lumotlari to'liq o'yinchi. O'yin ichida
+      // ko'rinishi muhim: odam kim bilan o'ynayotganini bilib turadi.
+      verified: p.verified === true,
     };
     if (!light) o.avatar = p.avatar || null;
     return o;
@@ -1989,6 +2182,7 @@ function revealPlayers(players) {
     avatar: p.avatar || null,
     isAlive: p.isAlive,
     isHost: p.isHost === true,
+    verified: p.verified === true,
     role: p.role,
     team: sideOf(p.role),
   }));
@@ -3651,15 +3845,21 @@ io.on('connection', (socket) => {
 
       const isHost = g.hostId && g.hostId === userId;
       let avatar = null;
+      let verified = false;
       if (userId && !String(userId).startsWith('guest-')) {
-        const u = await prisma.user.findUnique({ where: { id: userId }, select: { avatar: true } }).catch(() => null);
+        const u = await prisma.user.findUnique({
+          where: { id: userId },
+          select: { avatar: true, fullName: true, birthDate: true, region: true, gender: true, tgId: true },
+        }).catch(() => null);
         avatar = u?.avatar || null;
+        verified = u ? profileState(u).verified : false;
       }
       const player = {
         socketId: socket.id,
         userId: userId || 'guest-' + socket.id.slice(0, 6),
         username: username || 'O\'yinchi-' + socket.id.slice(0, 4),
         avatar,
+        verified,
         role: null, isAlive: true, connected: true, isHost, joinedAt: Date.now()
       };
       g.players.push(player);

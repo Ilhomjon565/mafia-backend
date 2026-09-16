@@ -22,6 +22,21 @@ model User {
   updatedAt   DateTime  @updatedAt
   lastSeen    DateTime?
   refSource   String?   // qayerdan kelgan: tgbot | tggroup | direct | boshqa (ro'yxatdan o'tishda bir marta yoziladi)
+
+  // ===== PROFIL MA'LUMOTLARI =====
+  // Hammasi to'ldirilsa o'yinchi "ishonchli" belgisini oladi (o'yin ichida
+  // ham ko'rinadi). Majburiy emas: o'yin uchun faqat taxallus kerak.
+  // Maqsad — hisob haqiqiy odamga tegishli ekaniga ishonch: soxta hisob
+  // yasab, reytingni buzib yurgan odam bu ma'lumotlarni to'ldirmaydi.
+  fullName    String?
+  birthDate   DateTime?
+  region      String?   // viloyat kaliti (uz-tas, uz-sam ...)
+  gender      String?   // m | f
+  // Telegram hisobi BIR MARTALIK havola orqali bog'lanadi (10 daqiqa amal
+  // qiladi). tgId unikal: bitta Telegram hisobi bitta o'yin hisobiga.
+  tgId        String?   @unique
+  tgUsername  String?
+  tgLinkedAt  DateTime?
   games       GamePlayer[]
   stats       UserStats?
   history     GameHistory[]

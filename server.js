@@ -1162,6 +1162,44 @@ app.get('/api/games', async (_, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ===== SOXTA XONANI OCHISH =====
+// Lobbidagi soxta xonaning ID si haqiqiy emas — unga to'g'ridan-to'g'ri
+// kirmoqchi bo'lgan odam "Xona topilmadi" xatosini ko'rardi. Shuning uchun
+// bosilganda shu yerga so'rov keladi va server AYNI SHU nom bilan haqiqiy
+// bot xonasi yaratib beradi: odam o'zi ko'rgan xonaga kirgan bo'ladi.
+//
+// Bir xonaga bir necha odam bossa — hammasi BITTA haqiqiy xonaga tushadi
+// (moslik Redis'da 20 daqiqa saqlanadi).
+app.post('/api/games/:id/open', authMiddleware, limitByUser(20), async (req, res) => {
+  try {
+    const fid = String(req.params.id || '');
+    // ID haqiqatan shu paytdagi soxta xonalardan birimi? (o'tgan slot ham
+    // hisobga olinadi: odam ro'yxatni bir daqiqa oldin ochgan bo'lishi mumkin)
+    const now = Date.now();
+    const pool = [...fakeRooms(now, FAKE_ONLINE), ...fakeRooms(now - 7 * 60000, FAKE_ONLINE)];
+    const room = pool.find((r) => r.id === fid);
+    if (!room) return res.status(404).json({ error: 'notFound' });
+
+    const mapKey = `fakeroom:${fid}`;
+    const existing = await redis.get(mapKey).catch(() => null);
+    if (existing) {
+      const g = await prisma.game.findUnique({ where: { id: existing } }).catch(() => null);
+      if (g && g.status === 'waiting') return res.json({ id: existing });
+    }
+
+    const settings = await getSettings();
+    const active = await prisma.game.count({ where: { status: { in: ['waiting', 'playing'] } } });
+    if (active >= (settings.maxRooms || 50)) return res.status(503).json({ error: 'tooManyRooms' });
+
+    const id = await startBotGame({ name: room.name, totalPlayers: room.totalPlayers, quick: true });
+    if (!id) return res.status(503).json({ error: 'busy' });
+    await redis.set(mapKey, id, 'EX', 20 * 60).catch(() => {});
+    res.json({ id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // yangi xona yaratish (ko'p xona ruxsat etilgan)
 app.post('/api/games', authMiddleware, limitByUser(30), async (req, res) => {
   try {
@@ -2569,12 +2607,14 @@ const botJoinTimers = new Map();
 // Botlar xonaga BIRDAN emas, bittalab qo'shiladi: 2-9 soniya oralig'ida.
 // Xona egasi "odamlar kelayotganini" ko'radi — bir zumda to'lgan xona
 // darhol soxta ekanini bildirardi.
-function scheduleBotJoins(gameId, bots) {
+function scheduleBotJoins(gameId, bots, fast = false) {
   cancelBotJoins(gameId);
   const timers = [];
   let delay = 0;
   for (const bot of bots) {
-    delay += 2000 + crypto.randomInt(7000);   // 2-9 s
+    // `fast` — odam lobbidan shu xonaga kirib kelmoqda: u ko'rgan xona
+    // deyarli to'la edi, demak botlar ham darhol joyida bo'lishi kerak.
+    delay += fast ? 400 + crypto.randomInt(1200) : 2000 + crypto.randomInt(7000);
     timers.push(setTimeout(() => withLock(gameId, async () => {
       const g = await getG(gameId);
       // O'yin boshlangan, xona o'chirilgan yoki to'lgan bo'lsa — qo'shmaymiz.
@@ -2602,6 +2642,58 @@ function cancelBotJoins(gameId) {
   botJoinTimers.delete(gameId);
 }
 
+// ==================== XONANI TEZ BOSHLASH ====================
+// Botlar bilan to'lgan xonaga ODAM kirdi — uni uzoq kutdirmaymiz, lekin
+// bir zumda ham boshlamaymiz: odam xonani ko'rib, kim borligini o'qib
+// olishi kerak. 10-15 soniya shu uchun.
+const botStartTimers = new Map();
+function armBotStart(gameId, delay) {
+  if (botStartTimers.has(gameId)) return false;   // allaqachon qurollangan
+  botStartTimers.set(gameId, setTimeout(() => {
+    botStartTimers.delete(gameId);
+    withLock(gameId, async () => {
+      const g = await getG(gameId);
+      if (!g || g.status !== 'waiting') return;
+      if ((g.players || []).length < (g.minPlayers || 5)) return;
+      await beginGame(gameId);
+    }).catch(() => {});
+  }, delay));
+  return true;
+}
+function cancelBotStart(gameId) {
+  if (botStartTimers.has(gameId)) { clearTimeout(botStartTimers.get(gameId)); botStartTimers.delete(gameId); }
+}
+
+// Bot nomidan ochiq chat xabari. Xabar oddiy o'yinchi xabari kabi saqlanadi
+// va tarqatiladi — tashqaridan farqi yo'q.
+async function botSay(gameId, bot, text) {
+  const payload = {
+    username: bot.username, message: text, channel: 'public',
+    isAlive: true, timestamp: Date.now(),
+  };
+  try {
+    const ck = `chat:${gameId}`;
+    await redis.rpush(ck, JSON.stringify(payload));
+    await redis.ltrim(ck, -200, -1);
+    await redis.expire(ck, 86400);
+  } catch {}
+  io.to(`game:${gameId}`).emit('chat_message', payload);
+}
+
+// "Boshlaymizmi?" degan xabarlar. Odam shulardan birini yozsa bot javob
+// beradi va o'yin boshlanadi.
+const START_ASK = /(^|\s)(g+o+|boshla\w*|gaz|start\w*|ketdik|davay|qani|tez\w*|tayyor\w*)(\s|$|[!?.,]+)/i;
+// Javoblar HAR SAFAR boshqa bo'ladi: bir xil javob qaytarilsa, javob
+// yozayotgan narsa bot ekani darhol bilinadi. Yozilish uslubi ham ataylab
+// "telefonda shosha-pisha yozilgan" kabi — ideal imlo shubha tug'diradi.
+const START_REPLIES = [
+  'ok boshlaymz', 'boshlavommz', 'gooo', 'bosvomman',
+  'hamma tayyor bosa bosdm', 'ha ketdik', 'boshladik',
+  'hozr bosaman', 'tayyor bo\'sa ketdik', 'bosdim',
+  'yaxshi boshlaymiz', 'ketdik unda', 'mayli bosdm',
+  'ha endi boshlasa bo\'ladi', 'bosaman ha', 'qani ketdik',
+];
+
 // ==================== BOTLARNING O'ZARO O'YINLARI ====================
 // Sayt faol ko'rinishi uchun kuniga 10-15 marta FAQAT BOTLAR o'ynaydigan
 // o'yin o'tkaziladi. Bu soxta xonadan ko'ra ishonchliroq: o'yin haqiqatan
@@ -2616,13 +2708,16 @@ function cancelBotJoins(gameId) {
 const BOT_GAMES_ON = process.env.BOT_GAMES !== '0' && process.env.BOT_FILL !== '0';
 const BOT_GAME_CHECK_MS = 5 * 60 * 1000;   // har 5 daqiqada jadvalni tekshiramiz
 
-async function startBotGame() {
+// `opts.name` / `opts.totalPlayers` — soxta xonani haqiqiyga aylantirganda
+// beriladi: odam lobbida KO'RGAN xona nomi va sig'imi saqlanib qolsin.
+// `opts.quick` — odam allaqachon kirmoqchi, botlar tezroq to'ladi.
+async function startBotGame(opts = {}) {
   const settings = await getSettings();
   // Umumiy xona chegarasi bot o'yinlariga ham amal qiladi
   const active = await prisma.game.count({ where: { status: { in: ['waiting', 'playing'] } } });
   if (active >= (settings.maxRooms || 50)) return null;
 
-  const totalPlayers = 9 + crypto.randomInt(4);          // 9-12 joylik xona
+  const totalPlayers = Math.max(8, Math.min(16, opts.totalPlayers || (9 + crypto.randomInt(4))));
   const mafiaCount = Math.max(1, Math.round(totalPlayers * 0.3));
   // 2-3 joy ODAM uchun bo'sh qoladi: bot o'yini "yopiq tomosha" emas, unga
   // kirib o'ynash mumkin bo'lishi kerak. Odam kirmasa botlar o'zlari o'ynaydi.
@@ -2641,7 +2736,7 @@ async function startBotGame() {
 
   const game = await prisma.game.create({
     data: {
-      name: randomRoomName(host.username, openNames),
+      name: opts.name || randomRoomName(host.username, openNames),
       status: 'waiting', hostId: host.userId, isPrivate: false,
       totalPlayers, maxPlayers: 20, minPlayers: Math.min(5, totalPlayers),
       mafiaCount, sheriffCount: 1, doctorCount: 1,
@@ -2649,20 +2744,33 @@ async function startBotGame() {
     },
   });
 
+  // Tez rejimda botlarning yarmi DARHOL xonada bo'ladi: odam lobbida
+  // "9/12" yozilgan xonani ko'rgan, unga kirganda 1/12 ni ko'rmasligi kerak.
+  // DIQQAT: bots[0] — host, u allaqachon xonada. Shuning uchun kesish 1 dan
+  // boshlanadi, aks holda host ikki marta qo'shilib qolardi.
+  const upfront = opts.quick ? bots.slice(1, 1 + Math.max(1, Math.floor((bots.length - 1) / 2))) : [];
+  for (const b of upfront) b.joinedAt = Date.now();
+
   const state = {
-    ...game, players: [host], phase: 'waiting', roleConfig: null,
+    ...game, players: [host, ...upfront], phase: 'waiting', roleConfig: null,
     dayVotes: {}, nightActions: {}, round: 0, durations: settings.durations,
     log: [], botEvents: [], kicked: {},
+    everPlayers: [host.username, ...upfront.map((b) => b.username)],
     botOnly: true,          // odamsiz o'yin: bo'sh xona tekshiruvidan himoyalangan
   };
   await saveG(game.id, state);
 
-  // Qolgan botlar bittalab kiradi (2-9 s), keyin xona bir muddat OCHIQ turadi —
-  // lobbi ro'yxatini ko'rgan odam kirib ulgursin. Odam kirmasa ham o'yin
-  // baribir boshlanadi.
-  const rest = bots.slice(1);
-  scheduleBotJoins(game.id, rest);
-  const startAfter = rest.length * 9000 + 45000;
+  // Qolgan botlar bittalab kiradi (2-9 s), keyin xona UZOQ OCHIQ turadi —
+  // lobbi ro'yxatini ko'rgan odam kirib ulgursin. Bu asosiy maqsad: lobbida
+  // doim qo'shilib o'ynash mumkin bo'lgan xona turishi kerak. Odam kirmasa
+  // 4-9 daqiqadan keyin botlar o'zlari boshlaydi.
+  const rest = bots.slice(1 + upfront.length);
+  scheduleBotJoins(game.id, rest, !!opts.quick);
+  // Tez rejimda odam kirishi bilan 10-15 soniyalik taymer ishga tushadi,
+  // bu esa faqat zaxira: odam kirmay qolsa ham xona muzlab turmasin.
+  const startAfter = opts.quick
+    ? 90000 + crypto.randomInt(60000)
+    : rest.length * 9000 + 4 * 60000 + crypto.randomInt(5 * 60000);
   setTimeout(() => withLock(game.id, async () => {
     const g = await getG(game.id);
     if (!g || g.status !== 'waiting') return;
@@ -2680,7 +2788,10 @@ async function startBotGame() {
 // zanjiri saytni tirik ko'rsatadi: guruhda ham yangi e'lon paydo bo'ladi.
 // Kunlik chegara bor (BOT_GAMES_MAX) — aks holda zanjir kechasi ham
 // to'xtamasdi. Faol soatlar: 10:00-00:00 (Toshkent).
-const BOT_GAMES_MAX = 26;
+// Kuniga nechta bot o'yini: jadvalda 4-10 ta, zanjir bilan ham shundan
+// oshmasin. Botlar o'yini "sayt tirik" hissi uchun, lobbining asosiy
+// mazmuni uchun emas.
+const BOT_GAMES_MAX = 12;
 function tashkentHour(now = Date.now()) {
   return new Date(now + 5 * 3600 * 1000).getUTCHours();
 }
@@ -2696,8 +2807,8 @@ async function chainNextBotGame() {
     const mark = -Date.now();
     await redis.sadd(dayKey, String(mark)).catch(() => {});
     await redis.expire(dayKey, 3 * 86400).catch(() => {});
-    // 3-9 daqiqa tanaffus: xona tugagan zahoti yangisi chiqsa sun'iy ko'rinadi
-    const delay = (3 + Math.random() * 6) * 60000;
+    // 6-16 daqiqa tanaffus: xona tugagan zahoti yangisi chiqsa sun'iy ko'rinadi
+    const delay = (6 + Math.random() * 10) * 60000;
     setTimeout(() => { startBotGame().catch(() => {}); }, delay);
     console.log(`\u{1F501} yangi bot xonasi ${Math.round(delay / 60000)} daqiqadan keyin`);
   } catch (e) {
@@ -3404,9 +3515,18 @@ io.on('connection', (socket) => {
       io.to(key).emit('player_joined', { username: player.username, total: g.players.length });
       tgRoomTouch(gameId); // guruhdagi e'londa o'yinchilar sonini yangilash
 
-      // 🤖 botlar o'yini — foydalanuvchi kirishi bilan avtomatik boshlanadi
+      // 🤖 "Botlar bilan o'ynash" — foydalanuvchi kirishi bilan boshlanadi
       if (g.vsBots && g.status === 'waiting') {
         setTimeout(() => withLock(gameId, () => beginGame(gameId)), 700);
+      } else if (g.status === 'waiting' && (g.players || []).some(isBot)
+                 && g.players.length >= (g.minPlayers || 5)) {
+        // Oddiy xona botlar bilan to'lgan va ODAM kirdi — 10-15 soniyada
+        // boshlanadi. Uzoq kutish odamni yo'qotadi: u lobbiga qaytib ketadi.
+        if (armBotStart(gameId, 10000 + crypto.randomInt(5000))) {
+          logEvent(g, '\u23F3', "O'yin boshlanmoqda...", 'startingSoon');
+          await saveG(gameId, g);
+          io.to(key).emit('game_state', publicGame(g));
+        }
       }
     } catch (e) {
       console.error('join_game:', e);
@@ -3661,6 +3781,27 @@ io.on('connection', (socket) => {
         } catch {}
         io.to(`game:${gameId}`).emit('chat_message', lw);
         return;
+      }
+    }
+
+    // ===== Kutish xonasida "boshlaymizmi?" =====
+    // Botlar bilan to'lgan xonada odam "goo / boshla / start" deb yozsa,
+    // botlardan biri odam kabi javob beradi va 3 soniyada o'yin boshlanadi.
+    // Javob har safar boshqa bo'ladi — bir xil javob bot ekanini oshkor
+    // qiladi.
+    if (g.status === 'waiting' && !isBot(player) && START_ASK.test(text)) {
+      const bots = (g.players || []).filter(isBot);
+      if (bots.length && (g.players || []).length >= (g.minPlayers || 5) && !g.startAsked) {
+        g.startAsked = true;
+        await saveG(gameId, g);
+        const bot = bots[crypto.randomInt(bots.length)];
+        const reply = START_REPLIES[crypto.randomInt(START_REPLIES.length)];
+        // 1.2-2.8 s — odam yozishga shuncha vaqt ketadi
+        setTimeout(() => {
+          botSay(gameId, bot, reply).catch(() => {});
+          cancelBotStart(gameId);
+          armBotStart(gameId, 3000);
+        }, 1200 + crypto.randomInt(1600));
       }
     }
 

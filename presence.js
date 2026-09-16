@@ -25,12 +25,15 @@ const daysSince = (now) => Math.max(0, Math.floor((now + TZ_MS - EPOCH) / 864000
 // ---------- onlayn ----------
 
 // Har soat uchun taxminiy onlayn (indeks = Toshkent vaqti bo'yicha soat).
-// Diapazon 50-150: tunda eng kam, kechqurun 20:00 da eng gavjum.
+// Kechqurun 20:00 da eng gavjum (~150), 01:00-06:00 da esa 5-10 kishi.
+// Nega tunda shunchalik kam: "yarim kechada 60 kishi onlayn" degan raqamni
+// o'zbek auditoriyasi darhol soxta deb biladi — o'yinchilar kechqurun
+// yig'iladi, tunda esa faqat bir-ikki uyqusiz qoladi.
 export const ONLINE_CURVE = [
-  96, 78, 62, 54, 50, 55,        // 00-05  tun
-  64, 78, 88, 95, 99, 103,       // 06-11  ertalab
-  107, 105, 101, 105, 114, 124,  // 12-17  kunduz
-  136, 147, 150, 143, 128, 110,  // 18-23  kechqurun
+  28, 9, 7, 6, 6, 8,             // 00-05  tun (01-05 → 5-10)
+  10, 24, 40, 56, 72, 84,        // 06-11  ertalab
+  92, 88, 84, 92, 104, 118,      // 12-17  kunduz
+  132, 145, 150, 140, 104, 58,   // 18-23  kechqurun
 ];
 
 export function fakeOnlineBase(now = Date.now(), enabled = true) {
@@ -45,7 +48,11 @@ export function fakeOnlineBase(now = Date.now(), enabled = true) {
   const min = Math.floor(now / 60000);
   const wave = Math.sin(min / 7.3) * 2.8 + Math.sin(min / 2.9) * 1.6 + Math.sin(min / 17) * 1.8;
 
-  return Math.max(28, Math.round(base + wave));
+  // Tebranish BAZAGA nisbatan kichrayadi: tunda baza 6 bo'lganda ±6 tebranish
+  // sonni 0 ga (yoki manfiyga) tushirib, "onlayn 0" ko'rsatib qo'yardi.
+  const amp = Math.min(1, base / 40);
+
+  return Math.max(3, Math.round(base + wave * amp));
 }
 
 // ---------- ro'yxatdan o'tganlar ----------
@@ -58,13 +65,18 @@ export function fakePlayersBase(now = Date.now(), enabled = true) {
 
 // ---------- o'ynalgan o'yinlar ----------
 
-// 30 dan boshlanadi. Kun bo'yi ham sekin o'sadi (o'yinlar tugab turadi),
-// lekin hech qachon kamaymaydi: kun ichidagi o'sish soatga bog'langan.
+// SON HAQIQIY: har tugagan o'yin (botlar o'zaro o'ynagani ham) bazada yozuv
+// qoldiradi va /api/stats shu yozuvlarni sanaydi. Ya'ni raqam kundan kunga
+// o'sadi, lekin o'sish SUN'IY emas — o'ynalgan o'yinlardan kelib chiqadi.
+//
+// Bu yerda faqat QOTIB QOLGAN bazaviy qiymat qoladi: sayt hozirgi serverga
+// ko'chishidan oldingi o'yinlar bazada yo'q. Ilgari bu qiymat kuniga +11
+// o'sib turardi — o'sishning katta qismi sun'iy edi. Qiymat o'sishning
+// OXIRGI nuqtasidan olindi: aks holda ko'rsatkich bir kunda tushib ketardi
+// ("son hech qachon kamaymaydi" qoidasi).
+const GAMES_BASE = 63;
 export function fakeGamesPlayed(now = Date.now(), enabled = true) {
-  if (!enabled) return 0;
-  const d = daysSince(now);
-  const hour = new Date(now + TZ_MS).getUTCHours();
-  return 30 + d * 11 + Math.floor(hour / 2);
+  return enabled ? GAMES_BASE : 0;
 }
 
 // ---------- lobbidagi xonalar ----------
@@ -169,12 +181,19 @@ export function fakeRooms(now = Date.now(), enabled = true) {
     // natijada `ROOM_NAMES[-5]` = undefined bo'lib, xonalar nomsiz qolardi.
     const s = h32(slot * 977 + i * 31);
     const total = [8, 9, 10, 10, 12, 12, 14, 16][s % 8];
-    // 70% jangda, 30% to'lgan va boshlanishini kutmoqda
-    const playing = ((s >>> 3) % 10) < 7;
+    // Xonalarning 45% i OCHIQ: 2-4 joy bo'sh, ya'ni odam kirib o'ynay oladi.
+    // Ilgari hammasi to'la yoki jangda edi va lobbiga qaragan odam "hech
+    // qayerga kira olmayman" degan xulosaga kelardi. Bunday xonaga bosilganda
+    // server HAQIQIY bot xonasi yaratib beradi (/api/games/:id/open).
+    const open = ((s >>> 3) % 100) < 45;
+    // Qolganlarining 70% i jangda, 30% i to'lib boshlanishini kutmoqda
+    const playing = !open && ((s >>> 11) % 10) < 7;
+    const free = open ? 2 + ((s >>> 17) % 3) : 0;
+    const filled = Math.max(3, total - free);
     const mafiaCount = Math.max(1, Math.round(total * 0.3));
     const players = [];
     const shift = s % PLAYER_NAMES.length;
-    for (let k = 0; k < total; k++) {
+    for (let k = 0; k < filled; k++) {
       players.push({
         userId: 'c' + (h32(slot * 7919 + i * 101 + k) >>> 0).toString(16).padStart(8, '0') + i + k,
         username: PLAYER_NAMES[(shift + k * 7) % PLAYER_NAMES.length],
@@ -185,6 +204,8 @@ export function fakeRooms(now = Date.now(), enabled = true) {
       id: 'c' + (h32(slot * 104729 + i) >>> 0).toString(16).padStart(8, '0') + 'x' + i,
       name: pickName(usedNames, (s >>> 7)),
       status: playing ? 'playing' : 'waiting',
+      // Frontend shu belgiga qarab "ochish" so'rovini yuboradi
+      fake: true,
       totalPlayers: total,
       mafiaCount,
       sheriffCount: 1,
@@ -193,7 +214,7 @@ export function fakeRooms(now = Date.now(), enabled = true) {
       hostId: 'fake',
       createdAt: new Date(now - ((s % 25) + 2) * 60000).toISOString(),
       phase: playing ? 'day_discussion' : 'waiting',
-      players,               // to'liq — ya'ni xona TO'LGAN
+      players,               // `open` bo'lsa joy bor, aks holda xona to'lgan
     });
   }
   return out;
@@ -211,7 +232,11 @@ export function fakeRooms(now = Date.now(), enabled = true) {
 // Vaqtlar 10:30-23:45 oralig'ida — odamlar saytda bo'lgan paytda.
 export function botGameSchedule(now = Date.now()) {
   const day = Math.floor((now + TZ_MS) / 86400000);
-  const n = 10 + (hashDay(day) % 6);             // kuniga 10-15 ta
+  // Kuniga 4-10 ta: botlar o'zaro o'yini "sayt tirik" hissi uchun kerak,
+  // lekin u lobbining asosiy mazmuni bo'lib qolmasligi kerak. Odam kirib
+  // o'ynaydigan xonalar bundan tashqari (soxta xonaga bosilganda haqiqiy
+  // xona yaratiladi) va ular hisobga kirmaydi.
+  const n = 4 + (hashDay(day) % 7);             // kuniga 4-10 ta
   const START = 10.5, END = 23.75;
   const step = (END - START) / n;
   const out = [];

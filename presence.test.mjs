@@ -53,7 +53,8 @@ test('qiymat haqiqatga o\'xshash diapazonda', () => {
   for (let h = 0; h < 24; h++) {
     for (const m of [0, 17, 33, 58]) {
       const v = fakeOnlineBase(at(h, m));
-      assert.ok(v >= 35 && v <= 260, `soat ${h}:${m} -> ${v}`);
+      // Tunda 5-10, kechqurun 150 atrofida — pastki chegara tunga mo'ljallangan
+      assert.ok(v >= 4 && v <= 260, `soat ${h}:${m} -> ${v}`);
     }
   }
 });
@@ -61,7 +62,7 @@ test('qiymat haqiqatga o\'xshash diapazonda', () => {
 test('raqam qotib qolmaydi (kun bo\'yi turli qiymatlar)', () => {
   const vals = new Set();
   for (let h = 0; h < 24; h++) for (const m of [0, 20, 40]) vals.add(fakeOnlineBase(at(h, m)));
-  assert.ok(vals.size > 40, 'turli qiymatlar soni: ' + vals.size);
+  assert.ok(vals.size > 30, 'turli qiymatlar soni: ' + vals.size);
 });
 
 test('ONLINE_CURVE 24 soatni qamrab oladi', () => {
@@ -103,14 +104,34 @@ test('soxta xonalarda BARCHA maydonlar bor', () => {
   }
 });
 
-test('soxta xonalarga QO\'SHILIB BO\'LMAYDI (hammasi to\'lgan)', () => {
-  // Soxta xona ID si haqiqiy emas — unga kirmoqchi bo'lgan odam xato ko'rardi.
-  // Frontend to'lgan yoki jangdagi xonaning tugmasini bloklaydi.
-  for (let k = 0; k < 200; k++) {
+test('lobbida OCHIQ (joy bor) xonalar ham bo\'ladi', () => {
+  // Ilgari hamma soxta xona to'la yoki jangda edi: lobbiga qaragan odam
+  // "hech qayerga kira olmayman" degan xulosaga kelardi. Endi ~45% xonada
+  // 2-4 joy bo'sh turadi — bunday xonaga bosilganda server haqiqiy bot
+  // xonasi yaratib beradi (/api/games/:id/open).
+  let open = 0, total = 0;
+  for (let k = 0; k < 60; k++) {
     for (const r of fakeRooms(Date.UTC(2026, 8, 16) + k * 7 * 60000)) {
-      const full = r.players.length >= r.totalPlayers;
-      assert.ok(full || r.status === 'playing',
-        `xona qo'shilishga ochiq qolgan: ${r.name} ${r.players.length}/${r.totalPlayers} ${r.status}`);
+      total++;
+      if (r.status === 'waiting' && r.players.length < r.totalPlayers) open++;
+    }
+  }
+  const share = open / total;
+  assert.ok(share > 0.2 && share < 0.7, 'ochiq xonalar ulushi: ' + share.toFixed(2));
+});
+
+test('soxta xona "fake" belgisi bilan keladi', () => {
+  // Frontend shu belgiga qarab oddiy kirish emas, "ochish" so'rovini yuboradi
+  for (const r of fakeRooms(Date.UTC(2026, 8, 16))) {
+    assert.equal(r.fake, true, 'fake belgisi yo\'q: ' + r.name);
+  }
+});
+
+test('ochiq xonada kamida 3 o\'yinchi bor (bo\'sh xona ishonch bermaydi)', () => {
+  for (let k = 0; k < 60; k++) {
+    for (const r of fakeRooms(Date.UTC(2026, 8, 16) + k * 7 * 60000)) {
+      assert.ok(r.players.length >= 3, 'juda bo\'sh xona: ' + r.players.length);
+      assert.ok(r.players.length <= r.totalPlayers, 'sig\'imdan oshdi');
     }
   }
 });
@@ -131,7 +152,6 @@ test('ikki xil holat ham uchraydi (hammasi bir xil emas)', () => {
 
 test('o\'yinchi ismlari va ID lari to\'g\'ri', () => {
   for (const r of fakeRooms(Date.UTC(2026, 8, 16))) {
-    assert.equal(r.players.length, r.totalPlayers, 'xona to\'lgan bo\'lishi kerak');
     for (const p of r.players) {
       assert.ok(p.username && p.username.length > 1, 'ism: ' + p.username);
       assert.ok(!/bot/i.test(p.username), 'ismda "bot": ' + p.username);
@@ -164,10 +184,10 @@ test('xona nomlari bir vaqtda takrorlanmaydi', () => {
 
 // ---------- botlarning o'zaro o'yinlari ----------
 
-test('kuniga 10-15 ta o\'yin rejalashtiriladi', () => {
+test('kuniga 4-10 ta o\'yin rejalashtiriladi', () => {
   for (let d = 0; d < 60; d++) {
     const slots = botGameSchedule(Date.UTC(2026, 8, 16) + d * 86400000);
-    assert.ok(slots.length >= 10 && slots.length <= 15, "kunlik oyin soni: " + slots.length);
+    assert.ok(slots.length >= 4 && slots.length <= 10, "kunlik oyin soni: " + slots.length);
     for (const h of slots) assert.ok(h >= 10.5 && h <= 23.75, 'vaqt oralig\'i: ' + h);
     // tartiblangan va bir-biriga yopishib qolmagan
     for (let i = 1; i < slots.length; i++) {
@@ -252,5 +272,29 @@ test('taxallussiz ham nom qaytadi', () => {
     const nm = randomRoomName('', []);
     assert.ok(nm.trim().length > 2, 'nom juda qisqa: ' + nm);
     assert.equal(nm, nm.trim(), 'chetida bo\'sh joy bor: [' + nm + ']');
+  }
+});
+
+
+test('tunda (01:00-06:00) onlayn 5-10 atrofida', () => {
+  // "Yarim kechada 60 kishi onlayn" degan raqamni odam darhol soxta deb
+  // biladi: o'yinchilar kechqurun yig'iladi, tunda esa bir-ikki kishi qoladi.
+  for (let h = 1; h <= 5; h++) {
+    for (let mi = 0; mi < 60; mi += 5) {
+      const v = fakeOnlineBase(at(h, mi));
+      assert.ok(v >= 4 && v <= 12, `soat ${h}:${mi} da onlayn ${v} — 5-10 bo'lishi kerak`);
+    }
+  }
+});
+
+test('kechqurun tunga qaraganda ancha gavjum', () => {
+  assert.ok(fakeOnlineBase(at(20)) > fakeOnlineBase(at(3)) * 8, 'kechqurun/tun nisbati kichik');
+});
+
+test('onlayn hech qachon 0 ko\'rsatmaydi', () => {
+  for (let h = 0; h < 24; h++) {
+    for (let mi = 0; mi < 60; mi += 3) {
+      assert.ok(fakeOnlineBase(at(h, mi)) >= 1, `soat ${h}:${mi} da 0 chiqdi`);
+    }
   }
 });

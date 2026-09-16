@@ -1497,7 +1497,13 @@ app.get('/api/games', async (_, res) => {
         sheriffCount: g.sheriffCount, doctorCount: g.doctorCount, civilCount: g.civilCount,
         hostId: g.hostId, createdAt: g.createdAt,
         phase: state?.phase || 'waiting',
-        players: (state?.players || []).map(p => ({ userId: p.userId, username: p.username, isAlive: p.isAlive }))
+        // DIQQAT: `p.userId` EMAS, `p.publicId`. Bot userId'si 'bot-' bilan
+        // boshlanadi va u ochiq ro'yxatda ko'rinsa, xonadagi botlar darhol
+        // bilinib qolardi (butun "botlar odamga o'xshasin" talabi buzilardi).
+        // Haqiqiy o'yinchining ichki ID si ham tashqariga chiqmasligi kerak.
+        players: (state?.players || []).map(p => ({
+          userId: p.publicId || p.userId, username: p.username, isAlive: p.isAlive,
+        }))
       };
     }));
     // Lobbi bo'sh ko'rinmasin: soxta xonalar qo'shiladi. Ularning HAMMASI
@@ -1723,7 +1729,13 @@ app.get('/api/my-games', authMiddleware, async (req, res) => {
         sheriffCount: g.sheriffCount, doctorCount: g.doctorCount, civilCount: g.civilCount,
         hostId: g.hostId, createdAt: g.createdAt,
         phase: state?.phase || 'waiting',
-        players: (state?.players || []).map(p => ({ userId: p.userId, username: p.username, isAlive: p.isAlive }))
+        // DIQQAT: `p.userId` EMAS, `p.publicId`. Bot userId'si 'bot-' bilan
+        // boshlanadi va u ochiq ro'yxatda ko'rinsa, xonadagi botlar darhol
+        // bilinib qolardi (butun "botlar odamga o'xshasin" talabi buzilardi).
+        // Haqiqiy o'yinchining ichki ID si ham tashqariga chiqmasligi kerak.
+        players: (state?.players || []).map(p => ({
+          userId: p.publicId || p.userId, username: p.username, isAlive: p.isAlive,
+        }))
       };
     }));
     res.json(enriched.filter(Boolean));

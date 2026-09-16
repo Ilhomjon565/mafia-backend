@@ -1,7 +1,10 @@
 // presence.js testlari: onlayn ko'rsatkichi tabiiy ko'rinishi kerak.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fakeOnlineBase, fakePlayersBase, fakeGamesPlayed, fakeRooms, ONLINE_CURVE } from './presence.js';
+import {
+  fakeOnlineBase, fakePlayersBase, fakeGamesPlayed, fakeRooms, ONLINE_CURVE,
+  botGameSchedule, dueBotGameSlot,
+} from './presence.js';
 
 // Toshkent vaqti bo'yicha berilgan soat/daqiqaga to'g'ri keladigan UTC ms
 const at = (hour, min = 0) => Date.UTC(2026, 8, 16, hour - 5, min, 0);
@@ -157,4 +160,57 @@ test('xona nomlari bir vaqtda takrorlanmaydi', () => {
     assert.equal(new Set(names).size, names.length,
       'takrorlangan nom: ' + names.join(', '));
   }
+});
+
+// ---------- botlarning o'zaro o'yinlari ----------
+
+test('kuniga 10-15 ta o\'yin rejalashtiriladi', () => {
+  for (let d = 0; d < 60; d++) {
+    const slots = botGameSchedule(Date.UTC(2026, 8, 16) + d * 86400000);
+    assert.ok(slots.length >= 10 && slots.length <= 15, "kunlik oyin soni: " + slots.length);
+    for (const h of slots) assert.ok(h >= 10.5 && h <= 23.75, 'vaqt oralig\'i: ' + h);
+    // tartiblangan va bir-biriga yopishib qolmagan
+    for (let i = 1; i < slots.length; i++) {
+      assert.ok(slots[i] > slots[i - 1], 'vaqtlar tartibda bo\'lishi kerak');
+      assert.ok(slots[i] - slots[i - 1] > 0.3, 'o\'yinlar juda yaqin: ' + (slots[i] - slots[i - 1]));
+    }
+  }
+});
+
+test('jadval bir kun ichida O\'ZGARMAYDI (server restartida ham)', () => {
+  const a = botGameSchedule(Date.UTC(2026, 8, 16, 7)).join();
+  const b = botGameSchedule(Date.UTC(2026, 8, 16, 15)).join();
+  assert.equal(a, b, 'bir kunning jadvali barqaror bo\'lishi kerak');
+  const c = botGameSchedule(Date.UTC(2026, 8, 17, 7)).join();
+  assert.notEqual(a, c, 'boshqa kunda boshqa jadval');
+});
+
+test('vaqti kelgan slot aniqlanadi', () => {
+  const day = Date.UTC(2026, 8, 16);
+  const slots = botGameSchedule(day);
+  // birinchi slotning aynan vaqti (Toshkent) -> UTC
+  const at = (h) => day + Math.round((h - 5) * 3600000);
+  assert.equal(dueBotGameSlot(at(slots[0]) + 60000, []), 0, 'birinchi o\'yin boshlanishi kerak');
+  assert.equal(dueBotGameSlot(at(slots[0]) + 60000, [0]), -1, 'boshlangan o\'yin qayta boshlanmaydi');
+  assert.equal(dueBotGameSlot(at(slots[0]) - 600000, []), -1, 'vaqti kelmagan');
+  assert.equal(dueBotGameSlot(at(slots[0]) + 3600000, []), -1, '40 daqiqalik oyna o\'tib ketdi');
+});
+
+test('ertalab va yarim kechada o\'yin boshlanmaydi', () => {
+  const day = Date.UTC(2026, 8, 16);
+  for (const h of [2, 5, 8, 9.5]) {
+    assert.equal(dueBotGameSlot(day + (h - 5) * 3600000, []), -1, 'soat ' + h + ' da o\'yin bo\'lmasligi kerak');
+  }
+});
+
+test('bir kunda hamma slot navbat bilan boshlanadi', () => {
+  const day = Date.UTC(2026, 8, 16);
+  const slots = botGameSchedule(day);
+  const started = [];
+  for (const [i, h] of slots.entries()) {
+    const due = dueBotGameSlot(day + Math.round((h - 5) * 3600000) + 120000, started);
+    assert.equal(due, i, `${i}-slot boshlanishi kerak`);
+    started.push(due);
+  }
+  assert.equal(started.length, slots.length, 'hamma o\'yin o\'tkazilishi kerak');
 });

@@ -14,7 +14,9 @@ import {
   chooseDayVote, chooseNightTarget, makeFillerBots, BOT_NAMES, botAvatar,
 } from './bot-ai.js';
 // Onlayn ko'rsatkichi egri chizig'i — alohida modulda, testlari presence.test.mjs da
-import { fakeOnlineBase, fakePlayersBase, fakeGamesPlayed, fakeRooms } from './presence.js';
+import {
+  fakeOnlineBase, fakePlayersBase, fakeGamesPlayed, fakeRooms, dueBotGameSlot,
+} from './presence.js';
 // FAKE_ONLINE=0 — soxta qo'shimchani butunlay o'chiradi (faqat haqiqiy onlayn)
 const FAKE_ONLINE = process.env.FAKE_ONLINE !== '0';
 import {
@@ -1713,6 +1715,9 @@ async function deleteIfEmpty(gameId) {
   // faqat hali boshlanmagan (waiting) va HAQIQIY odam yo'q xonalar o'chiriladi.
   // Botlar hisoblanmaydi: aks holda to'ldiruvchi botlar bor xona hech qachon
   // o'chmasdi va lobbi tashlab ketilgan xonalar bilan to'lib ketardi.
+  // Botlarning o'zaro o'yini ATAYLAB odamsiz: uni o'chirib yubormaymiz,
+  // aks holda botlar to'lgunicha xona yopilib ketardi.
+  if (g.botOnly && g.status === 'waiting') return;
   const humansInRoom = (g.players || []).filter(p => !isBot(p)).length;
   if (g.status === 'waiting' && humansInRoom === 0) {
     if (timers.has(gameId)) { clearTimeout(timers.get(gameId)); timers.delete(gameId); }
@@ -2509,6 +2514,89 @@ function cancelBotJoins(gameId) {
   for (const t of botJoinTimers.get(gameId) || []) clearTimeout(t);
   botJoinTimers.delete(gameId);
 }
+
+// ==================== BOTLARNING O'ZARO O'YINLARI ====================
+// Sayt faol ko'rinishi uchun kuniga 10-15 marta FAQAT BOTLAR o'ynaydigan
+// o'yin o'tkaziladi. Bu soxta xonadan ko'ra ishonchliroq: o'yin haqiqatan
+// o'ynaladi (ovoz berish, tungi harakatlar, natija), lobbida jonli "jangda"
+// xonasi turadi, Telegram guruhiga e'lon ketadi va "o'ynalgan o'yinlar"
+// hisobi haqiqatdan o'sadi.
+//
+// Statistika buzilmaydi: `isRealUser()` bot userId'ini rad etadi, ya'ni
+// reyting jadvaliga ham, o'yin tarixiga ham yozuv tushmaydi.
+//
+// O'chirish: BOT_GAMES=0
+const BOT_GAMES_ON = process.env.BOT_GAMES !== '0' && process.env.BOT_FILL !== '0';
+const BOT_GAME_CHECK_MS = 5 * 60 * 1000;   // har 5 daqiqada jadvalni tekshiramiz
+
+async function startBotGame() {
+  const settings = await getSettings();
+  // Umumiy xona chegarasi bot o'yinlariga ham amal qiladi
+  const active = await prisma.game.count({ where: { status: { in: ['waiting', 'playing'] } } });
+  if (active >= (settings.maxRooms || 50)) return null;
+
+  const totalPlayers = 8 + crypto.randomInt(5);          // 8-12 o'yinchi
+  const mafiaCount = Math.max(1, Math.round(totalPlayers * 0.3));
+  const bots = makeFillerBots('seed' + Date.now().toString(36), totalPlayers, []);
+  const host = bots[0];
+  host.isHost = true;
+
+  const game = await prisma.game.create({
+    data: {
+      // Xona nomi o'yinchi yozganday ko'rinadi
+      name: `${host.username} xonasi`,
+      status: 'waiting', hostId: host.userId, isPrivate: false,
+      totalPlayers, maxPlayers: 20, minPlayers: Math.min(5, totalPlayers),
+      mafiaCount, sheriffCount: 1, doctorCount: 1,
+      civilCount: Math.max(0, totalPlayers - mafiaCount - 2),
+    },
+  });
+
+  const state = {
+    ...game, players: [host], phase: 'waiting', roleConfig: null,
+    dayVotes: {}, nightActions: {}, round: 0, durations: settings.durations,
+    log: [], botEvents: [], kicked: {},
+    botOnly: true,          // odamsiz o'yin: bo'sh xona tekshiruvidan himoyalangan
+  };
+  await saveG(game.id, state);
+
+  // Qolgan botlar bittalab kiradi (2-9 s), oxirgisidan keyin o'yin boshlanadi
+  const rest = bots.slice(1);
+  scheduleBotJoins(game.id, rest);
+  // Kutish vaqtining yuqori chegarasi: 9 s * bot soni + zaxira
+  const startAfter = rest.length * 9000 + 6000;
+  setTimeout(() => withLock(game.id, async () => {
+    const g = await getG(game.id);
+    if (!g || g.status !== 'waiting') return;
+    // Odam qo'shilib qolgan bo'lsa ham o'yin boshlanadi — u ham o'ynaydi
+    if ((g.players || []).length >= (g.minPlayers || 5)) await beginGame(game.id);
+  }), startAfter);
+
+  // Telegram guruhiga e'lon — xuddi odam xona ochgandek
+  tgRoomAnnounce(game.id).catch(() => {});
+  console.log(`🎲 bot o'yini: ${game.id} (${totalPlayers} o'yinchi, host ${host.username})`);
+  return game.id;
+}
+
+// Jadval bo'yicha tekshirish. Boshlangan slotlar Redis'da belgilanadi —
+// server qayta ishga tushsa ham o'yin ikki marta boshlanmaydi.
+async function botGameTick() {
+  if (!BOT_GAMES_ON) return;
+  try {
+    const dayKey = 'botgames:' + new Date(Date.now() + 5 * 3600 * 1000).toISOString().slice(0, 10);
+    const done = await redis.smembers(dayKey).catch(() => []);
+    const slot = dueBotGameSlot(Date.now(), done.map(Number));
+    if (slot < 0) return;
+    // Slotni AVVAL band qilamiz: ikkita tekshiruv bir vaqtda kelsa ham
+    // o'yin bitta bo'ladi.
+    const added = await redis.sadd(dayKey, String(slot)).catch(() => 0);
+    if (!added) return;
+    await redis.expire(dayKey, 3 * 86400).catch(() => {});
+    await startBotGame();
+  } catch (e) {
+    console.error('botGameTick:', e.message);
+  }
+}
 function isBot(p) { return p && p.isBot === true; }
 const clamp01 = (v) => (Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0.7);
 function botDelayMs() { return 2000 + Math.floor(Math.random() * 2500); } // 2.0–4.5s
@@ -2879,6 +2967,14 @@ async function pingCycle() {
 
 const pingTimer = setInterval(pingCycle, PING_EVERY);
 pingTimer.unref?.();
+
+// Botlarning o'zaro o'yinlari — jadval bo'yicha (presence.js)
+if (BOT_GAMES_ON) {
+  const botGameTimer = setInterval(() => { botGameTick().catch(() => {}); }, BOT_GAME_CHECK_MS);
+  botGameTimer.unref?.();
+  // Ishga tushgandan 30 s keyin birinchi tekshiruv (Redis ulanishini kutamiz)
+  setTimeout(() => { botGameTick().catch(() => {}); }, 30000);
+}
 
 // Xonaga kirgan odam ping ko'rinishini kutib o'tirmasin — darhol bir sikl.
 function pingSoon() { setTimeout(() => { pingCycle().catch(() => {}); }, 400); }

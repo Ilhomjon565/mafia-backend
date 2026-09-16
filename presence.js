@@ -153,3 +153,53 @@ export function fakeRooms(now = Date.now(), enabled = true) {
   }
   return out;
 }
+
+// ---------- botlarning o'zaro o'yinlari ----------
+
+// Sayt faol ko'rinishi uchun kuniga 10-15 marta FAQAT BOTLAR o'ynaydigan
+// o'yin o'tkaziladi. Bu soxta xonadan ko'ra ishonchliroq: o'yin haqiqatan
+// o'ynaladi, lobbida jonli "jangda" xonasi turadi, natija bazaga tushadi va
+// "o'ynalgan o'yinlar" hisobi o'sadi.
+//
+// Jadval SANAdan hisoblanadi (tasodifiy emas): server qayta ishga tushsa ham
+// o'sha kunning jadvali o'zgarmaydi va o'yin ikki marta boshlanmaydi.
+// Vaqtlar 10:30-23:45 oralig'ida — odamlar saytda bo'lgan paytda.
+export function botGameSchedule(now = Date.now()) {
+  const day = Math.floor((now + TZ_MS) / 86400000);
+  const n = 10 + (hashDay(day) % 6);             // kuniga 10-15 ta
+  const START = 10.5, END = 23.75;
+  const step = (END - START) / n;
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    // Slot ichida tasodifiy nuqta — o'yinlar aniq bir xil vaqtda boshlanmasin.
+    // Jitter step'ning yarmidan oshmaydi: aks holda ketma-ket ikki o'yin
+    // bir vaqtga to'g'ri kelib qolardi.
+    const jitter = (hashDay(day * 131 + i * 17) % 1000) / 1000 * step * 0.5;
+    out.push(+(START + i * step + jitter).toFixed(3));
+  }
+  return out;
+}
+
+function hashDay(n) {
+  let x = (n | 0) ^ 0x6d2b79f5;
+  x = Math.imul(x ^ (x >>> 15), 1 | x);
+  x ^= x + Math.imul(x ^ (x >>> 7), 61 | x);
+  return ((x ^ (x >>> 14)) >>> 0);
+}
+
+// Hozir boshlanishi kerak bo'lgan slot indeksini qaytaradi (yoki -1).
+// `startedSlots` — bugun allaqachon boshlangan slotlar (Redis'dan).
+//
+// 40 daqiqalik "oyna": server o'chib qolgan bo'lsa ham o'yin o'tkazib
+// yuborilmaydi, lekin kechqurun boshlangan o'yin ertalab qayta boshlanmaydi.
+export function dueBotGameSlot(now = Date.now(), startedSlots = []) {
+  const t = new Date(now + TZ_MS);
+  const hourNow = t.getUTCHours() + t.getUTCMinutes() / 60;
+  const slots = botGameSchedule(now);
+  for (let i = 0; i < slots.length; i++) {
+    if (startedSlots.includes(i)) continue;
+    const diff = hourNow - slots[i];
+    if (diff >= 0 && diff <= 0.667) return i;    // 0-40 daqiqa ichida
+  }
+  return -1;
+}

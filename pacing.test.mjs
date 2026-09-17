@@ -5,6 +5,7 @@ import {
   GAME_SOFT_MS, GAME_HARD_MS, MIN_SCALE, PHASE_MIN,
   gameElapsed, timeScale, phaseDuration, isTimeUp,
 } from './pacing.js';
+import { makePersona, voteDelayMs } from './bot-ai.js';
 
 const MIN = 60000;
 // Sozlamalardagi bazaviy qiymatlar (DEFAULT_SETTINGS.durations bilan bir xil)
@@ -99,4 +100,23 @@ test('haqiqiy o\'yin: raundlar yig\'indisi 30 daqiqadan oshmaydi', () => {
   const mins = t / MIN;
   assert.ok(mins <= 30, `o'yin ${mins.toFixed(1)} daqiqa davom etdi`);
   assert.ok(rounds >= 6, `faqat ${rounds} raund sig'di — o'yin juda qisqa`);
+});
+
+
+test('bot ovozi QISQARGAN fazaga ham sig\'adi', () => {
+  // Nuqson tarixi: scheduleBotDay kechikishni SOZLAMADAGI 120 soniyadan
+  // hisoblardi. O'yin cho'zilib faza 60 soniyaga tushganda kechikish
+  // fazadan tashqariga chiqib ketardi va bot umuman ovoz bermay qolardi —
+  // ya'ni o'yinning eng muhim, oxirgi raundlarida botlar jim turardi.
+  // Shart: kechikish HAR DOIM fazaning haqiqiy davomiyligi ichida bo'lishi
+  // kerak (kamida 2 soniya zaxira bilan).
+  for (const min of [0, 10, 14, 18, 22, 26, 35]) {
+    const sec = phaseDuration(120, 'day_discussion', min * 60000);
+    for (let i = 0; i < 60; i++) {
+      const d = voteDelayMs(makePersona('bot' + i), sec * 1000, Math.random);
+      assert.ok(d <= sec * 1000 - 2000,
+        `${min}-daqiqa: faza ${sec}s, kechikish ${d}ms — faza tashqarisida`);
+      assert.ok(d >= 1000, 'juda tez: ' + d);
+    }
+  }
 });

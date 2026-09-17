@@ -3529,10 +3529,21 @@ async function botDayVoteOne(gameId, botSid) {
 // fazaning boshida, sekin bot oxiriga yaqin ovoz beradi — ilgari hammasi
 // 2-4.5 soniyada birdan ovoz berib, bot ekanini oshkor qilardi.
 function scheduleBotDay(gameId, g) {
-  const dur = (g.durations?.day_discussion || 60) * 1000;
+  // DIQQAT: fazaning HAQIQIY davomiyligi olinadi — `g.durations` dagi
+  // bazaviy qiymat EMAS.
+  //
+  // Nega muhim: o'yin 13 daqiqadan oshgach fazalar qisqara boradi
+  // (pacing.js). Bazaviy 120 soniyaga mo'ljallangan kechikish esa faza
+  // 60 soniyaga tushganda uning TASHQARISIGA chiqib ketardi va
+  // `botDayVoteOne` "faza o'zgargan" deb ovozni tashlab yuborardi.
+  // Natijada o'yinning eng muhim — oxirgi raundlarida botlarning katta
+  // qismi umuman ovoz bermay qolardi.
+  const phaseMs = dur(g, 'day_discussion') * 1000;
   for (const bot of g.players.filter(p => p.isAlive && isBot(p))) {
     if (!bot.persona) bot.persona = makePersona(bot.userId || bot.socketId);
-    const delay = voteDelayMs(bot.persona, dur);
+    // Zaxira chegara: kechikish har qanday holatda faza tugashidan
+    // kamida 2 soniya oldin bo'lsin.
+    const delay = Math.max(1200, Math.min(voteDelayMs(bot.persona, phaseMs), phaseMs - 2000));
     setTimeout(() => withLock(gameId, () => botDayVoteOne(gameId, bot.socketId)), delay);
   }
 }

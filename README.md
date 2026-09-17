@@ -64,13 +64,30 @@ node --check server.js
 
 ## Yangilash
 
+Serverda bitta skript hammasini qiladi (git pull → npm ci → prisma db push →
+pm2 restart):
+
+```bash
+/srv/mafia/deploy.sh backend      # yoki: frontend | all
+```
+
+Qoʻlda qilinganda:
+
 ```bash
 git pull
 npm ci
-npx prisma migrate deploy
-npm test                    # qoidalar buzilmaganini tekshirish
+npx prisma db push          # DIQQAT: `migrate deploy` EMAS
+npm test                    # deploy darvozasi — 242 ta test
 pm2 restart mafia-backend
 ```
+
+> **Nega `db push`:** repodagi migratsiyalar `schema.prisma` dan orqada
+> (drift bor), shuning uchun `migrate deploy` yiqiladi. Drift tuzatilsa
+> `migrate deploy` ga qaytish mumkin.
+
+> **Nega `npm test` majburiy:** oʻyin qoidalari, bot xulqi, chat filtri va
+> soxta xonalarning “bot ekani koʻrinmasin” shartlari aynan shu testlar bilan
+> qulflangan. Ular yiqilsa deploy qilinmaydi.
 
 ## Redis kalitlari
 
@@ -78,6 +95,9 @@ pm2 restart mafia-backend
 |---|---|
 | `game:<id>` | Oʻyin holati (TTL 24 soat) |
 | `chat:<id>` | Chat tarixi — qayta ulanishda tiklanadi (oxirgi 200 ta) |
+| `rooms:created:<userId>:<kun>` | Kunlik xona hisobi (xona oʻchirilsa ham kamaymaydi, TTL 36 soat) |
+| `reports` | Oʻyinchilarning shikoyatlari (oxirgi 500 ta) |
+| `admin:audit` | Admin choralari jurnali: ban, admin berish, hisob oʻchirish (oxirgi 1000 ta) |
 | `banned:users` | Bloklangan hisoblar keshi |
 | `presence:auth` / `presence:anon` | Onlayn qurilmalar |
 | `settings:global` | Admin sozlamalari |

@@ -6,6 +6,7 @@ import {
   makePersona, voteDelayMs, fakePing, buildSuspicion,
   buildVoteWeight, chooseDayVote, chooseNightTarget, weightedPick,
   makeFillerBots, BOT_NAMES,
+  nightDelayMs, botChatLine, chooseChatAct, typingMs,
 } from './bot-ai.js';
 
 const P = (sid, role) => ({ socketId: sid, username: sid, role });
@@ -315,7 +316,15 @@ test('botlar soni aniq, ismlar takrorlanmaydi', () => {
 test('bot ekanini oshkor qiladigan belgi YO\'Q', () => {
   const bots = makeFillerBots('g1', 12, []);
   for (const b of bots) {
-    assert.ok(!/bot/i.test(b.username), 'ismda "bot" bor: ' + b.username);
+    // DIQQAT: oddiy /bot/i QOIDA EMAS — ro'yxatda 'Botir' bor va u haqiqiy
+    // o'zbek ismi. U bot ekanini oshkor qilmaydi, lekin test har safar
+    // tasodifan tanlanganda yiqilardi (deploy darvozasi shu testda).
+    // Shuning uchun faqat HAQIQIY belgilar tekshiriladi: yakka 'bot' so'zi,
+    // raqam bilan birga ('bot7') yoki ajratgich bilan ('bot_1', 'mafia-bot').
+    assert.ok(!/(^|[^a-z])bot([^a-z]|$)/i.test(b.username),
+      'ismda yakka "bot" so\'zi bor: ' + b.username);
+    assert.ok(!/bot\s*[-_]?\s*\d/i.test(b.username),
+      'ismda "bot+raqam" bor: ' + b.username);
     assert.ok(!b.username.includes('🤖'), 'ismda robot emojisi bor');
     assert.ok(!/^bot-/.test(b.socketId), 'socketId bot ekanini ko\'rsatadi: ' + b.socketId);
     assert.ok(!/bot/i.test(b.publicId), 'publicId bot ekanini ko\'rsatadi: ' + b.publicId);
@@ -359,4 +368,172 @@ test('ismlar tugasa ham ishlaydi (zaxira nom)', () => {
 
 test('nol bot so\'ralsa bo\'sh ro\'yxat', () => {
   assert.deepEqual(makeFillerBots('g1', 0, []), []);
+});
+
+
+// ==================== TUNGI KECHIKISH ====================
+// Ilgari BARCHA botlar, rollar va tunlar uchun bitta tor oyna (2.0-4.5s)
+// ishlatilardi: 20-25 soniyalik bosqich har safar hisoblagichning 10-22% ida
+// yopilardi va progress-bar aynan bir joyda o'lardi.
+
+test('tungi kechikish bosqich ichida qoladi', () => {
+  for (const speed of [0.15, 0.5, 1]) {
+    for (const stepMs of [8000, 20000, 25000]) {
+      for (let i = 0; i < 200; i++) {
+        const d = nightDelayMs({ speed }, stepMs);
+        assert.ok(d >= 1500, 'juda tez: ' + d);
+        assert.ok(d < stepMs, 'bosqichdan chiqib ketdi: ' + d + ' >= ' + stepMs);
+      }
+    }
+  }
+});
+
+test('tez bot sekin botdan oldin harakat qiladi', () => {
+  const avg = (speed) => {
+    let sum = 0;
+    for (let i = 0; i < 400; i++) sum += nightDelayMs({ speed }, 25000);
+    return sum / 400;
+  };
+  assert.ok(avg(1) < avg(0.15) - 3000, 'xarakter kechikishga ta\'sir qilmadi');
+});
+
+test('kechikish QOTIB qolmaydi — 2.0-4.5s oynasi qaytmasin', () => {
+  // Eski xulqning regressiyaga qaytmasligi uchun: 25 soniyalik bosqichda
+  // sekin bot 4.5 soniyadan ancha kech harakat qilishi kerak.
+  const vals = new Set();
+  for (let i = 0; i < 200; i++) vals.add(nightDelayMs({ speed: 0.2 }, 25000));
+  const min = Math.min(...vals);
+  assert.ok(min > 5000, 'sekin bot hali ham 2-4.5s oynasida: ' + min);
+});
+
+// ==================== BOTLARNING GAPI ====================
+
+test('ibora nom bilan to\'ldiriladi va joy belgisi qolmaydi', () => {
+  for (let i = 0; i < 300; i++) {
+    const l = botChatLine('accuse', { n: 'Aziz' });
+    assert.ok(l && l.text, 'ibora qaytmadi');
+    assert.ok(!l.text.includes('{n}'), 'joy belgisi qoldi: ' + l.text);
+    assert.ok(l.text.includes('Aziz'), 'nom qo\'yilmadi: ' + l.text);
+  }
+});
+
+test('nom yo\'q bo\'lsa nom talab qiladigan ibora ishlatilmaydi', () => {
+  for (let i = 0; i < 300; i++) {
+    const l = botChatLine('agree', {});
+    // `agree` ning HAMMA iborasi nom talab qiladi — demak null qaytishi kerak
+    assert.equal(l, null, 'nomsiz ibora chiqdi: ' + (l && l.text));
+  }
+});
+
+test('takror gap qaytmaydi — bot ekanini oshkor qiladi', () => {
+  const said = [];
+  for (let i = 0; i < 8; i++) {
+    const l = botChatLine('open', {}, said);
+    assert.ok(l, 'ibora tugab qoldi');
+    assert.ok(!said.includes(l.key), 'takror ibora: ' + l.key);
+    said.push(l.key);
+  }
+});
+
+test('iboralar imlo jihatdan "telefonda yozilgan" — bosh harf yo\'q', () => {
+  // Ideal imlo o'zi shubha tug'diradi: gap kichik harfda va nuqtasiz bo'lsin.
+  for (const kind of ['open', 'accuse', 'agree', 'defend', 'skip', 'lastWord']) {
+    for (let i = 0; i < 60; i++) {
+      const l = botChatLine(kind, { n: 'Aziz' });
+      if (!l) continue;
+      const first = l.key[0];
+      assert.equal(first, first.toLowerCase(), 'bosh harf bilan: ' + l.key);
+      assert.ok(!/[.!?]$/.test(l.key), 'tinish belgisi bilan tugadi: ' + l.key);
+    }
+  }
+});
+
+test('mafiya bot sherigini AYBLAMAYDI', () => {
+  const ctx = {
+    me: { socketId: 'a', role: 'mafia' },
+    alive: [{ socketId: 'a' }, { socketId: 'b' }, { socketId: 'c' }, { socketId: 'd' }],
+    mates: ['a', 'b'],
+    iAmMafia: true,
+    suspicion: { b: 9 },            // sherigi eng shubhali ko'rinadi
+    votes: {}, round: 3, memory: {},
+    persona: { speed: 0.5, activity: 1, bandwagon: 0.2, noise: 0, ping: 50 },
+  };
+  for (let i = 0; i < 400; i++) {
+    const act = chooseChatAct(ctx, Math.random);
+    if (act && act.targetSid) assert.notEqual(act.targetSid, 'b', 'sherigini ayblab qo\'ydi');
+  }
+});
+
+test('komissar bot topgan mafiyasini e\'lon qiladi', () => {
+  const ctx = {
+    me: { socketId: 'a', role: 'komissar' },
+    alive: [{ socketId: 'a' }, { socketId: 'b' }, { socketId: 'c' }],
+    mates: [], iAmMafia: false,
+    suspicion: {}, votes: {}, round: 2,
+    memory: { checked: { b: 'mafia' } },
+    persona: { speed: 0.5, activity: 1, bandwagon: 0.2, noise: 0, ping: 50 },
+  };
+  const act = chooseChatAct(ctx, Math.random);
+  assert.equal(act.kind, 'claim');
+  assert.equal(act.targetSid, 'b');
+  // Bir marta e'lon qilingandan keyin takrorlamaydi
+  const ctx2 = { ...ctx, memory: { checked: { b: 'mafia' }, claimedSids: ['b'] } };
+  const act2 = chooseChatAct(ctx2, Math.random);
+  assert.notEqual(act2 && act2.kind, 'claim', 'bir xil da\'voni takrorladi');
+});
+
+test('o\'ziga ovoz kelsa bot himoyalanadi', () => {
+  const ctx = {
+    me: { socketId: 'a', role: 'civil' },
+    alive: [{ socketId: 'a' }, { socketId: 'b' }, { socketId: 'c' }],
+    mates: [], suspicion: {}, round: 3, memory: {},
+    votes: { b: 'a', c: 'a' },       // ikkovi menga ovoz bergan
+    persona: { speed: 0.5, activity: 1, bandwagon: 0.2, noise: 0, ping: 50 },
+  };
+  let defended = 0;
+  for (let i = 0; i < 400; i++) if (chooseChatAct(ctx, Math.random)?.kind === 'defend') defended++;
+  assert.ok(defended > 200, 'o\'zini himoya qilmadi: ' + defended + '/400');
+});
+
+test('yozish vaqti gap uzunligiga bog\'liq va cheklangan', () => {
+  const short = typingMs('ok', () => 0.5);
+  const long = typingMs('hamma tayyor bosa bosdm menimcha boshlaymiz', () => 0.5);
+  assert.ok(long > short, 'uzun gap tezroq yozildi');
+  assert.ok(short >= 900, 'juda tez: ' + short);
+  assert.ok(typingMs('x'.repeat(300)) <= 12000, 'juda sekin');
+});
+
+// ==================== ADVOKAT ====================
+// Ilgari advokat don/mafia bilan bir guruhda edi va `notMates` dan tanlardi,
+// ya'ni HAR DOIM mafiya BO'LMAGAN odamni "himoya" qilib, Komissardan
+// yashirish qobiliyatini butunlay behuda sarflardi.
+
+test('advokat sherigini (yoki o\'zini) himoya qiladi', () => {
+  const ctx = {
+    role: 'advokat',
+    me: { socketId: 'a', role: 'advokat' },
+    alive: [{ socketId: 'a' }, { socketId: 'b' }, { socketId: 'c' }, { socketId: 'd' }],
+    mates: ['a', 'b'],
+    suspicion: { b: 3, c: 9 },
+    memory: {},
+    persona: { speed: 0.5, activity: 1, bandwagon: 0.2, noise: 0, ping: 50 },
+  };
+  for (let i = 0; i < 300; i++) {
+    const t = chooseNightTarget(ctx, Math.random);
+    assert.ok(['a', 'b'].includes(t), 'mafiya bo\'lmagan odamni himoya qildi: ' + t);
+  }
+});
+
+test('doktor bot o\'zini davolash huquqini ikki marta ishlatmaydi', () => {
+  const ctx = {
+    role: 'doctor',
+    me: { socketId: 'a', role: 'doctor' },
+    alive: [{ socketId: 'a' }, { socketId: 'b' }, { socketId: 'c' }],
+    mates: [], suspicion: {}, killedTargets: [],
+    memory: { selfHeal: true },     // huquq allaqachon sarflangan
+    persona: { speed: 0.5, activity: 1, bandwagon: 0.2, noise: 0, ping: 50 },
+  };
+  for (let i = 0; i < 300; i++) {
+    assert.notEqual(chooseNightTarget(ctx, Math.random), 'a', 'o\'zini qayta davoladi');
+  }
 });

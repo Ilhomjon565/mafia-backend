@@ -89,11 +89,32 @@ const ROOM_NAMES = [
   'Sokin xona', 'Tezkor', 'Katta o\'yin', 'Mafia UZ', 'Kim kim?',
   'Shahar uxlaydi', 'Tunda ov', 'Oltin xona',
 ];
+// Lobbidagi soxta xonalarda ko'rinadigan taxalluslar.
+//
+// Ro'yxatda ATIGI 26 ta nom bor edi, lobbida esa bir vaqtda 40-80 "o'yinchi"
+// ko'rinadi — ya'ni bir xil taxallus bir necha xonada BIR VAQTDA turardi.
+// Jonli saytda bunday bo'lmaydi va buni payqash oson. Ro'yxat kengaytirildi.
+//
+// Uslub ATAYLAB aralash: toza ismlar, kichik harfli va raqamli shakllar —
+// haqiqiy o'yinchilar taxallusi ham shunday bo'ladi.
 const PLAYER_NAMES = [
   'Sardor', 'Aziza', 'Bekzod', 'Malika', 'Jasur', 'Nilufar', 'Otabek',
   'Zuhra', 'Kamola', 'Temur', 'Doston', 'Elyor', 'Javohir', 'Mirzo',
   'aziz_99', 'bobur7', 'jasurbek', 'temurxon', 'malika_x', 'nodirbek',
   'Sanjar', 'Ulugbek', 'Xurshid', 'Feruza', 'Sevara', 'sherzod',
+  'Akmal', 'Alisher', 'Anvar', 'Asror', 'Behruz', 'Bunyod', 'Diyor',
+  'Dilnoza', 'Farrux', 'Firdavs', 'Gulnora', 'Hasan', 'Husan', 'Ibrohim',
+  'Islom', 'Jahongir', 'Kamron', 'Laziz', 'Madina', 'Mansur', 'Muhammad',
+  'Murod', 'Nafisa', 'Nurbek', 'Oybek', 'Ozoda', 'Rustam', 'Sabina',
+  'Saida', 'Salim', 'Shahzod', 'Shohruh', 'Sirojiddin', 'Sitora',
+  'Umid', 'Umida', 'Vali', 'Yusuf', 'Zafar', 'Zarina', 'Zokir',
+  'akmal_7', 'alisher01', 'anvarbek', 'behruz_x', 'diyorbek', 'farruh24',
+  'gulya', 'hasanboy', 'ibrohim_9', 'islombek', 'jahon_1', 'kamronn',
+  'laziz_uz', 'mansur07', 'murodjon', 'nurbek11', 'oybek_2', 'rustamm',
+  'shahzod_5', 'shohruhx', 'umid_88', 'yusufbek', 'zafar_3', 'zokirjon',
+  'malikaa', 'sitoraa', 'zarina_7', 'sevinch', 'dilshod', 'qahramon',
+  'ravshan', 'sobir', 'tohir', 'uktam', 'valijon', 'xayrulla', 'yigitali',
+  'baxtiyor', 'iskandar', 'jamshid', 'komil', 'lochin', 'mahmud', 'normurod',
 ];
 
 // Deterministik hash — bir xil kirish har doim bir xil natija beradi.
@@ -191,6 +212,24 @@ export function randomRoomName(host = '', used = []) {
 //
 // Xona ID si butun umri davomida O'ZGARMAYDI — bu muhim: odam xonani
 // ko'rib, bosganda aynan o'sha xona ochiladi (/api/games/:id/open).
+// Haqiqiy ID lar Prisma cuid'i: 'c' + 24 belgi (jami 25). Soxta xonaning
+// ID si ilgari 'c' + 8 hex + 'x' + raqam (12-14 belgi) edi — ya'ni UZUNLIGI
+// bo'yicha darhol ajralib turardi. Endi shakli ham, uzunligi ham bir xil.
+function cuidLike(seed) {
+  // DIQQAT: h32 kirishni `n | 0` bilan 32 bitga qirqadi va katta seed
+  // (b * 2654435761 ~ 2.6e16) 2^53 dan oshib, qo'shilgan kichik `i` float
+  // aniqligida butunlay yo'qolardi — natijada bitta blok qayta-qayta
+  // takrorlanardi ("c19x33ay19x33ay..."). Shuning uchun hash ZANJIR bilan
+  // yuritiladi: har blok oldingisidan hosil bo'ladi.
+  let out = 'c';
+  let x = h32(seed);
+  while (out.length < 25) {
+    x = h32(x ^ 0x27d4eb2d);
+    out += x.toString(36).padStart(7, '0').slice(0, 7);
+  }
+  return out.slice(0, 25);
+}
+
 const BIRTH_MS = 3 * 60000;        // har 3 daqiqada bitta tug'ilish imkoni
 const LOOKBACK = 12;               // eng uzun umr / BIRTH_MS + zaxira
 
@@ -198,6 +237,10 @@ export function fakeRooms(now = Date.now(), enabled = true) {
   if (!enabled) return [];
   const out = [];
   const usedNames = new Set();
+  // O'yinchi taxalluslari ham xonalar ORASIDA takrorlanmasin. Ilgari har xona
+  // o'z siljishi bilan bitta ro'yxatdan olardi va bitta taxallus lobbining
+  // bir necha xonasida BIR VAQTDA ko'rinardi — jonli saytda bunday bo'lmaydi.
+  const usedPlayers = new Set();
   const current = Math.floor(now / BIRTH_MS);
 
   // Eng yangi xona birinchi bo'lib chiqadi (lobbida tepada turadi)
@@ -261,27 +304,44 @@ export function fakeRooms(now = Date.now(), enabled = true) {
     const players = [];
     const shift = s % PLAYER_NAMES.length;
     for (let j = 0; j < filled; j++) {
+      // Band bo'lmagan birinchi taxallusni olamiz (ro'yxat bo'ylab siljib)
+      let name = null;
+      for (let k = 0; k < PLAYER_NAMES.length; k++) {
+        const cand = PLAYER_NAMES[(shift + j * 7 + k) % PLAYER_NAMES.length];
+        if (!usedPlayers.has(cand)) { name = cand; break; }
+      }
+      if (!name) name = PLAYER_NAMES[(shift + j * 7) % PLAYER_NAMES.length];
+      usedPlayers.add(name);
       players.push({
-        userId: 'c' + (h32(b * 7919 + j * 101) >>> 0).toString(16).padStart(8, '0') + j,
-        username: PLAYER_NAMES[(shift + j * 7) % PLAYER_NAMES.length],
+        userId: cuidLike(b * 7919 + j * 101),
+        username: name,
         isAlive: true,
       });
     }
 
     out.push({
-      // ID umr bo'yi o'zgarmaydi: tug'ilish indeksidan yasaladi
-      id: 'c' + (h32(b * 104729) >>> 0).toString(16).padStart(8, '0') + 'x' + (b % 97),
+      // ID umr bo'yi o'zgarmaydi: tug'ilish indeksidan yasaladi.
+      // Shakli cuid bilan bir xil — ilgari uzunligidan ajralib turardi.
+      id: cuidLike(b * 104729),
       name: pickName(usedNames, (s >>> 7)),
       status: playing ? 'playing' : 'waiting',
-      // Frontend shu belgiga qarab "ochish" so'rovini yuboradi
-      fake: true,
+      // DIQQAT: `fake: true` maydoni OLIB TASHLANDI. U javobda ochiq turardi va
+      // /api/games ni bir marta ochgan odam qaysi xona soxta ekanini bir
+      // qarashda ko'rardi — butun "lobbi jonli ko'rinsin" g'oyasi shu bitta
+      // maydonda qulardi. Frontend endi bu belgiga tayanmaydi: har qanday
+      // xonaga bosilganda /api/games/:id/open chaqiriladi va server o'zi hal
+      // qiladi (haqiqiy xona bo'lsa o'sha ID qaytadi).
       totalPlayers: total,
       mafiaCount,
       sheriffCount: 1,
       doctorCount: 1,
       civilCount: Math.max(0, total - mafiaCount - 2),
-      hostId: 'fake',
-      createdAt: new Date(b * BIRTH_MS).toISOString(),
+      // 'fake' satri o'rniga cuid — hostId /api/games javobida ochiq ketadi
+      hostId: cuidLike(b * 15485863),
+      // Ilgari aniq `b * BIRTH_MS` edi: HAR BIR soxta xonaning yaratilish vaqti
+      // aniq 3 daqiqalik panjaraga tushardi (soniyasi ham bir xil). Endi har
+      // xonaga barqaror 0-179 soniyalik siljish qo'shiladi.
+      createdAt: new Date(b * BIRTH_MS + (h32(b * 7757) % 180) * 1000).toISOString(),
       phase: playing ? 'day_discussion' : 'waiting',
       players,
       events,                // "kim kirdi / kim chiqdi" (jangda bo'sh)

@@ -124,10 +124,35 @@ test('lobbida OCHIQ (joy bor) xonalar ham bo\'ladi', () => {
   assert.ok(share > 0.2 && share < 0.7, 'ochiq xonalar ulushi: ' + share.toFixed(2));
 });
 
-test('soxta xona "fake" belgisi bilan keladi', () => {
-  // Frontend shu belgiga qarab oddiy kirish emas, "ochish" so'rovini yuboradi
-  for (const r of fakeRooms(Date.UTC(2026, 8, 16))) {
-    assert.equal(r.fake, true, 'fake belgisi yo\'q: ' + r.name);
+test('soxta xonada BOT EKANINI oshkor qiladigan belgi YO\'Q', () => {
+  // Ilgari javobda `fake: true` va `hostId: 'fake'` ochiq turardi, ID esa
+  // cuid'dan qisqa edi — /api/games ni bir marta ochgan odam qaysi xona
+  // soxta ekanini bir qarashda ajratardi.
+  // Kechqurun — lobbida bir nechta xona bo'ladi (soniya siljishi ko'rinsin)
+  const rooms = fakeRooms(Date.UTC(2026, 8, 16, 14));
+  assert.ok(rooms.length > 1, 'xona chiqmadi: ' + rooms.length);
+  const seenSec = new Set();
+  for (const r of rooms) {
+    assert.equal(r.fake, undefined, '"fake" maydoni qoldi');
+    assert.notEqual(r.hostId, 'fake', 'hostId "fake" bo\'lib qoldi');
+    assert.equal(r.id.length, 25, 'ID cuid uzunligida emas: ' + r.id);
+    assert.ok(/^c[a-z0-9]{24}$/.test(r.id), 'ID cuid shaklida emas: ' + r.id);
+    assert.ok(/^c[a-z0-9]{24}$/.test(r.hostId), 'hostId cuid shaklida emas: ' + r.hostId);
+    for (const p of r.players) assert.ok(/^c[a-z0-9]{24}$/.test(p.userId), 'o\'yinchi ID si cuid emas: ' + p.userId);
+    seenSec.add(new Date(r.createdAt).getUTCSeconds());
+  }
+  assert.ok(seenSec.size > 1, 'hamma xona aynan bir xil soniyada yaratilgan — panjara ko\'rinib turadi');
+});
+
+test('bir taxallus lobbining ikki xonasida BIR VAQTDA turmaydi', () => {
+  for (const t of [Date.UTC(2026, 8, 16, 19), Date.UTC(2026, 8, 17, 12), Date.UTC(2026, 8, 18, 3)]) {
+    const seen = new Set();
+    for (const r of fakeRooms(t)) {
+      for (const p of r.players) {
+        assert.ok(!seen.has(p.username), 'takroriy taxallus: ' + p.username);
+        seen.add(p.username);
+      }
+    }
   }
 });
 

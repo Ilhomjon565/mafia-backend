@@ -66,6 +66,36 @@ export function hasAngle(input) {
 // Obyekt/massiv ichidagi HAMMA satrni tozalaydi (joyida, rekursiv).
 // Chuqurlik cheklangan: hujumchi 10 000 qatlamli JSON yuborib stekni
 // to'ldirib qo'ymasligi kerak.
+// ==================== CHAT TARKIBI ====================
+// Ochiq chatda eng ko'p uchraydigan suiiste'mol — reklama, tashqi havola,
+// telegram kanaliga chaqiriq va telefon raqami. Ilgari xabar matniga HECH
+// QANDAY tarkib tekshiruvi yo'q edi (faqat uzunlik va HTML tozalash), ya'ni
+// xona begona reklama maydoni bo'lib qolardi va o'yinchida shikoyat qilish
+// yo'li ham yo'q edi.
+//
+// Sof funksiya — testlari validate.test.mjs da.
+// `recent` — shu o'yinchining oxirgi xabarlari (takror/spam uchun).
+//
+// DIQQAT: o'yinda raqam KO'P ishlatiladi ("3 ga beraman", "5-raqam shubhali"),
+// shuning uchun telefon qoidasi kamida 7 ta ketma-ket raqamni talab qiladi.
+const LINKY = /(https?:\/\/|www\.|t\.me\/|telegram\.me\/|wa\.me\/|\b[a-z0-9-]{2,}\.(uz|com|ru|net|org|me|io|co|info|site|online|xyz)\b)/i;
+const PHONE = /(?:\+?\d[\s\-().]*){7,}/;
+
+export function checkChat(text, recent = []) {
+  const t = String(text || '').trim();
+  if (!t) return { ok: false, code: 'empty' };
+  if (LINKY.test(t)) return { ok: false, code: 'link' };
+  if (PHONE.test(t.replace(/[^\d+\s\-().]/g, ''))) return { ok: false, code: 'phone' };
+  // Bir xil xabarni qayta-qayta yozish — eng oddiy spam shakli
+  const norm = t.toLowerCase().replace(/\s+/g, ' ');
+  if (recent.some((r) => String(r).toLowerCase().replace(/\s+/g, ' ') === norm)) {
+    return { ok: false, code: 'repeat' };
+  }
+  // Bitta belgini cho'zish ("aaaaaaaaaaa") — ekranni to'ldirish usuli
+  if (/(.)\1{9,}/.test(t)) return { ok: false, code: 'flood' };
+  return { ok: true, value: t };
+}
+
 export function cleanDeep(value, depth = 0) {
   if (depth > 6) return value;
   if (typeof value === 'string') return cleanText(value, { maxLen: 4000 });

@@ -6,8 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   NICK_MIN, NICK_MAX, ROOM_NAME_MAX,
-  cleanText, hasAngle, cleanDeep, validateNick, validateRoomName,
-} from './validate.js';
+  cleanText, hasAngle, cleanDeep, validateNick, validateRoomName, checkChat } from './validate.js';
 
 // ---------- QAVSLAR ----------
 
@@ -167,4 +166,63 @@ test('xona nomi: bo\'shliq va tinish belgilari mumkin, qavs yo\'q', () => {
   assert.equal(validateRoomName('a').code, 'short');
   assert.equal(validateRoomName('!!!').code, 'chars');
   assert.equal(validateRoomName('x'.repeat(100)).value.length, ROOM_NAME_MAX);
+});
+
+
+// ==================== CHAT TARKIBI ====================
+// Ochiq chatda reklama/havola/telefon tarqatish eng ko'p uchraydigan
+// suiiste'mol edi va hech qanday to'siq yo'q edi.
+
+test('havola yuborib bo\'lmaydi', () => {
+  for (const bad of [
+    'https://example.com ga kiring',
+    'www.reklama.uz',
+    't.me/kanalim',
+    'mening saytim reklama.uz zor',
+    'HTTPS://KATTA.COM',
+  ]) {
+    const r = checkChat(bad);
+    assert.equal(r.ok, false, 'o\'tkazib yubordi: ' + bad);
+    assert.equal(r.code, 'link', 'kod noto\'g\'ri: ' + bad);
+  }
+});
+
+test('telefon raqam yuborib bo\'lmaydi', () => {
+  for (const bad of ['+998901234567', '90 123 45 67 ga qongiroq qil', '998-90-123-45-67']) {
+    const r = checkChat(bad);
+    assert.equal(r.ok, false, 'o\'tkazib yubordi: ' + bad);
+    assert.equal(r.code, 'phone', 'kod noto\'g\'ri: ' + bad);
+  }
+});
+
+test('O\'YIN gaplari erkin o\'tadi — raqam ko\'p ishlatiladi', () => {
+  // Eng muhim test: filtr o'yinning o'ziga xalaqit bermasligi kerak.
+  for (const good of [
+    '3 ga beraman',
+    '5-raqam shubhali',
+    'men komissarman 4 mafiya',
+    'kecha 2 va 7 ovoz bergandi',
+    'menimcha Aziz',
+    '1 2 3 4 5 6',           // 6 ta raqam — telefon emas
+  ]) {
+    const r = checkChat(good);
+    assert.equal(r.ok, true, 'bekorga to\'sdi: ' + good + ' (' + r.code + ')');
+  }
+});
+
+test('bir xil xabar takrorlanmaydi', () => {
+  const recent = ['men tinch aholiman'];
+  assert.equal(checkChat('men tinch aholiman', recent).code, 'repeat');
+  assert.equal(checkChat('MEN   tinch aholiman', recent).code, 'repeat', 'katta harf/probel bilan aylanib o\'tdi');
+  assert.equal(checkChat('men mafiyaman', recent).ok, true);
+});
+
+test('bitta belgini cho\'zib ekranni to\'ldirib bo\'lmaydi', () => {
+  assert.equal(checkChat('aaaaaaaaaaaaaaa').code, 'flood');
+  assert.equal(checkChat('haaa').ok, true, 'oddiy cho\'zish to\'silmasin');
+});
+
+test('bo\'sh xabar o\'tmaydi', () => {
+  assert.equal(checkChat('   ').code, 'empty');
+  assert.equal(checkChat(null).code, 'empty');
 });

@@ -12,6 +12,8 @@ import crypto from 'crypto';
 import {
   makePersona, voteDelayMs, fakePing, buildSuspicion, buildVoteWeight,
   chooseDayVote, chooseNightTarget, makeFillerBots, BOT_NAMES,
+  // Botlarning gapi va tungi kechikishi — ikkalasi ham sof funksiya (testlari bor)
+  nightDelayMs, botChatLine, chooseChatAct, typingMs, weightedPick,
 } from './bot-ai.js';
 import { botAvatar } from './avatar.js';
 // Onlayn ko'rsatkichi egri chizig'i — alohida modulda, testlari presence.test.mjs da
@@ -39,7 +41,7 @@ import { gameElapsed as pacingElapsed, phaseDuration, isTimeUp, GAME_HARD_MS } f
 // belgilar, HTML mohiyatlari va ko'rinmas belgilar bilan qilingan
 // "aylanma yo'llar" ham yopilgan).
 import {
-  cleanText, cleanDeep, validateNick, validateRoomName,
+  cleanText, cleanDeep, validateNick, validateRoomName, checkChat,
   NICK_MIN, NICK_MAX,
 } from './validate.js';
 
@@ -113,6 +115,15 @@ function isPublicIp(ip) {
   if (/^10\./.test(ip) || /^192\.168\./.test(ip) || /^172\.(1[6-9]|2\d|3[01])\./.test(ip) || /^169\.254\./.test(ip)) return false;
   return true;
 }
+// REST xatosi. Ilgari 31 ta ishlovchi `e.message` ni to'g'ridan-to'g'ri
+// mijozga qaytarardi (Prisma xatosi jadval/ustun nomlarini oshkor qiladi) va
+// serverda HECH QANDAY log qolmasdi — ya'ni nosozlikni keyin topib bo'lmasdi.
+function serverFail(res, e, code = 'serverError') {
+  console.error('API:', e?.stack || e);
+  if (res.headersSent) return;
+  res.status(500).json({ code, error: 'Serverda xatolik — birozdan keyin urinib ko\'ring' });
+}
+
 // yengil, xotirada ishlaydigan fixed-window rate limiter (Redis/round-trip yo'q — tez)
 function rateLimiter({ windowMs, max, keyFn, message }) {
   const hits = new Map();
@@ -260,14 +271,46 @@ function panicMiddleware(req, res, next) {
   next();
 }
 
+// `shuttingDown` — SIGTERM boshlangani. Redis 'end' hodisasi shu paytda ham
+// keladi va uni ogohlantirish sifatida ko'rsatish kerak emas.
+// Yuqorida e'lon qilinadi, chunki redis tinglovchilari undan foydalanadi.
+let shuttingDown = false;
 const prisma = new PrismaClient();
 const redis = new Redis({
   host: process.env.REDIS_HOST || 'localhost',
   port: parseInt(process.env.REDIS_PORT) || 6379,
   // umumiy Redis serverida boshqa loyihalar bilan aralashmaslik uchun alohida DB indeksi
   db: parseInt(process.env.REDIS_DB || '0'),
-  retryStrategy: (times) => Math.min(times * 50, 2000)
+  retryStrategy: (times) => Math.min(times * 50, 2000),
+  // Uzilgan paytda navbat CHEKSIZ o'smasin: 20 ta so'rovdan keyingisi darhol
+  // rad etiladi va chaqiruvchidagi .catch() ishlaydi. Busiz uzoq uzilishda
+  // minglab kutayotgan promise to'planib, ulanish tiklanganda hammasi
+  // birdan otilardi.
+  maxRetriesPerRequest: 3,
+  enableOfflineQueue: true,
 });
+
+// ⚠️ MAJBURIY: 'error' tinglovchisi.
+//
+// ioredis EventEmitter'ga tayanadi va Node'da tinglovchisi YO'Q 'error'
+// hodisasi PROTSESSNI YIQITADI. Ya'ni Redis bir soniyaga uzilsa (yoki
+// parol/DB indeksi noto'g'ri bo'lsa) butun server — barcha jonli o'yinlar
+// bilan birga — o'lardi va logda faqat "Unhandled 'error' event" qolardi.
+// ioredis o'zi qayta ulanadi, bizga esa faqat shovqinsiz log kerak.
+let redisDownAt = 0;
+redis.on('error', (e) => {
+  if (!redisDownAt) {
+    redisDownAt = Date.now();
+    console.error('Redis xatosi:', e?.message || e);
+  }
+});
+redis.on('ready', () => {
+  if (redisDownAt) {
+    console.log(`✅ Redis tiklandi (${Math.round((Date.now() - redisDownAt) / 1000)} s uzilgandi)`);
+    redisDownAt = 0;
+  }
+});
+redis.on('end', () => { if (!shuttingDown) console.warn('Redis ulanishi yopildi'); });
 
 app.use(cors());
 app.use(express.json({ limit: '800kb' })); // avatar (base64) sig'adi, lekin ulkan payload floodini cheklaydi
@@ -637,7 +680,7 @@ app.post('/api/access-request', limitAuth, async (req, res) => {
       ]] },
     }).catch(() => {});
     res.json({ requestId });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // frontend holatni so'rab turadi
@@ -1134,7 +1177,7 @@ app.get('/api/me', authMiddleware, async (req, res) => {
       verified: profileState(u).verified,
       perks: await readPerks(u.id),
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // ===== PROFIL MA'LUMOTLARINI SAQLASH =====
@@ -1173,7 +1216,7 @@ app.patch('/api/me/profile', authMiddleware, limitByUser(30), async (req, res) =
 
     const u = await prisma.user.update({ where: { id: req.user.userId }, data });
     res.json({ ok: true, completion: profileState(u), verified: profileState(u).verified });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // ===== TELEGRAM HISOBINI BOG'LASH =====
@@ -1210,7 +1253,7 @@ app.post('/api/me/telegram/link', authMiddleware, limitByUser(10), async (req, r
       url: `https://t.me/${bot}?start=${code}`,
       expiresIn: 600,
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 app.delete('/api/me/telegram', authMiddleware, limitByUser(10), async (req, res) => {
@@ -1221,7 +1264,7 @@ app.delete('/api/me/telegram', authMiddleware, limitByUser(10), async (req, res)
     });
     const u = await prisma.user.findUnique({ where: { id: req.user.userId } });
     res.json({ ok: true, completion: profileState(u) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // 🛒 do'kon — tangaga item sotib olish
@@ -1277,7 +1320,7 @@ app.post('/api/shop/buy', authMiddleware, limitByUser(40), async (req, res) => {
     if (out.err) return res.status(out.err).json({ error: out.msg });
     await logActivity(userId, 'shop_buy', { item, amount: -price, detail: `Do'kondan ${item} sotib olindi` });
     res.json({ ok: true, coins: out.coins, items: out.items });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // 🎁 kunlik bonus — kuniga bir marta
@@ -1300,7 +1343,7 @@ app.post('/api/daily-bonus', authMiddleware, limitByUser(20), async (req, res) =
     const fresh = await prisma.user.findUnique({ where: { id: req.user.userId }, select: { coins: true } });
     await logActivity(req.user.userId, 'coin_bonus', { amount: ECONOMY.dailyBonus, detail: 'Kunlik bonus' });
     res.json({ ok: true, coins: fresh?.coins ?? 0, bonus: ECONOMY.dailyBonus });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // 📜 o'yin tarixi (oxirgi 20 ta)
@@ -1311,7 +1354,7 @@ app.get('/api/me/history', authMiddleware, async (req, res) => {
       orderBy: { createdAt: 'desc' }, take: 20
     });
     res.json(list.map(h => ({ role: h.role, won: h.won, winner: h.winner, coins: h.coins, createdAt: h.createdAt })));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // 👤 profilni tahrirlash — nikname va rasm. Bo'sh nikname mumkin emas.
@@ -1350,7 +1393,7 @@ app.put('/api/me/profile', authMiddleware, limitByUser(15), async (req, res) => 
     res.json({ userId: u.id, username: u.username, avatar: u.avatar || null, isAdmin: u.isAdmin, token: signToken(u, reqDeviceId(req)) });
   } catch (e) {
     if (e.code === 'P2002') return res.status(409).json({ error: 'Bu nikname band' });
-    res.status(500).json({ error: e.message });
+    serverFail(res, e);
   }
 });
 
@@ -1359,13 +1402,26 @@ app.get('/api/leaderboard', async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(50, Math.max(5, parseInt(req.query.limit) || 20));
-    const total = await prisma.userStats.count();
+    // 15 soniyalik xotira keshi: jadval har so'rovda to'liq `count` + `findMany`
+    // qilardi va ochiq endpoint bo'lgani uchun uni istalgancha urish mumkin edi.
+    // Reyting sekundlar ichida o'zgarmaydi — eskirish sezilmaydi.
+    const ck = `board:${page}:${limit}`;
+    const hot = memGet(ck);
+    if (hot) return res.json(hot);
+    // Bloklangan hisoblar va bir-ikki o'yin o'ynagan tasodifiy natijalar
+    // jadvalda turmasin: birinchisi adolatsiz (ban olgan odam tepada qoladi),
+    // ikkinchisi esa jadvalni ma'nosiz qiladi — bitta g'alaba bilan yuqori
+    // reyting olib, keyin umuman o'ynamaslik eng oson "strategiya" edi.
+    const BOARD_MIN_GAMES = 3;
+    const where = { gamesPlayed: { gte: BOARD_MIN_GAMES }, user: { isBanned: false } };
+    const total = await prisma.userStats.count({ where });
     const rows = await prisma.userStats.findMany({
+      where,
       orderBy: [{ rating: 'desc' }, { gamesWon: 'desc' }],
       skip: (page - 1) * limit, take: limit,
       include: { user: { select: { username: true } } }   // avatar yo'q — payload yengil
     });
-    res.json({
+    const payload = {
       total, page, limit, pages: Math.max(1, Math.ceil(total / limit)),
       // Liga va daraja SERVERDA hisoblanadi: chegaralar bitta joyda
       // (progression.js) turishi kerak, aks holda frontend bilan
@@ -1375,9 +1431,11 @@ app.get('/api/leaderboard', async (req, res) => {
         username: s.user.username, rating: s.rating,
         gamesPlayed: s.gamesPlayed, gamesWon: s.gamesWon, winRate: s.winRate,
         xp: s.xp || 0, level: levelFromXp(s.xp || 0), tier: tierOf(s.rating),
-      }))
-    });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+      })),
+    };
+    memSet(ck, payload, 15000);
+    res.json(payload);
+  } catch (e) { serverFail(res, e); }
 });
 
 // Liga chegaralari (public). /reyting sahifasidagi jadval shundan chiziladi —
@@ -1389,8 +1447,13 @@ app.get('/api/tiers', (_req, res) => {
 });
 
 // joriy foydalanuvchining reytingdagi o'rni
-app.get('/api/me/rank', authMiddleware, async (req, res) => {
+app.get('/api/me/rank', authMiddleware, limitByUser(60), async (req, res) => {
   try {
+    // 15 soniyalik kesh: profil sahifasi buni tez-tez so'raydi va har so'rov
+    // ikkita to'liq `count()` qilardi. O'rin sekundlar ichida o'zgarmaydi.
+    const ck = 'rank:' + req.user.userId;
+    const hot = memGet(ck);
+    if (hot) return res.json(hot);
     const s = await prisma.userStats.findUnique({ where: { userId: req.user.userId } });
     const rating = s?.rating ?? 1000;
     // mendan yuqori reytingli o'yinchilar soni + 1 = mening o'rnim
@@ -1402,7 +1465,7 @@ app.get('/api/me/rank', authMiddleware, async (req, res) => {
     // ko'rsatib qo'yadi. Shuning uchun nomlari ATAYLAB ajratilgan.
     const lv = levelProgress(s?.xp ?? 0);
     const tr = tierProgress(rating);
-    res.json({
+    const payload = {
       rank: higher + 1, total, rating,
       gamesPlayed: s?.gamesPlayed ?? 0, gamesWon: s?.gamesWon ?? 0, winRate: s?.winRate ?? 0,
       // daraja
@@ -1410,22 +1473,68 @@ app.get('/api/me/rank', authMiddleware, async (req, res) => {
       xpLeft: lv.left, percent: lv.percent,
       // liga
       tier: tr.tier, next: tr.next, tierPercent: tr.percent, tierLeft: tr.left,
-    });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    };
+    memSet(ck, payload, 15000);
+    res.json(payload);
+  } catch (e) { serverFail(res, e); }
 });
 
 // ==================== GAME REST ROUTES ====================
 
 // Oddiy holat — watchdog va nginx uchun. Batafsil raqamlar faqat admin kaliti bilan:
 // ochiq ko'rsatilsa hujumchi himoya chegaralarini o'lchab olardi.
-app.get('/health', (req, res) => {
+// Bog'liqliklar holati — 5 soniya keshlanadi (watchdog har 15 s so'raydi).
+//
+// NEGA 503 QAYTARMAYMIZ: watchdog 3 ta muvaffaqiyatsiz javobdan keyin
+// jarayonni RESTART qiladi, restart esa barcha jonli o'yinlarni o'ldiradi.
+// Postgres yoki Redis qisqa uzilib qolsa restart yordam bermaydi (ioredis va
+// Prisma o'zi qayta ulanadi), faqat zarar qiladi. Shuning uchun /health
+// "ok" bo'lib qolaveradi, holat esa kalitli javobda ko'rinadi va buzilish
+// boshlanganda adminga Telegram xabari ketadi.
+let depCache = { at: 0, ok: true, redis: 'ok', db: 'ok' };
+let depAlerted = false;
+async function depCheck() {
+  if (Date.now() - depCache.at < 5000) return depCache;
+  const timeout = (ms) => new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms));
+  const out = { at: Date.now(), ok: true, redis: 'ok', db: 'ok' };
+  try { await Promise.race([redis.ping(), timeout(1500)]); } catch { out.redis = 'xato'; out.ok = false; }
+  try { await Promise.race([prisma.$queryRaw`SELECT 1`, timeout(1500)]); } catch { out.db = 'xato'; out.ok = false; }
+  depCache = out;
+  if (!out.ok && !depAlerted) {
+    depAlerted = true;
+    console.error(`\u{26A0} Bog'liqlik uzildi — redis: ${out.redis}, postgres: ${out.db}`);
+    if (TG_ADMIN_BOT_TOKEN && TG_ADMIN_CHAT_ID) {
+      tgApi('sendMessage', {
+        chat_id: TG_ADMIN_CHAT_ID,
+        text: `\u{26A0} <b>Bog'liqlik uzildi</b>\nRedis: ${out.redis}\nPostgres: ${out.db}\n`
+            + `Server ishlashda davom etyapti (restart qilinmadi).`,
+        parse_mode: 'HTML',
+      }).catch(() => {});
+    }
+  }
+  if (out.ok && depAlerted) {
+    depAlerted = false;
+    console.log("\u2705 Bog'liqliklar tiklandi");
+  }
+  return out;
+}
+
+app.get('/health', async (req, res) => {
   const base = { status: 'ok' };
   const key = req.query.key || req.headers['x-admin-key'];
-  if (!ADMIN_ACCESS_KEY || key !== ADMIN_ACCESS_KEY) return res.json(base);
+  if (!ADMIN_ACCESS_KEY || key !== ADMIN_ACCESS_KEY) {
+    // Kalitsiz so'rov ham bog'liqlikni tekshiradi (natija keshlanadi), lekin
+    // javob o'zgarmaydi: hujumchi holatimizni o'lchay olmasin.
+    depCheck().catch(() => {});
+    return res.json(base);
+  }
+  const dep = await depCheck().catch(() => ({ ok: false, redis: '?', db: '?' }));
   const mem = process.memoryUsage();
   res.json({
     ...base,
     uptimeSec: Math.round(process.uptime()),
+    bogliqliklar: { soz: dep.ok, redis: dep.redis, postgres: dep.db },
+    oyinlar: { taymerlar: timers.size, qulflar: chains.size, xonalar: voiceCtx.size },
     sockets: { ochiq: io.engine.clientsCount, chegara: MAX_TOTAL_SOCKETS, ipLar: ipConns.size },
     ramMb: { rss: Math.round(mem.rss / 1048576), heap: Math.round(mem.heapUsed / 1048576) },
     // rad etilgan ulanishlar (server ishga tushgandan beri)
@@ -1497,7 +1606,7 @@ app.get('/api/stats', async (_, res) => {
     await redis.set('cache:pubstats', JSON.stringify(data), 'EX', 10).catch(() => {});
     memSet('stats', data, 3000);
     res.json(data);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // hydrate: redis yo'q bo'lsa postgres dan tiklash (faqat waiting xonalar uchun)
@@ -1529,7 +1638,52 @@ async function getG(gameId) {
   return null;
 }
 async function saveG(gameId, g) {
+  updateVoiceCtx(gameId, g);   // ovoz guruhlari (sof xotira — arzon)
   await redis.set(`game:${gameId}`, JSON.stringify(g), 'EX', 86400);
+}
+
+// ==================== OVOZ: KIM KIMNI ESHITADI ====================
+// Himoyaning ASOSIY qatlami mijozda qoladi va shunday bo'lishi kerak: mafiya
+// tunda `replaceTrack(null)` bilan tinch aholiga ovoz OQIMINI umuman
+// yubormaydi, ya'ni o'zgartirilgan mijoz ham eshitolmaydi (mesh WebRTC da
+// server oqimni ko'rmaydi — buni faqat SFU qila olardi).
+//
+// Lekin "gapiryapti" indikatori SERVERDAN o'tadi va u umuman tekshirilmasdi:
+// o'zgartirilgan mijoz tunda kim gapirayotganini ko'rib, mafiyani ro'yxatdan
+// aniqlab olishi mumkin edi. Shu sababli indikator endi shu jadval bo'yicha
+// filtrlanadi. Jadval `saveG` da yangilanadi — ya'ni har doim joriy holat.
+const voiceCtx = new Map();   // gameId -> { night, alive:Set, mafia:Set }
+// Xonadagi TIRIK botlar surati — soxta ping uchun.
+//
+// `pingCycle` har 3 soniyada har bir xonaning BUTUN holatini Redis'dan o'qib
+// JSON.parse qilardi (50 xona = sekundiga ~17 ta to'liq parse) — faqat botlar
+// ro'yxatini bilish uchun. Ro'yxat holat saqlanganda bir marta yig'iladi.
+const gameBots = new Map();   // gameId -> [{ socketId, persona }]
+function updateVoiceCtx(gameId, g) {
+  if (!g) { voiceCtx.delete(gameId); gameBots.delete(gameId); return; }
+  const night = String(g.phase || '').startsWith('night');
+  const alive = new Set(), mafia = new Set();
+  const bots = [];
+  for (const p of g.players || []) {
+    if (p.isAlive !== false) alive.add(p.socketId);
+    if (sideOf(p.role) === 'mafia') mafia.add(p.socketId);
+    if (p.isBot === true && p.isAlive !== false) {
+      if (!p.persona) p.persona = makePersona(p.userId || p.socketId);
+      bots.push({ socketId: p.socketId, persona: p.persona });
+    }
+  }
+  voiceCtx.set(gameId, { night, alive, mafia });
+  if (bots.length) gameBots.set(gameId, bots); else gameBots.delete(gameId);
+}
+function canHearVoice(gameId, fromSid, toSid) {
+  const c = voiceCtx.get(gameId);
+  if (!c) return true;                                  // ma'lumot yo'q — to'smaymiz
+  const fromAlive = c.alive.has(fromSid);
+  const toAlive = c.alive.has(toSid);
+  if (!fromAlive) return !toAlive;                      // o'lik faqat o'liklarga
+  if (!toAlive) return true;                            // o'lik hammani eshitadi
+  if (!c.night) return true;                            // kunduzi hamma eshitadi
+  return c.mafia.has(fromSid) && c.mafia.has(toSid);     // tunda faqat mafiya
 }
 
 // barcha aktiv xonalar ro'yxati
@@ -1557,7 +1711,9 @@ app.get('/api/games', async (_, res) => {
         id: g.id, name: g.name, status: g.status,
         totalPlayers: g.totalPlayers, mafiaCount: g.mafiaCount,
         sheriffCount: g.sheriffCount, doctorCount: g.doctorCount, civilCount: g.civilCount,
-        hostId: g.hostId, createdAt: g.createdAt,
+        // Bot ochgan xonada xom `hostId` 'bot-' prefiksini oshkor qilardi
+        hostId: publicHostId({ hostId: g.hostId, players: state?.players || [] }),
+        createdAt: g.createdAt,
         phase: state?.phase || 'waiting',
         // DIQQAT: `p.userId` EMAS, `p.publicId`. Bot userId'si 'bot-' bilan
         // boshlanadi va u ochiq ro'yxatda ko'rinsa, xonadagi botlar darhol
@@ -1581,7 +1737,7 @@ app.get('/api/games', async (_, res) => {
     await redis.set('cache:games', JSON.stringify(list), 'EX', 3).catch(() => {});
     memSet('games', list, 1500);
     res.json(list);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // Kutayotgan xonaning jurnalidan oxirgi kirish/chiqish hodisalarini
@@ -1595,7 +1751,10 @@ function lobbyEvents(state) {
   const out = [];
   for (let i = log.length - 1; i >= 0 && out.length < 3; i--) {
     const e = log[i];
-    const t = e?.reason === 'playerJoined' ? 'join' : e?.reason === 'playerLeft' ? 'leave' : null;
+    // `logEvent` yozuvda `code` maydonini saqlaydi, `reason` emas — shuning
+    // uchun bu tekshiruv HECH QACHON rost bo'lmasdi va lobbi kartasidagi
+    // "kim kirdi / kim chiqdi" lentasi har doim bo'sh qolardi.
+    const t = e?.code === 'playerJoined' ? 'join' : e?.code === 'playerLeft' ? 'leave' : null;
     if (!t) continue;
     const name = e?.args?.name;
     if (!name) continue;
@@ -1621,11 +1780,28 @@ function lobbyEvents(state) {
 //      odam mavjud bo'sh xonalardan biriga yuboriladi.
 const OPEN_WAITING_CAP = 8;
 
-app.post('/api/games/:id/open', authMiddleware, limitByUser(6), async (req, res) => {
+// Limit 6 -> 25: lobbi endi HAR QANDAY xonaga bosilganda shu endpointni
+// chaqiradi (ilgari faqat soxta xonalar uchun chaqirilardi). 6 ta so'rov bir
+// necha xonani ko'rib chiqqan odamni ham bloklab qo'yardi.
+// Yangi HAQIQIY xona yaratish baribir OPEN_WAITING_CAP bilan cheklangan.
+app.post('/api/games/:id/open', authMiddleware, limitByUser(25), async (req, res) => {
   try {
     const fid = String(req.params.id || '');
-    // ID haqiqatan shu paytdagi soxta xonalardan birimi? (o'tgan slot ham
-    // hisobga olinadi: odam ro'yxatni bir daqiqa oldin ochgan bo'lishi mumkin)
+
+    // HAQIQIY xona bo'lsa — shu ID ning o'zini qaytaramiz.
+    //
+    // NEGA: lobbi endi HAR QANDAY xonaga bosilganda shu endpointni chaqiradi.
+    // Ilgari frontend javobdagi `fake: true` belgisiga qarab qaror qilardi va
+    // aynan shu belgi soxta xonalarni oshkor qilardi. Qaror endi serverda:
+    // mijoz qaysi xona soxta ekanini umuman bilmaydi.
+    const real = await prisma.game.findUnique({ where: { id: fid } }).catch(() => null);
+    if (real) {
+      if (real.status === 'finished') return res.status(404).json({ error: 'notFound' });
+      return res.json({ id: real.id });
+    }
+
+    // ID shu paytdagi soxta xonalardan birimi? (o'tgan slot ham hisobga
+    // olinadi: odam ro'yxatni bir daqiqa oldin ochgan bo'lishi mumkin)
     const now = Date.now();
     const pool = [...fakeRooms(now, FAKE_ONLINE), ...fakeRooms(now - 7 * 60000, FAKE_ONLINE)];
     const room = pool.find((r) => r.id === fid);
@@ -1681,9 +1857,9 @@ app.post('/api/games', authMiddleware, limitByUser(30), async (req, res) => {
       return res.status(429).json({ error: 'Xonalar limiti to\'ldi. Keyinroq urinib ko\'ring.' });
     }
 
-    // KUNLIK LIMIT: har bir foydalanuvchi kuniga maksimum 2 ta xona yaratadi
-    const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
-    const todayCount = await prisma.game.count({ where: { hostId: req.user.userId, createdAt: { gte: startOfDay } } });
+    // KUNLIK LIMIT — o'chirilmaydigan hisoblagichda (roomsCreatedToday).
+    // Jonli COUNT ishlatilganda xonani o'chirish limitni qaytarardi.
+    const todayCount = await roomsCreatedToday(req.user.userId);
     const DAILY_LIMIT = await userDailyLimit(req.user.userId, settings);
     if (todayCount >= DAILY_LIMIT) {
       return res.status(429).json({ error: `Kuniga maksimum ${DAILY_LIMIT} ta xona yaratish mumkin. Mavjud xonaga qo'shiling.` });
@@ -1738,11 +1914,12 @@ app.post('/api/games', authMiddleware, limitByUser(30), async (req, res) => {
     };
     await saveG(game.id, state);
     // Botlar bittalab, 2-9 soniya oralig'ida qo'shiladi
+    await bumpRoomsCreated(req.user.userId);   // kunlik hisob (o'chirish bilan qaytmaydi)
     if (fillers.length) scheduleBotJoins(game.id, fillers);
     scheduleEmptyCheck(game.id); // 2 daqiqa ichida ODAM kirmasa o'chadi
     tgRoomAnnounce(game.id).catch(() => {}); // Telegram guruhiga e'lon (ochiq xonalar)
     res.json(game);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // 🤖 BOTLAR BILAN O'YIN — xona ochmasdan, barcha rollardan, tez o'yin
@@ -1802,7 +1979,7 @@ app.post('/api/games/bots', authMiddleware, limitByUser(30), async (req, res) =>
       }
     }, 60000));
     res.json({ id: game.id });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // foydalanuvchining o'z xonalari (yopiqlar ham ko'rinadi)
@@ -1832,16 +2009,24 @@ app.get('/api/my-games', authMiddleware, async (req, res) => {
       };
     }));
     res.json(enriched.filter(Boolean));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // foydalanuvchi FAQAT o'z xonasini o'chira oladi
-app.delete('/api/games/:id', authMiddleware, async (req, res) => {
+app.delete('/api/games/:id', authMiddleware, limitByUser(20), async (req, res) => {
   try {
     const id = req.params.id;
     const game = await prisma.game.findUnique({ where: { id } });
     if (!game) return res.status(404).json({ error: 'Xona topilmadi' });
     if (game.hostId !== req.user.userId) return res.status(403).json({ error: 'Faqat o\'z xonangizni o\'chira olasiz' });
+    // KETAYOTGAN o'yinni o'chirib bo'lmaydi. Ilgari mumkin edi va bu ikki narsani
+    // buzardi: (1) yutqazayotgan host bir tugma bilan endGame/recordStats ni
+    // chetlab o'tib mag'lubiyatdan qutulardi; (2) o'sha xonadagi QOLGAN haqiqiy
+    // o'yinchilarning to'plangan reyting/tanga/XP si yo'q bo'lardi — ular hech
+    // narsa qilmagan holda. O'yin tugagach xona baribir o'chadi.
+    if (game.status === 'playing') {
+      return res.status(409).json({ code: 'gameRunning', error: 'O\'yin ketyapti — tugagandan keyin o\'chirishingiz mumkin' });
+    }
     io.to(`game:${id}`).emit('game_closed', { code: 'hostClosed', message: 'Xona egasi xonani yopdi' });
     if (timers.has(id)) { clearTimeout(timers.get(id)); timers.delete(id); }
     // guruhdagi e'lonni "o'chirildi" holatiga keltiramiz (redis o'chishidan OLDIN o'qiymiz)
@@ -1850,7 +2035,7 @@ app.delete('/api/games/:id', authMiddleware, async (req, res) => {
     await redis.del(`game:${id}`, `chat:${id}`).catch(() => {});
     await prisma.game.delete({ where: { id } }).catch(() => {});
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 app.get('/api/games/:id', async (req, res) => {
@@ -1858,7 +2043,7 @@ app.get('/api/games/:id', async (req, res) => {
     const g = await getG(req.params.id);
     if (!g) return res.status(404).json({ error: 'Xona topilmadi yoki tugagan' });
     res.json(publicGame(g));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // ==================== AVATAR RASMLARI ====================
@@ -1985,7 +2170,7 @@ app.get('/api/admin/live', authMiddleware, adminMiddleware, async (_, res) => {
       redis.zcard('presence:anon').catch(() => 0),
     ]);
     res.json({ authed, anon, total: authed + anon });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 app.get('/api/admin/stats', authMiddleware, adminMiddleware, async (_, res) => {
@@ -2015,7 +2200,7 @@ app.get('/api/admin/stats', authMiddleware, adminMiddleware, async (_, res) => {
       users, banned, admins, totalGames, activeGames, finishedGames, mafiaWins, civilWins,
       sources, tgStarted, tgbotWeek,
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) => {
@@ -2048,7 +2233,35 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) =>
         stats: u.stats || { gamesPlayed: 0, gamesWon: 0, winRate: 0, rating: RATING_START, xp: 0 }
       }))
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
+});
+
+// Admin choralarining jurnali. Redis ro'yxatida (oxirgi 1000 ta) —
+// yangi jadval qo'shmasdan, lekin "kim nima qildi" savoli javobsiz qolmasin.
+async function adminAudit(actor, action, targetId, targetName) {
+  const rec = {
+    at: Date.now(),
+    byId: actor?.userId || '?', by: actor?.username || '?',
+    action, targetId, target: targetName || null,
+  };
+  try {
+    await redis.rpush('admin:audit', JSON.stringify(rec));
+    await redis.ltrim('admin:audit', -1000, -1);
+  } catch {}
+  console.log(`\u{1F6E1} admin: ${rec.by} -> ${action} -> ${targetName || targetId}`);
+}
+
+// Shikoyatlar va admin jurnali (admin panel uchun)
+app.get('/api/admin/reports', authMiddleware, adminMiddleware, async (_req, res) => {
+  try {
+    const [reports, audit] = await Promise.all([
+      redis.lrange('reports', -200, -1).catch(() => []),
+      redis.lrange('admin:audit', -200, -1).catch(() => []),
+    ]);
+    const parse = (rows) => rows.map(r => { try { return JSON.parse(r); } catch { return null; } })
+      .filter(Boolean).reverse();
+    res.json({ reports: parse(reports), audit: parse(audit) });
+  } catch (e) { serverFail(res, e); }
 });
 
 app.post('/api/admin/users/:id/ban', authMiddleware, adminMiddleware, async (req, res) => {
@@ -2059,8 +2272,11 @@ app.post('/api/admin/users/:id/ban', authMiddleware, adminMiddleware, async (req
     await setBanned(u.id, updated.isBanned);
     // ban darhol kuchga kirsin — ochiq sessiyalarni uzamiz
     if (updated.isBanned) kickUserSockets(u.id, 'Hisobingiz bloklandi');
+    // Admin chorasi JURNALGA yoziladi. Ilgari hech qayerda iz qolmasdi:
+    // kim, qachon va kimni bloklaganini keyin aniqlab bo'lmasdi.
+    await adminAudit(req.user, updated.isBanned ? 'ban' : 'unban', u.id, u.username);
     res.json({ id: updated.id, isBanned: updated.isBanned });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 app.post('/api/admin/users/:id/admin', authMiddleware, adminMiddleware, async (req, res) => {
@@ -2068,8 +2284,9 @@ app.post('/api/admin/users/:id/admin', authMiddleware, adminMiddleware, async (r
     const u = await prisma.user.findUnique({ where: { id: req.params.id } });
     if (!u) return res.status(404).json({ error: 'Topilmadi' });
     const updated = await prisma.user.update({ where: { id: u.id }, data: { isAdmin: !u.isAdmin } });
+    await adminAudit(req.user, updated.isAdmin ? 'grantAdmin' : 'revokeAdmin', u.id, u.username);
     res.json({ id: updated.id, isAdmin: updated.isAdmin });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // admin foydalanuvchiga shaxsiy kunlik xona limitini belgilaydi: { limit }
@@ -2087,7 +2304,7 @@ app.post('/api/admin/users/:id/room-limit', authMiddleware, adminMiddleware, asy
     if (!Number.isFinite(n) || n < 0 || n > 1000) return res.status(400).json({ error: 'Limit 0–1000 oralig\'ida bo\'lishi kerak' });
     await redis.hset('roomlimits', u.id, String(n));
     res.json({ id: u.id, roomLimit: n });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // admin foydalanuvchiga buyum beradi/oladi: { item, qty }  (qty manfiy bo'lishi mumkin)
@@ -2101,7 +2318,7 @@ app.post('/api/admin/users/:id/give', authMiddleware, adminMiddleware, async (re
     if (!items) return res.status(404).json({ error: 'Topilmadi' });
     await logActivity(req.params.id, 'admin_grant', { item, amount: n, detail: `Admin ${n > 0 ? 'berdi' : 'oldi'}: ${item} ${Math.abs(n)}` });
     res.json({ id: req.params.id, items });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // 👤 bitta foydalanuvchining TO'LIQ ma'lumoti (admin batafsil sahifasi)
@@ -2138,15 +2355,23 @@ app.get('/api/admin/users/:id', authMiddleware, adminMiddleware, async (req, res
       activities: activities.map(a => ({ type: a.type, item: a.item, amount: a.amount, detail: a.detail, gameId: a.gameId, createdAt: a.createdAt })),
       history: history.map(h => ({ role: h.role, won: h.won, winner: h.winner, coins: h.coins, createdAt: h.createdAt })),
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 app.delete('/api/admin/users/:id', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     if (req.params.id === req.user.userId) return res.status(400).json({ error: 'O\'zingizni o\'chira olmaysiz' });
+    const victim = await prisma.user.findUnique({ where: { id: req.params.id }, select: { username: true } }).catch(() => null);
     await prisma.user.delete({ where: { id: req.params.id } });
+    // O'CHIRILGAN HISOB SESSIYASI ham darhol tugaydi. Ilgari faqat DB yozuvi
+    // o'chirilardi, JWT esa 30 kun yashaydi va hech narsani tekshirmasdi —
+    // o'chirilgan odam o'ynashda davom etardi (xona ochish, chat, ovoz).
+    await setBanned(req.params.id, true);
+    kickUserSockets(req.params.id, 'Hisobingiz o\'chirildi');
+    userRooms.delete(req.params.id);
+    await adminAudit(req.user, 'deleteUser', req.params.id, victim?.username || '?');
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 app.get('/api/admin/games', authMiddleware, adminMiddleware, async (req, res) => {
@@ -2168,7 +2393,7 @@ app.get('/api/admin/games', authMiddleware, adminMiddleware, async (req, res) =>
       };
     }));
     res.json({ total, page, limit, pages: Math.max(1, Math.ceil(total / limit)), games: enriched });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // xonani majburan to'xtatish
@@ -2183,7 +2408,7 @@ app.post('/api/admin/games/:id/stop', authMiddleware, adminMiddleware, async (re
     tgRoomCancel(id, stopG, 'admin xonani yopdi').catch(() => {});
     await redis.del(`game:${id}`, `chat:${id}`).catch(() => {});
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // xonani butunlay o'chirish
@@ -2197,7 +2422,7 @@ app.delete('/api/admin/games/:id', authMiddleware, adminMiddleware, async (req, 
     await redis.del(`game:${id}`, `chat:${id}`).catch(() => {});
     await prisma.game.delete({ where: { id } }).catch(() => {});
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // eskirgan/stale xonalarni tozalash (redis holati yo'q bo'lganlarni tugatish)
@@ -2213,7 +2438,7 @@ app.post('/api/admin/cleanup', authMiddleware, adminMiddleware, async (_, res) =
       }
     }
     res.json({ cleaned });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 app.get('/api/admin/settings', authMiddleware, adminMiddleware, async (_, res) => {
@@ -2231,7 +2456,7 @@ app.put('/api/admin/settings', authMiddleware, adminMiddleware, async (req, res)
     };
     await saveSettings(next);
     res.json(next);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { serverFail(res, e); }
 });
 
 // ==================== GAME ENGINE ====================
@@ -2269,10 +2494,17 @@ function scheduleAbandonCheck(gameId) {
     if (!g || g.status !== 'playing') return;
     if (g.players.some(p => !p.isBot && p.connected !== false)) return; // kimdir qaytib keldi
     if (timers.has(gameId)) { clearTimeout(timers.get(gameId)); timers.delete(gameId); }
+    // NATIJA YOZILADI. Ilgari o'yin jimgina o'chirilardi va `recordStats` umuman
+    // chaqirilmasdi — ya'ni yutqazayotgan o'yinchi tabni yopib mag'lubiyatdan
+    // qutulardi. Bot bilan to'lgan xonada bu eng ko'p uchraydigan holat edi
+    // (odam yagona tirik ulanish bo'ladi).
+    const winner = checkWin(g) || 'draw';
+    logEvent(g, '\u{1F50C}', "O'yinchilar uzilib qoldi — o'yin yakunlandi", 'abandonedEnd');
+    await saveG(gameId, g);
     io.to(`game:${gameId}`).emit('game_closed', { code: 'abandoned', message: 'O\'yinchilar uzilib qolgani uchun o\'yin yopildi' });
-    await prisma.game.update({ where: { id: gameId }, data: { status: 'finished', endedAt: new Date() } }).catch(() => {});
-    tgRoomCancel(gameId, g, 'barcha o\'yinchilar uzilib qoldi').catch(() => {});
-    await redis.del(`game:${gameId}`, `chat:${gameId}`).catch(() => {});
+    // endGame o'zi: statusni yopadi, recordStats ni yozadi, Telegram e'lonini
+    // yakunlaydi va 60 soniyadan keyin Redis kalitlarini o'chiradi.
+    await endGame(gameId, winner);
   }), ABANDON_MS));
 }
 
@@ -2303,7 +2535,10 @@ const chains = new Map();
 function withLock(key, fn) {
   const prev = chains.get(key) || Promise.resolve();
   const next = prev.catch(() => {}).then(() => fn());
-  const tail = next.catch(() => {});
+  // Xato KAMIDA loglanadi. Ilgari `next.catch(() => {})` uni butunlay yutardi:
+  // o'yin dvigatelida xato bo'lsa xona jimgina muzlardi va logda hech qanday
+  // iz qolmasdi — sababni topish imkonsiz edi.
+  const tail = next.catch((e) => { console.error(`withLock[${key}]:`, e?.stack || e); });
   chains.set(key, tail);
   // Zanjir tugagach va yangi ish qo'shilmagan bo'lsa kalitni o'chiramiz —
   // aks holda Map har bir o'yin/foydalanuvchi uchun abadiy o'sib borardi.
@@ -2355,6 +2590,22 @@ function revealPlayers(players) {
   }));
 }
 
+// Xona egasining TASHQARIGA chiqadigan ID si.
+//
+// `publicPlayers` har bir o'yinchining userId'sini puxta maskalaydi, lekin xona
+// darajasidagi `hostId` xom holda ketardi — bot ochgan xonada u 'bot-' prefiksi
+// bilan ko'rinib, xonani kim ochganini darhol oshkor qilardi.
+//
+// Frontend `hostId` ni faqat "bu mening xonammi" solishtiruvi uchun ishlatadi
+// (app/game/[id]/page.js va app/oyin/view.js), shuning uchun haqiqiy
+// foydalanuvchi uchun qiymat o'zgarmaydi — faqat bot host maskalanadi.
+function publicHostId(g) {
+  if (!g || !g.hostId) return null;
+  if (isRealUser(g.hostId)) return g.hostId;
+  const h = (g.players || []).find(p => p.userId === g.hostId);
+  return h?.publicId || null;
+}
+
 // Mijozga yuboriladigan XAVFSIZ o'yin holati.
 // `{ ...g }` ni to'g'ridan-to'g'ri yuborish mumkin emas: nightActions ichida
 // mafiya socketId'lari (mafiaVotes), nightCheck ichida komissar tekshiruvi turadi —
@@ -2362,10 +2613,15 @@ function revealPlayers(players) {
 function publicGame(g) {
   if (!g) return null;
   return {
+    // Mijoz o'z soatini SERVER soati bilan solishtirib tuzatadi. Busiz faza
+    // taymeri qurilma soatiga bog'liq edi: soat 40 soniya oldinda bo'lsa
+    // hisoblagich umuman ko'rinmasdi (darhol 00:00), orqada bo'lsa esa faza
+    // allaqachon yopilganda ham sanashda davom etardi.
+    now: Date.now(),
     id: g.id,
     name: g.name,
     status: g.status,
-    hostId: g.hostId,
+    hostId: publicHostId(g),
     isPrivate: g.isPrivate,
     vsBots: g.vsBots === true,
     totalPlayers: g.totalPlayers,
@@ -2545,6 +2801,27 @@ const ECONOMY = {
 const PERK_KEYS = ['xpBoost', 'roomSlot'];
 const dayKeySuffix = () => new Date(Date.now() + 5 * 3600 * 1000).toISOString().slice(0, 10);
 const xpBoostKey = (userId) => `perk:xpboost:${userId}`;
+// Kunlik xona hisoblagichi. Redis'da, XONA O'CHIRILSA HAM KAMAYMAYDI.
+//
+// Ilgari limit jonli `prisma.game.count` ga tayanardi: xonani o'chirish hisobni
+// QAYTARARDI, ya'ni yarat-o'chir aylanishi bilan kunlik limitni cheksiz chetlab
+// o'tish mumkin edi va 80 tangalik `roomSlot` perki bekorga sotib olinardi.
+//
+// Kun `dayKeySuffix` bilan bir xil (UTC+5) — roomSlot perki bilan AYNI kunda
+// tugasin. Ilgari perk UTC+5 da, xona hisobi esa server vaqtida hisoblanardi va
+// sotib olingan perk vaqt zonasi farqi ichida yo'qolib ketardi.
+const roomCountKey = (userId) => `rooms:created:${userId}:${dayKeySuffix()}`;
+async function roomsCreatedToday(userId) {
+  try { return Math.max(0, parseInt((await redis.get(roomCountKey(userId))) || '0') || 0); }
+  catch { return 0; }
+}
+async function bumpRoomsCreated(userId) {
+  try {
+    const k = roomCountKey(userId);
+    const n = await redis.incr(k);
+    if (n === 1) await redis.expire(k, 36 * 3600);   // kun almashgach o'zi o'chadi
+  } catch {}
+}
 const roomSlotKey = (userId) => `perk:roomslot:${userId}:${dayKeySuffix()}`;
 
 async function readPerks(userId) {
@@ -2651,7 +2928,8 @@ async function startPhase(gameId, phase) {
 
   await saveG(gameId, g);
   io.to(`game:${gameId}`).emit('phase_change', {
-    phase, endsAt, duration: d, round: g.round, players: publicPlayers(g.players, { light: true }), log: g.log
+    phase, endsAt, duration: d, round: g.round, now: Date.now(),
+    players: publicPlayers(g.players, { light: true }), log: g.log
   });
 
   // kunduz boshlandi — komissarning kechagi tekshiruv natijasini endi yuboramiz
@@ -2689,7 +2967,10 @@ async function startPhase(gameId, phase) {
   // o'yinlari `vsBots: false` — natijada ular kunduzi UMUMAN ovoz bermasdi
   // va o'yin faqat taymer bilan aylanardi (jonli saytda ko'rilgan:
   // `dayVotes: 0`, hech kim chetlatilmaydi).
-  if (phase === 'day_discussion' && (g.players || []).some(isBot)) scheduleBotDay(gameId, g);
+  if (phase === 'day_discussion' && (g.players || []).some(isBot)) {
+    scheduleBotDay(gameId, g);
+    scheduleBotChat(gameId, g);   // muhokama jim o'tmasin
+  }
 }
 
 async function onPhaseEnd(gameId, phase) {
@@ -2736,11 +3017,13 @@ async function onPhaseEnd(gameId, phase) {
           // 🗣️ Oxirgi so'z — chiqarilgan o'yinchi day_results davomida bitta ochiq xabar yozadi
           g.lastWordSid = p.socketId;
           io.to(p.socketId).emit('your_last_word', {});
+          if (isBot(p)) scheduleBotLastWord(gameId, p.socketId);
           // 🧞‍♂️ Afsungar ovozda o'ldirilsa — qurbonni O'ZI tanlaydi (ROLES.md).
           // Tanlov day_results davomida beriladi; tanlamasa hech kim o'lmaydi.
           if (p.role === 'afsungar' && g.players.some(x => x.isAlive && x.socketId !== p.socketId)) {
             g.revenge = { by: p.socketId, username: p.username, target: null };
             revengeWindow = true;
+            if (isBot(p)) scheduleBotRevenge(gameId, p.socketId);
             io.to(p.socketId).emit('your_revenge', {
               targets: g.players.filter(x => x.isAlive && x.socketId !== p.socketId)
                 .map(x => ({ socketId: x.socketId, username: x.username })),
@@ -2773,7 +3056,7 @@ async function onPhaseEnd(gameId, phase) {
     }
 
     io.to(`game:${gameId}`).emit('phase_change', {
-      phase: 'day_results', endsAt: g.phaseEndsAt, duration: d, round: g.round,
+      phase: 'day_results', endsAt: g.phaseEndsAt, duration: d, round: g.round, now: Date.now(),
       players: publicPlayers(g.players, { light: true }), message: msg, result, log: g.log
     });
     if (timers.has(gameId)) clearTimeout(timers.get(gameId));
@@ -2781,6 +3064,13 @@ async function onPhaseEnd(gameId, phase) {
 
   } else if (phase === 'night') {
     await processNight(gameId);
+  } else {
+    // ZAXIRA TARMOQ. Bu yerga tushish = fazani suradigan taymer noto'g'ri
+    // funksiyaga ulangan. Ilgari bunday holatda HECH NIMA bo'lmasdi va xona
+    // abadiy muzlab qolardi. Endi o'yin baribir davom etadi, log esa sababni
+    // topish uchun iz qoldiradi.
+    console.error(`onPhaseEnd: kutilmagan faza "${phase}" (${gameId}) — davom ettiramiz`);
+    await phaseResumer(g).fire(gameId);
   }
 }
 
@@ -3005,7 +3295,7 @@ async function processNight(gameId) {
   if (winner) return endGame(gameId, winner);
 
   io.to(`game:${gameId}`).emit('phase_change', {
-    phase: 'night_results', endsAt: g.phaseEndsAt,
+    phase: 'night_results', endsAt: g.phaseEndsAt, now: Date.now(),
     duration: dur(g, 'night_results'), round: g.round,
     players: publicPlayers(g.players, { light: true }), message: msg, result, log: g.log
   });
@@ -3087,7 +3377,7 @@ async function startNightStep(gameId, idx) {
   await saveG(gameId, g);
 
   io.to(`game:${gameId}`).emit('phase_change', {
-    phase: step.phase, endsAt, duration: d, round: g.round,
+    phase: step.phase, endsAt, duration: d, round: g.round, now: Date.now(),
     players: publicPlayers(g.players, { light: true }), log: g.log,
     present, stepNoun: step.noun,
   });
@@ -3102,14 +3392,43 @@ async function startNightStep(gameId, idx) {
     const actors = g.players.filter(p => p.isAlive && step.roles.includes(p.role));
     // uzilib qolgan odam aktyor sanalmasin — aks holda uni abadiy kutardik
     const humanActor = present && actors.some(p => !isBot(p) && p.connected !== false);
-    if (present) scheduleBotNightStep(gameId, idx);
+    if (present) scheduleBotNightStep(gameId, idx, d * 1000, actors.find(isBot));
     // Taymer HAR DOIM qo'yiladi. Ilgari roli odamda bo'lsa taymer umuman qo'yilmasdi va
     // u harakat qilmasa (yoki uzilib qolsa) o'yin abadiy muzlab qolardi.
-    const fb = humanActor ? (d * 1000) : (present ? 7000 : d * 1000);
+    //
+    // Zaxira qiymat ilgari qat'iy `7000` edi — botlar ushlagan bosqich HAR SAFAR
+    // aynan 7.000 soniyada yopilardi. Endi tasodifiy oraliq.
+    const fb = humanActor ? (d * 1000)
+      : (present ? Math.min(d * 1000, 6000 + crypto.randomInt(5000)) : d * 1000);
     timers.set(gameId, setTimeout(() => withLock(gameId, () => endNightStep(gameId, idx)), fb));
   } else {
     timers.set(gameId, setTimeout(() => withLock(gameId, () => endNightStep(gameId, idx)), d * 1000));
   }
+}
+
+// ==================== FAZANI DAVOM ETTIRISH ====================
+// Joriy fazadan kelib chiqib, o'yinni SURADIGAN funksiyani beradi.
+//
+// NEGA ALOHIDA FUNKSIYA: bu mantiq ilgari faqat `recoverTimers` ichida bor edi.
+// `disconnect` esa uzilgan o'yinchini kutish uchun xonaning YAGONA faza
+// taymerini o'chirib, o'rniga HAR DOIM `onPhaseEnd(gameId, ph)` qo'yardi.
+// `onPhaseEnd` esa faqat 'day_discussion' ni biladi ('night' tarmog'i o'lik kod —
+// bunday faza umuman yo'q). Natijada 'day_results', 'night_results' va tungi
+// bosqichlarda uzilish xonani ABADIY muzlatardi: faza almashmaydi, botlar kutadi
+// va qutqaruv yo'li yo'q — o'yinchi qaytib kelsa ham (cancelAbandonCheck ishlaydi).
+function phaseResumer(g) {
+  const phase = g?.phase;
+  const step = nightStepByPhase(phase);
+  if (step) {
+    let idx = Number.isInteger(g.nightStep) ? g.nightStep : NIGHT_STEPS.indexOf(step);
+    if (idx < 0) idx = 0;
+    return { step, idx, fire: (gameId) => endNightStep(gameId, idx) };
+  }
+  if (phase === 'day_discussion') return { step: null, idx: -1, fire: (gameId) => onPhaseEnd(gameId, 'day_discussion') };
+  if (phase === 'day_results')   return { step: null, idx: -1, fire: (gameId) => startNight(gameId) };
+  if (phase === 'night_results') return { step: null, idx: -1, fire: (gameId) => startPhase(gameId, 'day_discussion') };
+  // noma'lum yoki eski format — kunduzdan davom ettiramiz (muzlab qolgandan yaxshiroq)
+  return { step: null, idx: -1, fire: (gameId) => startPhase(gameId, 'day_discussion') };
 }
 
 // bosqichni yakunlab keyingisiga o'tadi (vaqt tugaganda yoki rol harakat qilganda)
@@ -3136,7 +3455,13 @@ function scheduleBotJoins(gameId, bots, fast = false) {
   for (const bot of bots) {
     // `fast` — odam lobbidan shu xonaga kirib kelmoqda: u ko'rgan xona
     // deyarli to'la edi, demak botlar ham darhol joyida bo'lishi kerak.
-    delay += fast ? 400 + crypto.randomInt(1200) : 2000 + crypto.randomInt(7000);
+    // Odamlar bittalab, TENG oraliqda kirmaydi: ba'zan ikkitasi deyarli birga
+    // keladi, ba'zan uzoq pauza bo'ladi. Ilgari oraliq har doim 2-9 soniya edi
+    // va hech qachon ikkita "o'yinchi" birga kirmasdi — bu ham naqsh edi.
+    const together = crypto.randomInt(100) < 22;
+    delay += fast
+      ? (together ? 120 + crypto.randomInt(320) : 400 + crypto.randomInt(1200))
+      : (together ? 250 + crypto.randomInt(900) : 1800 + crypto.randomInt(7500));
     timers.push(setTimeout(() => withLock(gameId, async () => {
       const g = await getG(gameId);
       // O'yin boshlangan, xona o'chirilgan yoki to'lgan bo'lsa — qo'shmaymiz.
@@ -3151,8 +3476,10 @@ function scheduleBotJoins(gameId, bots, fast = false) {
       // botlar ham oddiy o'yinchi sifatida tushadi.
       if (!Array.isArray(g.everPlayers)) g.everPlayers = [];
       if (!g.everPlayers.includes(bot.username)) g.everPlayers.push(bot.username);
-      await saveG(gameId, g);
+      // logEvent saveG dan OLDIN: aks holda yozuv Redis'ga tushmas va lobbi
+      // lentasi (lobbyEvents) baribir bo'sh qolardi.
       logEvent(g, '👋', `${bot.username} o'yinga qo'shildi`, 'playerJoined', { name: bot.username });
+      await saveG(gameId, g);
       io.to(`game:${gameId}`).emit('game_state', publicGame(g));
       tgRoomTouch(gameId);   // guruhdagi e'londa o'yinchilar soni yangilanadi
 
@@ -3166,6 +3493,25 @@ function scheduleBotJoins(gameId, bots, fast = false) {
         armBotStart(gameId, 5000 + crypto.randomInt(5000));
       }
     }), delay));
+  }
+  // ~35% xonada bitta "o'yinchi" kirib, keyin fikridan qaytib chiqib ketadi.
+  // Ilgari bot HECH QACHON chiqmasdi — xonaga kirgan hamma oxirigacha qolardi.
+  // Jonli lobbida bunday bo'lmaydi va "hech kim chiqmaydigan xona" ham naqsh edi.
+  if (!fast && bots.length > 2 && crypto.randomInt(100) < 35) {
+    timers.push(setTimeout(() => { withLock(gameId, async () => {
+      const g = await getG(gameId);
+      if (!g || g.status !== 'waiting') return;
+      const cand = (g.players || []).filter(isBot);
+      // Xona minimumdan pastga tushmasin — aks holda o'yin boshlanmay qoladi
+      if (cand.length <= 1 || g.players.length <= (g.minPlayers || 5)) return;
+      const gone = cand[crypto.randomInt(cand.length)];
+      g.players = g.players.filter(p => p.socketId !== gone.socketId);
+      logEvent(g, '👋', `${gone.username} xonadan chiqdi`, 'playerLeft', { name: gone.username });
+      await saveG(gameId, g);
+      io.to(`game:${gameId}`).emit('game_state', publicGame(g));
+      io.to(`game:${gameId}`).emit('player_left', { username: gone.username });
+      tgRoomTouch(gameId);
+    }).catch(() => {}); }, delay + 3000 + crypto.randomInt(9000)));
   }
   botJoinTimers.set(gameId, timers);
 }
@@ -3340,14 +3686,22 @@ async function chainNextBotGame() {
     const dayKey = 'botgames:' + new Date(Date.now() + 5 * 3600 * 1000).toISOString().slice(0, 10);
     const done = await redis.scard(dayKey).catch(() => 0);
     if (done >= BOT_GAMES_MAX) return;
-    // Slotni band qilamiz (jadval slotlari bilan chalkashmasin: manfiy raqam)
+    // Slot xona HAQIQATAN yaratilgandan keyin band qilinadi. Ilgari avval band
+    // qilinardi va `startBotGame` xato bersa (yoki maxRooms to'lgan bo'lsa) o'sha
+    // slot kun bo'yi yo'qolardi — logda esa hech qanday iz qolmasdi.
     const mark = -Date.now();
-    await redis.sadd(dayKey, String(mark)).catch(() => {});
-    await redis.expire(dayKey, 3 * 86400).catch(() => {});
     // 2-6 daqiqa tanaffus: xona tugagan zahoti yangisi chiqsa sun'iy
     // ko'rinadi, uzoq kutilsa esa lobbi bo'shab qoladi.
     const delay = (2 + Math.random() * 4) * 60000;
-    setTimeout(() => { startBotGame().catch(() => {}); }, delay);
+    setTimeout(() => {
+      startBotGame()
+        .then(async (id) => {
+          if (!id) { console.warn('chainNextBotGame: xona yaratilmadi — slot band qilinmadi'); return; }
+          await redis.sadd(dayKey, String(mark)).catch(() => {});
+          await redis.expire(dayKey, 3 * 86400).catch(() => {});
+        })
+        .catch((e) => console.error('chainNextBotGame/start:', e?.stack || e));
+    }, delay);
     console.log(`\u{1F501} yangi bot xonasi ${Math.round(delay / 60000)} daqiqadan keyin`);
   } catch (e) {
     console.error('chainNextBotGame:', e.message);
@@ -3375,7 +3729,6 @@ async function botGameTick() {
 }
 function isBot(p) { return p && p.isBot === true; }
 const clamp01 = (v) => (Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0.7);
-function botDelayMs() { return 2000 + Math.floor(Math.random() * 2500); } // 2.0–4.5s
 function pickRandom(arr) { return arr.length ? arr[Math.floor(Math.random() * arr.length)] : null; }
 
 // barcha rollardan bittadan (botlar bilan o'ynash) — 11 maxsus + 1 civil = 12 o'yinchi
@@ -3384,6 +3737,25 @@ function allRolesConfig() {
   for (const r of SELECTABLE_ROLES) cfg[r] = 1;
   cfg.civil = 1;
   return cfg;
+}
+
+// Xonaga kirgan odam bilan BIR XIL taxallusli botni qayta nomlaydi.
+//
+// `makeFillerBots` faqat xona egasining taxallusini chetlab o'tadi; keyin
+// kirgan odam bot bilan bir xil nomda bo'lib qolishi mumkin edi. Mijoz esa
+// o'yinchini ISM bo'yicha ko'rsatadi — ikkita bir xil nom xonada chalkashlik
+// va ochiq soxtalik belgisi bo'lardi.
+function renameClashingBots(g, username) {
+  const low = String(username || '').trim().toLowerCase();
+  if (!low) return;
+  for (const p of g.players || []) {
+    if (!isBot(p) || String(p.username).toLowerCase() !== low) continue;
+    const used = new Set((g.players || []).map(x => String(x.username).toLowerCase()));
+    const free = BOT_NAMES.filter(n => !used.has(n.toLowerCase()));
+    p.username = free.length
+      ? free[crypto.randomInt(free.length)]
+      : 'mafia' + crypto.randomInt(1000, 9999);
+  }
 }
 
 // o'yinni boshlash (start_game va botlar avto-boshlash uchun umumiy)
@@ -3398,7 +3770,18 @@ async function beginGame(gameId) {
   // Qaysi rollar o'yinda ekani HAMMAGA ochiq (klassik mafiyada host e'lon qilganidek).
   // Busiz ham tungi bosqichlarning tezligidan bilinardi — ochiq qilib adolatli qilamiz.
   g.roleSetup = g.players.reduce((acc, p) => { acc[p.role] = (acc[p.role] || 0) + 1; return acc; }, {});
-  for (const p of g.players) { p.items = await loadUserItems(p.userId); p.shieldActive = false; }
+  // Buyumlar BITTA so'rovda olinadi. Ilgari har o'yinchi uchun alohida
+  // `loadUserItems` chaqirilardi — 12 kishilik xonada 12 ta KETMA-KET so'rov,
+  // va o'yin boshlanishi shuncha kechikardi.
+  const itemIds = g.players.filter(p => isRealUser(p.userId)).map(p => p.userId);
+  const itemRows = itemIds.length
+    ? await prisma.user.findMany({ where: { id: { in: itemIds } }, select: { id: true, items: true } }).catch(() => [])
+    : [];
+  const itemsById = new Map(itemRows.map(r => [r.id, normItems(r.items)]));
+  for (const p of g.players) {
+    p.items = itemsById.get(p.userId) || { shield: 0, lupa: 0, life: 0 };
+    p.shieldActive = false;
+  }
   logEvent(g, '🎭', 'O\'yin boshlandi — rollar tarqatildi', 'gameStarted');
   // DIQQAT: `startedAt` HOLATGA ham yoziladi, faqat bazaga emas.
   // Ilgari u faqat Postgres'da bo'lardi va Redis'dagi `g.startedAt`
@@ -3420,9 +3803,202 @@ async function beginGame(gameId) {
   timers.set(gameId, setTimeout(() => withLock(gameId, () => startPhase(gameId, 'day_discussion')), 5000));
 }
 
-// tungi bosqichda botlar harakatini rejalashtiradi (2–4.5s kechikish bilan)
-function scheduleBotNightStep(gameId, idx) {
-  setTimeout(() => withLock(gameId, () => runBotNightStep(gameId, idx)), botDelayMs());
+// Tungi bosqichda bot harakatini rejalashtiradi.
+//
+// Kechikish botning XARAKTERIGA va bosqich uzunligiga bog'liq. Ilgari
+// `botDelayMs()` — 2.0-4.5 s — barcha rollar, barcha tunlar va barcha botlar
+// uchun bitta tor oyna berardi. Natijada mijoz 20-25 soniyalik hisoblagich
+// ko'rsatardi, bosqich esa HAR SAFAR o'sha hisoblagichning 10-22% ida yopilardi:
+// progress-bar aynan bir joyda o'lardi va tun ~145 soniya o'rniga ~20 soniyada
+// o'tardi. Bu bot ekanini ko'rsatadigan eng aniq naqshlardan biri edi.
+function scheduleBotNightStep(gameId, idx, stepMs = 20000, actor = null) {
+  let persona = actor?.persona;
+  if (actor && !persona) persona = actor.persona = makePersona(actor.userId || actor.socketId);
+  const delay = nightDelayMs(persona || makePersona(gameId + ':' + idx), stepMs);
+  const t = setTimeout(() => { withLock(gameId, () => runBotNightStep(gameId, idx)).catch(() => {}); }, delay);
+  t.unref?.();
+}
+
+// ==================== BOTLARNING GAPI ====================
+// Ilgari botlar o'yin davomida chatda BIR OG'IZ ham gapirmasdi: `botSay` butun
+// serverda faqat bitta joyda — kutish xonasidagi "goo" javobida — chaqirilardi.
+// Natijada 12 "o'yinchi" ovoz taxtasida faol harakat qilib turardi, chat esa
+// mutlaqo jim edi: birorta ayblov, bahs, "men komissarman" yo'q. Mafiya
+// o'yinida bunday bo'lishi mumkin emas.
+//
+// Qaror `chooseChatAct` da (bot-ai.js) — ovoz berish bilan AYNI manbadan
+// (ochiq shubha ballari). Ya'ni bot aytgan gap uning keyingi ovoziga mos keladi.
+function scheduleBotChat(gameId, g) {
+  const phaseMs = dur(g, 'day_discussion') * 1000;
+  const bots = (g.players || []).filter(p => p.isAlive && isBot(p));
+  if (!bots.length || phaseMs < 15000) return;
+  // Har raundda 2-5 bot gapiradi — hammasi emas. Jonli xonada ham har
+  // muhokamada hamma yozmaydi, va "hamma har raund gapiradi" ham naqsh bo'lardi.
+  const order = bots.slice();
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(i + 1);
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+  const speakers = order.slice(0, Math.min(order.length, 2 + crypto.randomInt(4)));
+  // Vaqtlar faza bo'ylab TARQOQ va kamida 2.6 s oraliq bilan: ikki xabar bir
+  // vaqtda chiqsa bu ham darhol ko'zga tashlanadi.
+  //
+  // DIQQAT: xabar yozilishiga ham vaqt ketadi (typingMs, 0.9-12 s) — shuning
+  // uchun oxirgi slot faza tugashidan kamida TYPING_MAX oldin bo'lishi kerak,
+  // aks holda gap keyingi fazada (masalan tunda) chiqib qolardi.
+  const TYPING_MAX = 12000;
+  const from = 3000;
+  const last = phaseMs - TYPING_MAX - 2000;
+  if (last <= from) return;
+  const to = Math.max(from + 3000, last);
+  const slots = speakers.map(() => from + crypto.randomInt(to - from)).sort((a, b) => a - b);
+  for (let i = 1; i < slots.length; i++) {
+    if (slots[i] - slots[i - 1] < 2600) slots[i] = slots[i - 1] + 2600 + crypto.randomInt(1800);
+  }
+  speakers.forEach((bot, i) => {
+    if (slots[i] > last) return;
+    const t = setTimeout(() => { withLock(gameId, () => botTalkOnce(gameId, bot.socketId)).catch(() => {}); }, slots[i]);
+    t.unref?.();
+  });
+}
+
+// Bitta bot bitta gap yozadi.
+async function botTalkOnce(gameId, botSid) {
+  const g = await getG(gameId);
+  if (!g || g.status !== 'playing' || g.phase !== 'day_discussion') return;
+  const bot = (g.players || []).find(p => p.socketId === botSid);
+  if (!isBot(bot) || !bot.isAlive) return;
+
+  const act = chooseChatAct(botCtx(g, bot));
+  if (!act) return;
+  const tgt = act.targetSid ? g.players.find(p => p.socketId === act.targetSid) : null;
+  if (act.targetSid && !tgt) return;
+
+  bot.mem = bot.mem || {};
+  // Takror gap bot ekanini darhol oshkor qiladi — oxirgi 10 ta ibora eslanadi
+  const line = botChatLine(act.kind, { n: tgt?.username }, bot.mem.said || []);
+  if (!line) return;
+  bot.mem.said = [...(bot.mem.said || []), line.key].slice(-10);
+  // Komissar bir xil odamni qayta-qayta e'lon qilmaydi
+  if (act.kind === 'claim' && act.targetSid) {
+    bot.mem.claimedSids = [...(bot.mem.claimedSids || []), act.targetSid];
+  }
+  await saveG(gameId, g);
+
+  // "Yozib turish" vaqti: uzunroq gap uzoqroq yoziladi. Bir zumda paydo
+  // bo'lgan 24 belgili xabar odam yozgan bo'lishi mumkin emas.
+  //
+  // Yuborishdan OLDIN faza qayta tekshiriladi: yozish 12 soniyagacha davom
+  // etishi mumkin va shu orada kunduz yopilib ulgurishi mumkin. Kunduzgi
+  // ochiq gap tunda chiqib qolsa — bu darhol ko'zga tashlanadigan xato.
+  const sid = bot.socketId;
+  const t = setTimeout(() => {
+    getG(gameId)
+      .then((fresh) => {
+        if (!fresh || fresh.status !== 'playing' || fresh.phase !== 'day_discussion') return;
+        const still = (fresh.players || []).find((x) => x.socketId === sid);
+        if (!still || !still.isAlive) return;
+        return botSay(gameId, still, line.text);
+      })
+      .catch(() => {});
+  }, typingMs(line.text));
+  t.unref?.();
+}
+
+// Chiqarilgan BOT ham oxirgi so'zini yozadi. Ilgari faqat odam yozardi va
+// bot chiqarilgan har raundda o'sha o'rin bo'sh — takrorlanadigan jimlik — edi.
+function scheduleBotLastWord(gameId, sid) {
+  const t = setTimeout(() => { withLock(gameId, async () => {
+    const g = await getG(gameId);
+    if (!g || g.lastWordSid !== sid || g.phase !== 'day_results') return;
+    const bot = g.players.find(p => p.socketId === sid);
+    if (!isBot(bot)) return;
+    delete g.lastWordSid;
+    bot.mem = bot.mem || {};
+    const line = botChatLine('lastWord', {}, bot.mem.said || []);
+    if (line) bot.mem.said = [...(bot.mem.said || []), line.key].slice(-10);
+    await saveG(gameId, g);
+    if (!line) return;
+    const payload = {
+      username: bot.username, message: line.text, channel: 'public',
+      isAlive: false, lastWord: true, timestamp: Date.now(),
+    };
+    try {
+      const ck = `chat:${gameId}`;
+      await redis.rpush(ck, JSON.stringify(payload));
+      await redis.ltrim(ck, -200, -1);
+      await redis.expire(ck, 86400);
+    } catch {}
+    io.to(`game:${gameId}`).emit('chat_message', payload);
+  }).catch(() => {}); }, 1500 + crypto.randomInt(3000));
+  t.unref?.();
+}
+
+// Bot Afsungar ham qasos oladi. Ilgari faqat odam tanlay olardi: bot Afsungar
+// chiqarilsa o'yin "qasos tanlanmoqda" deb 15 soniyaga muzlab turardi va keyin
+// har safar "qasos olmadi" deb yozardi — takrorlanuvchi va ochiq bot belgisi.
+function scheduleBotRevenge(gameId, sid) {
+  const t = setTimeout(() => { withLock(gameId, async () => {
+    const g = await getG(gameId);
+    if (!g || !g.revenge || g.revenge.by !== sid || g.revenge.target) return;
+    const bot = g.players.find(p => p.socketId === sid);
+    if (!isBot(bot)) return;
+    const pool = g.players.filter(x => x.isAlive && x.socketId !== sid);
+    if (!pool.length) return;
+    // Eng shubhali odamni olib ketadi — odam ham shunday qiladi
+    const sus = buildSuspicion(g.botEvents || [], g.players);
+    const cand = pool.map(x => ({ v: x.socketId, w: 1 + (sus[x.socketId] || 0) * 2 }));
+    g.revenge.target = weightedPick(cand) || pool[crypto.randomInt(pool.length)].socketId;
+    await saveG(gameId, g);
+  }).catch(() => {}); }, 3000 + crypto.randomInt(6000));
+  t.unref?.();
+}
+
+// Bot mafiya sheriklari ODAMNING tanloviga qo'shiladi.
+//
+// Ilgari bu faqat `g.vsBots` xonasida ishlardi. Oddiy xonada va botlarning
+// o'zaro o'yinlarida `vsBots` qo'yilmaydi, shuning uchun `runBotNightStep`
+// dagi `if (humanActor) return` bilan birga natija shunday bo'lardi: odam
+// mafiya bo'lsa (mafiya ~30%, ya'ni har uchinchi o'yin) sheriklari HECH QACHON
+// nishon tanlamaydi. Kelishuv paneli har kecha bo'sh turadi va
+// `nightStepComplete` hech qachon rost bo'lmay, night_mafia har tunda to'liq
+// 25 soniyani yondiradi — boshqa bosqichlar bir necha soniyada o'tayotganda.
+function scheduleBotMafiaFollow(gameId, targetSid) {
+  // Darhol emas va hammasi birga emas: sherik ham "o'ylab" turadi.
+  for (let i = 0; i < 4; i++) {
+    const t = setTimeout(() => { withLock(gameId, async () => {
+      const g = await getG(gameId);
+      if (!g || g.status !== 'playing') return;
+      const step = nightStepByPhase(g.phase);
+      if (!step || step.phase !== 'night_mafia') return;
+      const tgt = g.players.find(p => p.socketId === targetSid);
+      if (!tgt || !tgt.isAlive || sideOf(tgt.role) === 'mafia') return;
+      const na = g.nightActions = g.nightActions || {};
+      na.mafiaVotes = na.mafiaVotes || {};
+      const waiting = g.players.filter(p =>
+        p.isAlive && isBot(p) && MAFIA_VOTERS.includes(p.role) && !na.mafiaVotes[p.socketId]);
+      if (!waiting.length) return;
+      na.mafiaVotes[waiting[0].socketId] = targetSid;
+      await saveG(gameId, g);
+      emitMafiaVotes(gameId, g);
+      if (nightStepComplete(g, step)) await endNightStep(gameId, g.nightStep);
+    }).catch(() => {}); }, 1500 + i * (1200 + crypto.randomInt(2200)));
+    t.unref?.();
+  }
+}
+
+// Mafiya kelishuv panelini yangilaydi (botlar ham qo'shilgani ko'rinsin).
+function emitMafiaVotes(gameId, g) {
+  const na = g.nightActions || {};
+  const view = {};
+  for (const m of g.players.filter(p => p.isAlive && MAFIA_VOTERS.includes(p.role))) {
+    const sid = (na.mafiaVotes || {})[m.socketId];
+    const tgt = sid ? g.players.find(p => p.socketId === sid) : null;
+    view[m.username] = tgt ? tgt.username : null;
+  }
+  for (const m of g.players.filter(p => p.isAlive && sideOf(p.role) === 'mafia' && !isBot(p))) {
+    io.to(m.socketId).emit('mafia_vote_update', { votes: view });
+  }
 }
 // Bot uchun qaror konteksti. Botga FAQAT o'yinchi ko'radigan ma'lumot beriladi
 // (ochiq tarix + o'z roli + mafiya sheriklari), shuning uchun u "aldamaydi".
@@ -3433,6 +4009,10 @@ function botCtx(g, bot) {
     : [];
   if (!bot.persona) bot.persona = makePersona(bot.userId || bot.socketId);
   if (!bot.mem) bot.mem = {};
+  // "O'zini davolash huquqi sarflangan" belgisi. Server bu qoidani (ROLES.md)
+  // faqat ODAM doktorga qo'llardi — bot `na.doctor` ni to'g'ridan-to'g'ri
+  // yozgani uchun uni chetlab o'tardi va o'zini cheksiz davolay olardi.
+  bot.mem.selfHeal = bot.roleData?.selfHeal === true;
   return {
     me: { socketId: bot.socketId, role: bot.role },
     role: bot.role,
@@ -3578,7 +4158,10 @@ async function recordStats(g, winner) {
   const botCount = g.players.filter((p) => !isRealUser(p.userId)).length;
   const totalRating = ids.reduce((s, id) => s + ratingOf(id), 0) + botCount * RATING_START;
 
-  for (const p of real) {
+  // O'yinchilar PARALLEL yoziladi: ilgari 12 kishilik xonada har biri uchun
+  // ketma-ket 4-5 ta so'rov bajarilardi va natija ekrani shular tugaguncha
+  // kutib turardi.
+  await Promise.all(real.map(async (p) => {
     const won = isWinner(p.role, winner, p.isAlive);
     const reward = won ? ECONOMY.winReward : ECONOMY.loseReward;
     const prev = statsById.get(p.userId);
@@ -3626,17 +4209,22 @@ async function recordStats(g, winner) {
           rating: nextRating, ratingDelta: delta, tier: tierOf(nextRating),
         });
       }
-      // 🪙 tanga mukofoti + o'yin tarixi
-      await prisma.user.update({ where: { id: p.userId }, data: { coins: { increment: reward } } });
-      await prisma.gameHistory.create({
-        data: { userId: p.userId, gameId: g.id, role: p.role || 'civil', won, winner: winner || '', coins: reward }
-      });
-      await logActivity(p.userId, 'coin_earn', { amount: reward, gameId: g.id, detail: `${won ? 'G\'alaba' : 'Mag\'lubiyat'} — ${roleName(p.role)}` });
-      // tirik klientga yangi tanga balansini yuboramiz
-      const fresh = await prisma.user.findUnique({ where: { id: p.userId }, select: { coins: true } }).catch(() => null);
-      if (fresh && p.socketId) io.to(p.socketId).emit('coins_update', { coins: fresh.coins, reward });
-    } catch {}
-  }
+      // 🪙 tanga mukofoti + o'yin tarixi — uchtasi PARALLEL, va yangi balans
+      // update natijasidan olinadi (ilgari qo'shimcha findUnique so'rovi bor edi).
+      const [updated] = await Promise.all([
+        prisma.user.update({ where: { id: p.userId }, data: { coins: { increment: reward } }, select: { coins: true } }),
+        prisma.gameHistory.create({
+          data: { userId: p.userId, gameId: g.id, role: p.role || 'civil', won, winner: winner || '', coins: reward },
+        }),
+        logActivity(p.userId, 'coin_earn', { amount: reward, gameId: g.id, detail: `${won ? 'G\'alaba' : 'Mag\'lubiyat'} — ${roleName(p.role)}` }),
+      ]);
+      if (updated && p.socketId) io.to(p.socketId).emit('coins_update', { coins: updated.coins, reward });
+    } catch (e) {
+      // Ilgari bo'sh `catch {}` edi: reyting/tanga jimgina yozilmay qolardi va
+      // logda hech qanday iz qolmasdi — shikoyat kelganda sababni topib bo'lmasdi.
+      console.error('recordStats:', p.userId, e?.stack || e);
+    }
+  }));
 }
 
 function winnerMessage(w) {
@@ -3668,6 +4256,12 @@ async function endGame(gameId, winner) {
     message: winnerMessage(winner)
   });
   if (timers.has(gameId)) { clearTimeout(timers.get(gameId)); timers.delete(gameId); }
+  for (const p of g.players || []) {
+    BOT_PING_HIST.delete(p.socketId);            // xotira sizmasin
+    if (!isBot(p) && p.userId) userRooms.delete(p.userId);
+  }
+  voiceCtx.delete(gameId);
+  gameBots.delete(gameId);
   cancelAbandonCheck(gameId);
   cancelEmptyCheck(gameId);
   cancelBotJoins(gameId);   // qo'shilishni kutayotgan botlar endi kerak emas
@@ -3678,6 +4272,15 @@ async function endGame(gameId, winner) {
 // ==================== SOCKET.IO ====================
 
 const socketData = new Map();
+// userId -> gameId. Bir foydalanuvchi bir vaqtda FAQAT bitta o'yinda bo'ladi.
+//
+// Ilgari cheklov yo'q edi va ikki oqibati bor edi:
+//   1) eski xonalarda "arvoh" o'yinchi abadiy qolardi — xona hech qachon
+//      o'chmasdi va `maxRooms` chegarasi to'lib borardi;
+//   2) buyumlar (qalqon/lupa/jon) `beginGame` da har xonaga ALOHIDA
+//      yuklanadi, ya'ni bitta qalqonni ikki xonada parallel ishlatib
+//      ikkilantirish mumkin edi.
+const userRooms = new Map();
 
 // ==================== PING (ulanish sifati) ====================
 // Ping SERVERDA o'lchanadi, mijoz o'zi xabar qilmaydi: past ping "yaxshi
@@ -3700,6 +4303,12 @@ const PING_TIMEOUT = 2500;   // javob kelmasa oldingi qiymat saqlanadi
 // sakrash edi va ekranda "ping ko'tarilib ketdi" bo'lib ko'rinardi.)
 const PING_HIST = new Map();  // socketId -> so'nggi namunalar
 const PING_WINDOW = 5;
+// Botlar uchun ALOHIDA oyna. Bot pingi ham xuddi odamniki kabi hisoblanishi
+// kerak (oxirgi 5 namunaning minimumi) — aks holda taqsimot TESKARI naqsh
+// beradi: bot raqami har 3 soniyada sakraydi, haqiqiy o'yinchiniki esa
+// (minimum olingani uchun) deyarli qotib turadi. Ya'ni "tebranib turgan
+// ping = bot" degan oddiy qoida ishlab ketardi.
+const BOT_PING_HIST = new Map();
 
 function probePing(socket) {
   return new Promise((resolve) => {
@@ -3761,14 +4370,15 @@ async function pingCycle() {
     // "pingsiz o'yinchi" — bu bot degan eng aniq belgi bo'lardi.
     // Qiymat har o'lchashda biroz tebranadi (fakePing), xuddi haqiqiy tarmoq kabi.
     for (const [gameId, map] of byGame) {
-      const g = await getG(gameId).catch(() => null);
-      if (g) {
-        for (const p of g.players || []) {
-          if (!isBot(p) || p.isAlive === false) continue;
-          if (!p.persona) p.persona = makePersona(p.userId || p.socketId);
-          map[p.socketId] = fakePing(p.persona);
-          trByGame.get(gameId)[p.socketId] = 'websocket';
-        }
+      // Botlar ro'yxati XOTIRADAN olinadi (saveG da yangilanadi) — ilgari bu
+      // yerda har xona uchun to'liq holat Redis'dan o'qilib parse qilinardi.
+      for (const b of gameBots.get(gameId) || []) {
+        const hist = BOT_PING_HIST.get(b.socketId) || [];
+        hist.push(fakePing(b.persona));
+        if (hist.length > PING_WINDOW) hist.shift();
+        BOT_PING_HIST.set(b.socketId, hist);
+        map[b.socketId] = Math.min(...hist);
+        trByGame.get(gameId)[b.socketId] = 'websocket';
       }
       io.to(`game:${gameId}`).emit('ping_update', { ping: map, transport: trByGame.get(gameId) });
     }
@@ -3877,6 +4487,15 @@ function clearIdle(socket) {
   if (socket?.data?.idleTimer) { clearTimeout(socket.data.idleTimer); socket.data.idleTimer = null; }
 }
 // har socket uchun: umumiy flood + event bo'yicha cheklov. Ruxsat bo'lsa true.
+// Socket FAQAT bitta o'yin xonasida qoladi. Ilgari eski xonadan chiqarilmasdi:
+// bitta socket bir necha xonaning `game_state` oqimini olib turardi.
+function joinRoomOnly(socket, key) {
+  for (const r of socket.rooms) {
+    if (r !== socket.id && r !== key && String(r).startsWith('game:')) socket.leave(r);
+  }
+  socket.join(key);
+}
+
 function guard(socket, key, max, windowMs) {
   const d = socket.data; const now = Date.now();
   // umumiy flood (sekundiga) — chegaradan oshsa socketni uzamiz
@@ -3981,7 +4600,25 @@ io.on('connection', (socket) => {
   }, IDLE_SOCKET_MS);
   socket.data.idleTimer.unref?.();
 
-  socket.on('join_game', ({ gameId, userId, username } = {}) => withLock(gameId, async () => {
+  // ==================== XAVFSIZ ISHLOVCHI ====================
+  // socket.io ishlovchini process.nextTick ichida chaqiradi va QAYTGAN
+  // promise'ni kuzatmaydi. Shu sababli `socket.on('x', () => withLock(...))`
+  // shaklidagi ishlovchida xato bo'lsa u `unhandledRejection` ga aylanardi —
+  // `onFatal` esa bir daqiqada 10 ta shunday xatodan keyin YAGONA instansiyani
+  // o'chirib yuboradi (barcha jonli o'yinlar bilan birga). Amalda buning uchun
+  // Redis'ning 10 soniyalik uzilishi yoki noto'g'ri `gameId` yuborilgan bir
+  // nechta chat xabari kifoya edi.
+  //
+  // Endi HAR BIR ishlovchi shu o'ramdan o'tadi: xato loglanadi va shu yerda
+  // qoladi. Yangi hodisa qo'shilganda ham esdan chiqmaydi.
+  const sOn = (event, fn) => socket.on(event, (...args) => {
+    try {
+      const r = fn(...args);
+      if (r && typeof r.catch === 'function') r.catch((e) => console.error(`socket/${event}:`, e?.stack || e));
+    } catch (e) { console.error(`socket/${event}:`, e?.stack || e); }
+  });
+
+  sOn('join_game', ({ gameId, userId, username } = {}) => withLock(gameId, async () => {
     try {
       if (!guard(socket, 'join', 10, 5000)) return;
       // faqat haqiqiy (Google-tasdiqlangan) foydalanuvchilar — anonim/guest flood yo'q
@@ -4002,6 +4639,32 @@ io.on('connection', (socket) => {
       const key = `game:${gameId}`;
       const g = await getG(gameId);
       if (!g) { socket.emit('game_error', { code: 'notFound', message: 'O\'yin topilmadi yoki tugagan' }); return; }
+
+      // ===== BIR VAQTDA FAQAT BITTA O'YIN =====
+      const prevId = userRooms.get(userId);
+      if (prevId && prevId !== gameId) {
+        const prev = await getG(prevId).catch(() => null);
+        const there = prev?.players?.find(p => p.userId === userId);
+        if (prev && prev.status === 'playing' && there && there.isAlive !== false) {
+          socket.emit('game_error', { code: 'alreadyInGame', message: 'Siz boshqa o\'yindasiz — avval o\'sha o\'yinni tugating' });
+          return;
+        }
+        if (prev && prev.status === 'waiting' && there) {
+          // Kutayotgan xonadan jimgina chiqaramiz (boshqa qulf — deadlock yo'q)
+          await withLock(prevId, async () => {
+            const fresh = await getG(prevId);
+            if (!fresh) return;
+            fresh.players = (fresh.players || []).filter(p => p.userId !== userId);
+            logEvent(fresh, '\u{1F44B}', `${there.username} xonadan chiqdi`, 'playerLeft', { name: there.username });
+            await saveG(prevId, fresh);
+            io.to(`game:${prevId}`).emit('game_state', publicGame(fresh));
+            io.to(`game:${prevId}`).emit('player_left', { username: there.username });
+            if (!(fresh.players || []).some(p => !isBot(p))) scheduleEmptyCheck(prevId);
+          }).catch(() => {});
+        }
+        userRooms.delete(userId);
+      }
+      userRooms.set(userId, gameId);
       if (!g.players) g.players = [];
       // botlar o'yiniga qaytib kelindi — o'chirish taymerini bekor qilamiz
       if (botDeleteTimers.has(gameId)) { clearTimeout(botDeleteTimers.get(gameId)); botDeleteTimers.delete(gameId); }
@@ -4018,7 +4681,7 @@ io.on('connection', (socket) => {
           existing.socketId = socket.id;
           existing.connected = true;
           clearIdle(socket); pingSoon(); socketData.set(socket.id, { userId, username: existing.username, gameId });
-          socket.join(key);
+          joinRoomOnly(socket, key);
           await saveG(gameId, g);
           socket.emit('game_state', publicGame(g));
           socket.emit('your_role', { role: existing.role });
@@ -4030,7 +4693,7 @@ io.on('connection', (socket) => {
           if (g.phaseEndsAt && g.status === 'playing') {
             const step = nightStepByPhase(g.phase);
             socket.emit('phase_change', {
-              phase: g.phase, endsAt: g.phaseEndsAt,
+              phase: g.phase, endsAt: g.phaseEndsAt, now: Date.now(),
               duration: (step ? dur(g, step.dur) : dur(g, g.phase)) || 0, round: g.round,
               players: publicPlayers(g.players, { light: true }),
               present: step ? (g.nightPresent !== false) : undefined,
@@ -4059,7 +4722,7 @@ io.on('connection', (socket) => {
         existing.socketId = socket.id;
         existing.connected = true;
         clearIdle(socket); pingSoon(); socketData.set(socket.id, { userId, username: existing.username, gameId });
-        socket.join(key);
+        joinRoomOnly(socket, key);
         await saveG(gameId, g);
         socket.emit('game_state', publicGame(g));
         io.to(key).emit('game_state', publicGame(g));
@@ -4074,6 +4737,7 @@ io.on('connection', (socket) => {
         return;
       }
 
+      renameClashingBots(g, username);   // bot bilan bir xil nom qolmasin
       const isHost = g.hostId && g.hostId === userId;
       let avatar = null;
       let verified = false;
@@ -4099,7 +4763,7 @@ io.on('connection', (socket) => {
       if (!g.everPlayers.includes(player.username)) g.everPlayers.push(player.username);
       await saveG(gameId, g);
       clearIdle(socket); pingSoon(); socketData.set(socket.id, { userId: player.userId, username: player.username, gameId });
-      socket.join(key);
+      joinRoomOnly(socket, key);
 
       io.to(key).emit('game_state', publicGame(g));
       io.to(key).emit('player_joined', { username: player.username, total: g.players.length });
@@ -4127,7 +4791,7 @@ io.on('connection', (socket) => {
     }
   }));
 
-  socket.on('start_game', ({ gameId } = {}) => withLock(gameId, async () => {
+  sOn('start_game', ({ gameId } = {}) => withLock(gameId, async () => {
     try {
       if (!guard(socket, 'start', 5, 5000)) return;
       const g = await getG(gameId);
@@ -4146,7 +4810,7 @@ io.on('connection', (socket) => {
     } catch (e) { console.error('start_game:', e); }
   }));
 
-  socket.on('day_vote', ({ gameId, targetSocketId } = {}) => withLock(gameId, async () => {
+  sOn('day_vote', ({ gameId, targetSocketId } = {}) => withLock(gameId, async () => {
     try {
       if (!guard(socket, 'vote', 20, 5000)) return;
       const g = await getG(gameId);
@@ -4180,7 +4844,7 @@ io.on('connection', (socket) => {
     } catch (e) { console.error('day_vote:', e); }
   }));
 
-  socket.on('night_action', ({ gameId, targetSocketId, actionType } = {}) => withLock(gameId, async () => {
+  sOn('night_action', ({ gameId, targetSocketId, actionType } = {}) => withLock(gameId, async () => {
     try {
       if (!guard(socket, 'night', 25, 5000)) return;
       const g = await getG(gameId);
@@ -4202,21 +4866,14 @@ io.on('connection', (socket) => {
           if (!targetAlive || sideOf(target.role) === 'mafia') { socket.emit('game_error', { code: 'noMafiaTarget', message: '❌ Mafiyaga ovoz berib bo\'lmaydi' }); return; }
           if (!na.mafiaVotes) na.mafiaVotes = {};
           na.mafiaVotes[socket.id] = targetSocketId;
-          // BOTLAR REJIMI: bot mafiyalar foydalanuvchini qo'llab-quvvatlaydi (bir xil nishon)
-          if (g.vsBots) {
-            for (const b of g.players.filter(p => p.isAlive && isBot(p) && sideOf(p.role) === 'mafia')) na.mafiaVotes[b.socketId] = targetSocketId;
-          }
+          // Bot mafiya sheriklari odamning tanloviga QO'SHILADI — darhol emas,
+          // har biri o'z kechikishi bilan (scheduleBotMafiaFollow). Shart ilgari
+          // `g.vsBots` edi va oddiy xonada umuman ishlamasdi: sheriklar hech
+          // qachon nishon tanlamay, panel har kecha bo'sh turardi.
+          if ((g.players || []).some(isBot)) scheduleBotMafiaFollow(gameId, targetSocketId);
           socket.emit('action_confirmed', { code: 'mafiaVote', name: target.username, message: `🔫 Ovozingiz: ${target.username}` });
           // mafiya sheriklarga joriy ovozlarni ko'rsatamiz (kelishish uchun)
-          const mafiaVotesView = {};
-          for (const m of g.players.filter(p => p.isAlive && MAFIA_VOTERS.includes(p.role))) {
-            const tgtSid = na.mafiaVotes[m.socketId];
-            const tgt = tgtSid ? g.players.find(p => p.socketId === tgtSid) : null;
-            mafiaVotesView[m.username] = tgt ? tgt.username : null;
-          }
-          for (const m of g.players.filter(p => p.isAlive && sideOf(p.role) === 'mafia')) {
-            io.to(m.socketId).emit('mafia_vote_update', { votes: mafiaVotesView });
-          }
+          emitMafiaVotes(gameId, g);
           break;
         }
         case 'komissar': {
@@ -4295,7 +4952,7 @@ io.on('connection', (socket) => {
   }));
 
   // 🧞‍♂️ Afsungar qasosi — kunduzi chiqarilgach o'zi bilan olib ketadigan o'yinchini tanlaydi
-  socket.on('revenge_pick', ({ gameId, targetSocketId } = {}) => withLock(gameId, async () => {
+  sOn('revenge_pick', ({ gameId, targetSocketId } = {}) => withLock(gameId, async () => {
     try {
       if (!guard(socket, 'revenge', 10, 5000)) return;
       const g = await getG(gameId);
@@ -4308,7 +4965,7 @@ io.on('connection', (socket) => {
     } catch (e) { console.error('revenge_pick:', e); }
   }));
 
-  socket.on('use_item', ({ gameId, item, targetSocketId } = {}) => withLock(gameId, async () => {
+  sOn('use_item', ({ gameId, item, targetSocketId } = {}) => withLock(gameId, async () => {
     try {
       if (!guard(socket, 'item', 10, 5000)) return;
       const g = await getG(gameId);
@@ -4344,7 +5001,7 @@ io.on('connection', (socket) => {
     } catch (e) { console.error('use_item:', e); }
   }));
 
-  socket.on('chat_message', async ({ gameId, message } = {}) => {
+  sOn('chat_message', async ({ gameId, message } = {}) => {
     if (!guard(socket, 'chat', 6, 5000)) return; // ~1.2 xabar/sekund
     const data = socketData.get(socket.id);
     if (!data) return;
@@ -4353,6 +5010,37 @@ io.on('connection', (socket) => {
     const g = await getG(gameId);
     const player = g?.players.find(p => p.socketId === socket.id);
     if (!player) return;
+
+    // Xona egasi jim qildirgan o'yinchi yozolmaydi.
+    //
+    // NEGA CHIQARIB YUBORISH EMAS: o'yin boshlangach o'yinchini xonadan
+    // chiqarish rollar muvozanatini buzadi (mafiya chiqarilsa shahar
+    // avtomatik g'olib bo'ladi) — shuning uchun `kick_player` faqat
+    // kutish xonasida ishlaydi. Lekin ilgari o'yin boshlangach so'kinayotgan
+    // odamdan qutulishning UMUMAN yo'li yo'q edi: 15 daqiqa chidashdan boshqa
+    // chora qolmasdi. Jim qildirish muvozanatga tegmaydi.
+    if (g.muted?.[player.userId]) {
+      socket.emit('game_error', { code: 'muted', message: '🔇 Xona egasi sizni jim qildirdi' });
+      return;
+    }
+
+    // Tarkib tekshiruvi (validate.js — sof funksiya, testlari bor)
+    const recent = (g.chatRecent && g.chatRecent[player.userId]) || [];
+    const chk = checkChat(text, recent);
+    if (!chk.ok) {
+      const MSG = {
+        link: '🚫 Havola yuborish mumkin emas',
+        phone: '🚫 Telefon raqam yuborish mumkin emas',
+        repeat: '🚫 Bir xil xabarni takrorlamang',
+        flood: '🚫 Bunday xabar yuborib bo\'lmaydi',
+        empty: '',
+      };
+      if (MSG[chk.code]) socket.emit('game_error', { code: 'chat_' + chk.code, message: MSG[chk.code] });
+      return;
+    }
+    // Oxirgi 3 ta xabar eslanadi (takror tekshiruvi uchun)
+    g.chatRecent = g.chatRecent || {};
+    g.chatRecent[player.userId] = [...recent, text].slice(-3);
 
     // 🗣️ Oxirgi so'z — chiqarilgan o'yinchi day_results davomida bitta OCHIQ xabar yozadi.
     // Holatni o'zgartirgani uchun qulf ostida bajaramiz (aks holda bir vaqtda ketayotgan
@@ -4379,7 +5067,8 @@ io.on('connection', (socket) => {
 
     // ===== Kutish xonasida "boshlaymizmi?" =====
     // Botlar bilan to'lgan xonada odam "goo / boshla / start" deb yozsa,
-    // botlardan biri odam kabi javob beradi va 3 soniyada o'yin boshlanadi.
+    // botlardan biri odam kabi javob beradi va bir necha soniyadan keyin
+    // o'yin boshlanadi (darhol emas).
     // Javob har safar boshqa bo'ladi — bir xil javob bot ekanini oshkor
     // qiladi.
     if (g.status === 'waiting' && !isBot(player) && START_ASK.test(text)) {
@@ -4393,8 +5082,22 @@ io.on('connection', (socket) => {
         setTimeout(() => {
           botSay(gameId, bot, reply).catch(() => {});
           cancelBotStart(gameId);
-          armBotStart(gameId, 3000);
-        }, 1200 + crypto.randomInt(1600));
+          // Javobdan keyin DARHOL boshlanmaydi. Haqiqiy host "bosdim" deb
+          // yozganidan keyin ham tugmani izlab bosguncha vaqt ketadi, va
+          // xonadagilar "boshlanyapti" degan yozuvni ko'rib ulgurishi kerak.
+          // Bir zumda boshlanish — botlar borligini oshkor qiladigan birinchi
+          // belgi. 7-13 soniya shu uchun.
+          armBotStart(gameId, 7000 + crypto.randomInt(6000));
+          // Xonada "O'yin boshlanmoqda..." ko'rinsin — odam kutayotganini
+          // bilib tursin, chat ichida javob yo'qolib ketmasin.
+          withLock(gameId, async () => {
+            const fresh = await getG(gameId);
+            if (!fresh || fresh.status !== 'waiting') return;
+            logEvent(fresh, '⏳', "O'yin boshlanmoqda...", 'startingSoon');
+            await saveG(gameId, fresh);
+            io.to(`game:${gameId}`).emit('game_state', publicGame(fresh));
+          }).catch(() => {});
+        }, typingMs(reply));
       }
     }
 
@@ -4431,11 +5134,16 @@ io.on('connection', (socket) => {
   });
 
   // ===== Do'st bot-o'yiniga qo'shilish so'rovi =====
-  socket.on('request_join_bot', async ({ hostUsername, userId, username, avatar } = {}) => {
+  sOn('request_join_bot', async ({ hostUsername, userId, username, avatar } = {}) => {
     try {
       if (!guard(socket, 'joinreq', 3, 30000)) return socket.emit('bot_join_error', { message: 'Juda tez-tez so\'rov yubordingiz' });
-      // tokendan ishonchli identifikatsiya
-      if (socket.data.auth) { userId = socket.data.auth.userId; username = socket.data.auth.username; }
+      // Avtorizatsiya SHART. Ilgari token bo'lmasa `userId`/`username` MIJOZDAN
+      // olinardi: istalgan socket boshqa odamning nomidan so'rov yuborib, uni
+      // uch marta rad ettirib o'yinga kirishini butunlay bloklay olardi
+      // (g.rejects userId bo'yicha saqlanadi).
+      if (!socket.data.auth) return socket.emit('bot_join_error', { message: 'Avtorizatsiya kerak' });
+      userId = socket.data.auth.userId;
+      username = socket.data.auth.username;
       if (!hostUsername || !username) return socket.emit('bot_join_error', { message: 'Username kerak' });
       const found = await findBotGameByHost(String(hostUsername).trim());
       if (!found) return socket.emit('bot_join_error', { message: 'Bu foydalanuvchi hozir botlar bilan o\'ynamayapti' });
@@ -4463,7 +5171,7 @@ io.on('connection', (socket) => {
     } catch (e) { socket.emit('bot_join_error', { message: e.message }); }
   });
 
-  socket.on('join_response', async ({ requestId, accept } = {}) => {
+  sOn('join_response', async ({ requestId, accept } = {}) => {
     if (!guard(socket, 'joinresp', 10, 5000)) return;
     const req = pendingJoins.get(requestId);
     if (!req) return;
@@ -4471,9 +5179,19 @@ io.on('connection', (socket) => {
     await withLock(req.gameId, async () => {
       const g = await getG(req.gameId);
       if (!g) { io.to(req.requesterSocketId).emit('bot_join_error', { message: 'O\'yin tugagan' }); return; }
-      // javob beruvchi haqiqatan ham o'yin ichidagi odammi (xavfsizlik)
+      // Javob beruvchi — XONA EGASI bo'lishi shart. Ilgari faqat "o'yin
+      // ichidagi odammi" tekshirilardi: so'rov xona egasiga yuborilsa ham,
+      // xonadagi ISTALGAN odam uni tasdiqlab yoki rad etib yubora olardi
+      // (do'stini o'zi chaqirmagan holda o'yinga kiritish yoki begonani
+      // uch marta rad etib butunlay bloklash).
       const responder = g.players.find(p => p.socketId === socket.id && !p.isBot);
       if (!responder) return;
+      if (g.hostId && responder.userId !== g.hostId && responder.isHost !== true) return;
+      // Bloklangan yoki chiqarib yuborilgan odam qayta kira olmasin
+      if (accept && (g.kicked?.[req.requesterUserId] || await isBanned(req.requesterUserId))) {
+        io.to(req.requesterSocketId).emit('bot_join_error', { message: 'Siz bu o\'yinga qo\'shila olmaysiz' });
+        return;
+      }
       if (accept) {
         const bot = pickRandom(g.players.filter(p => p.isAlive && p.isBot));
         if (!bot) { io.to(req.requesterSocketId).emit('bot_join_error', { message: 'Bo\'sh joy qolmadi' }); return; }
@@ -4506,7 +5224,7 @@ io.on('connection', (socket) => {
   // muvozanatini buzadi (mafiya chiqarilsa shahar avtomatik g'olib bo'ladi).
   // Ketayotgan o'yinda tashlab ketgan o'yinchi allaqachon boshqa mexanizm
   // bilan ishlanadi (abandon/disconnect).
-  socket.on('kick_player', ({ gameId, targetSocketId } = {}) => withLock(gameId, async () => {
+  sOn('kick_player', ({ gameId, targetSocketId } = {}) => withLock(gameId, async () => {
     if (!guard(socket, 'kick', 12, 10000)) return;
     const d = socketData.get(socket.id);
     if (!d?.gameId || d.gameId !== gameId) return;
@@ -4546,8 +5264,75 @@ io.on('connection', (socket) => {
     logEvent(g, '🚪', `${target.username} xonadan chiqarildi`, 'kicked', { name: target.username });
   }));
 
+  // ===== Jim qildirish (xona egasi, o'yin ichida ham) =====
+  // `kick_player` faqat kutish xonasida ishlaydi (rollar muvozanati), shuning
+  // uchun o'yin boshlangach suiiste'molga qarshi yagona chora shu.
+  sOn('mute_player', ({ gameId, targetSocketId, on = true } = {}) => withLock(gameId, async () => {
+    if (!guard(socket, 'mute', 20, 10000)) return;
+    const d = socketData.get(socket.id);
+    if (!d?.gameId || d.gameId !== gameId) return;
+    const g = await getG(gameId);
+    if (!g) return;
+    if (g.hostId !== d.userId) {
+      socket.emit('game_error', { code: 'notHost', message: 'Faqat xona egasi jim qildira oladi' });
+      return;
+    }
+    const target = (g.players || []).find(p => p.socketId === targetSocketId);
+    if (!target || target.userId === d.userId) return;
+    g.muted = g.muted || {};
+    if (on) g.muted[target.userId] = Date.now(); else delete g.muted[target.userId];
+    logEvent(g, on ? '\u{1F507}' : '\u{1F509}',
+      `${target.username} ${on ? 'jim qildirildi' : 'ovozi qaytarildi'}`,
+      on ? 'playerMuted' : 'playerUnmuted', { name: target.username });
+    await saveG(gameId, g);
+    io.to(`game:${gameId}`).emit('game_state', publicGame(g));
+    if (!isBot(target)) {
+      io.to(target.socketId).emit('game_error', {
+        code: on ? 'muted' : 'unmuted',
+        message: on ? '\u{1F507} Xona egasi sizni jim qildirdi' : '\u{1F509} Jim qildirish bekor qilindi',
+      });
+    }
+  }));
+
+  // ===== Shikoyat =====
+  // Ilgari o'yinchi suiiste'molni BILDIRA olmasdi — hech qanday kanal yo'q edi.
+  // Shikoyat Redis'ga yoziladi (admin ko'rishi uchun) va darhol Telegram'ga
+  // ketadi: admin xonaga kirib ulgursin, chunki o'yin 15-20 daqiqada tugaydi.
+  sOn('report_player', async ({ gameId, targetSocketId, reason } = {}) => {
+    if (!guard(socket, 'report', 3, 600000)) {
+      socket.emit('game_error', { code: 'reportLimit', message: 'Juda ko\'p shikoyat yubordingiz' });
+      return;
+    }
+    const d = socketData.get(socket.id);
+    if (!d?.gameId || d.gameId !== gameId) return;
+    const g = await getG(gameId);
+    const target = (g?.players || []).find(p => p.socketId === targetSocketId);
+    if (!target || isBot(target)) { socket.emit('game_error', { code: 'reportBad', message: 'Shikoyat yuborilmadi' }); return; }
+    const why = cleanText(String(reason || ''), { maxLen: 200 });
+    const rec = {
+      at: Date.now(), gameId,
+      byId: d.userId, by: d.username,
+      onId: target.userId, on: target.username,
+      reason: why || '—',
+    };
+    try {
+      await redis.rpush('reports', JSON.stringify(rec));
+      await redis.ltrim('reports', -500, -1);
+    } catch {}
+    await logActivity(d.userId, 'report', { detail: `${target.username}: ${rec.reason}`, gameId });
+    if (TG_ADMIN_BOT_TOKEN && TG_ADMIN_CHAT_ID) {
+      tgApi('sendMessage', {
+        chat_id: TG_ADMIN_CHAT_ID,
+        text: `\u{1F6A9} <b>Shikoyat</b>\n${tgEsc(rec.by)} \u2192 <b>${tgEsc(rec.on)}</b>\n`
+            + `Sabab: ${tgEsc(rec.reason)}\nXona: <code>${tgEsc(gameId)}</code>`,
+        parse_mode: 'HTML',
+      }).catch(() => {});
+    }
+    socket.emit('report_sent', { ok: true });
+  });
+
   // ===== Ovozli chat signaling =====
-  socket.on('voice_join', ({ gameId } = {}) => {
+  sOn('voice_join', ({ gameId } = {}) => {
     if (!guard(socket, 'vjoin', 5, 5000)) return;
     // Faqat o'sha xonaning o'yinchisi ovozli seansga qo'shila oladi — ilgari
     // begona odam "arvoh peer" bo'lib kirib, xonadagi socketId'lar ro'yxatini olardi
@@ -4559,7 +5344,7 @@ io.on('connection', (socket) => {
     set.add(socket.id);
     voicePeers.set(gameId, set);
   });
-  socket.on('voice_leave', ({ gameId } = {}) => {
+  sOn('voice_leave', ({ gameId } = {}) => {
     // guard + a'zolik: ilgari ikkalasi ham yo'q edi va bitta socket istalgan
     // begona xonaga cheksiz tezlikda 'voice_peer_leave' yog'dira olardi (1→N amplifikatsiya)
     if (!guard(socket, 'vleave', 10, 5000)) return;
@@ -4578,7 +5363,7 @@ io.on('connection', (socket) => {
     return !!set && set.has(socket.id) && set.has(to);
   }
   // SDP/ICE ni aniq bir o'yinchiga uzatish (ICE ko'p bo'lishi mumkin — saxiy limit)
-  socket.on('voice_signal', ({ to, data } = {}) => {
+  sOn('voice_signal', ({ to, data } = {}) => {
     if (!guard(socket, 'vsig', 600, 10000)) return; // ICE ko'p bo'lishi mumkin — saxiy
     if (!voiceAllowed(to)) return;
     // SDP/ICE dan boshqa narsa uzatmaymiz: aks holda socket 1MB gacha ixtiyoriy
@@ -4588,15 +5373,20 @@ io.on('connection', (socket) => {
     io.to(to).emit('voice_signal', { from: socket.id, data });
   });
   // "gapiryapti" indikatori — faqat ruxsat etilgan tinglovchilarga
-  socket.on('voice_talk', ({ to, on } = {}) => {
+  sOn('voice_talk', ({ to, on } = {}) => {
     if (!guard(socket, 'vtalk', 40, 5000)) return;
     if (!Array.isArray(to)) return;
+    const d = socketData.get(socket.id);
     for (const sid of to.slice(0, 40)) {
-      if (voiceAllowed(sid)) io.to(sid).emit('voice_talk', { from: socket.id, on: !!on });
+      // Ikki shart: (1) ikkovi bir ovozli seansda, (2) hozir eshitishga HAQLI.
+      // Ikkinchisi ilgari yo'q edi — tunda mafiya indikatori butun xonaga ketardi.
+      if (voiceAllowed(sid) && canHearVoice(d?.gameId, socket.id, sid)) {
+        io.to(sid).emit('voice_talk', { from: socket.id, on: !!on });
+      }
     }
   });
 
-  socket.on('disconnect', async () => {
+  sOn('disconnect', async () => {
     console.log(`❌ ${socket.id}`);
     clearIdle(socket);
     PING_MS.delete(socket.id);
@@ -4662,9 +5452,13 @@ io.on('connection', (socket) => {
             g.phaseEndsAt += RECONNECT_GRACE_MS;
             if (timers.has(data.gameId)) clearTimeout(timers.get(data.gameId));
             const left = Math.max(1000, g.phaseEndsAt - Date.now());
-            const ph = g.phase;
+            // FAZAGA MOS davomchi. Ilgari bu yerda har doim `onPhaseEnd`
+            // qo'yilardi va u faqat 'day_discussion' ni bilardi — natijada
+            // tungi bosqichda yoki natija ekranida uzilish xonani abadiy
+            // muzlatardi (xonaning yagona taymeri yuqorida o'chirilgan).
+            const resume = phaseResumer(g);
             timers.set(data.gameId, setTimeout(
-              () => withLock(data.gameId, () => onPhaseEnd(data.gameId, ph)),
+              () => withLock(data.gameId, () => resume.fire(data.gameId)),
               left + graceFor(g)));
             io.to(`game:${data.gameId}`).emit('phase_extended', {
               username: p.username,
@@ -4709,7 +5503,13 @@ async function recoverTimers() {
       // Boshlanmagan xonalar: restartdan keyin disconnect hodisasi kelmaydi, ya'ni
       // bo'sh-xona taymeri hech qachon qo'yilmasdi va xona abadiy ro'yxatda qolardi.
       if (g.status === 'waiting') {
-        if (!(g.players || []).some(p => !p.isBot)) scheduleEmptyCheck(gameId);
+        if (!(g.players || []).some(p => !p.isBot)) { scheduleEmptyCheck(gameId); continue; }
+        // Xonada ODAM bor va botlar bilan to'lgan: restartdan keyin "boshlash"
+        // taymeri ham yo'qolgan. Qayta qurmasak xona lobbida abadiy kutib
+        // qolardi — odam ichkarida o'tirib, o'yin hech qachon boshlanmaydi.
+        if ((g.players || []).some(isBot) && g.players.length >= (g.minPlayers || 5)) {
+          armBotStart(gameId, 8000 + crypto.randomInt(7000));
+        }
         continue;
       }
       if (g.status !== 'playing') continue;
@@ -4726,28 +5526,26 @@ async function recoverTimers() {
 
       const remain = Math.max(0, (g.phaseEndsAt || 0) - Date.now());
       const phase = g.phase;
-      const step = nightStepByPhase(phase);
-      // Eski holatda nightStep bo'lmasligi mumkin — fazadan aniqlaymiz,
-      // aks holda endNightStep(undefined) NIGHT_STEPS[NaN] ga urilib o'yinni muzlatardi.
-      let stepIdx = Number.isInteger(g.nightStep) ? g.nightStep : NIGHT_STEPS.indexOf(step);
-      if (step && stepIdx < 0) stepIdx = 0;
+      // Dispetcher `phaseResumer` da — disconnect bilan AYNI mantiq ishlatilsin
+      // (ilgari ikki nusxa bor edi va faqat shu yerdagisi to'g'ri edi).
+      const resume = phaseResumer(g);
+      const { step, idx: stepIdx } = resume;
       // Holatni tiklaymiz: endNightStep birinchi navbatda `g.nightStep !== idx` ni
       // tekshiradi — normallashtirmasak u darhol qaytib ketib, o'yin muzlab qolardi.
       if (step && g.nightStep !== stepIdx) { g.nightStep = stepIdx; await saveG(gameId, g); }
-      const fire = () => {
-        if (step) return endNightStep(gameId, stepIdx);
-        if (phase === 'day_discussion') return onPhaseEnd(gameId, 'day_discussion');
-        if (phase === 'day_results') return startNight(gameId);
-        if (phase === 'night_results') return startPhase(gameId, 'day_discussion');
-        // noma'lum faza (eski format) — kunduzdan davom ettiramiz
-        return startPhase(gameId, 'day_discussion');
-      };
       if (timers.has(gameId)) clearTimeout(timers.get(gameId));
-      timers.set(gameId, setTimeout(() => withLock(gameId, fire), remain));
-      // botlar o'yini bo'lsa — joriy faza bot harakatlarini ham qayta rejalashtiramiz
-      if (g.vsBots) {
-        if (step) scheduleBotNightStep(gameId, stepIdx);
-        else if (phase === 'day_discussion') scheduleBotDay(gameId, g);
+      timers.set(gameId, setTimeout(() => withLock(gameId, () => resume.fire(gameId)), remain));
+      // Xonada bot bo'lsa — joriy faza bot harakatlarini ham qayta rejalashtiramiz.
+      //
+      // DIQQAT: shart ilgari `g.vsBots` edi. Aynan shu xato startPhase va
+      // startNightStep da allaqachon tuzatilgan (izohlari o'sha yerda), bu yerda
+      // esa qolib ketgan edi. Natijasi: har deploy/restartdan keyin to'ldiruvchi
+      // botli va botOnly xonalarda joriy faza bo'sh o'tardi — birorta bot ovoz
+      // bermaydi, tunda hech kim harakat qilmaydi. Foydalanuvchi buni "hamma
+      // birdan AFK bo'lib qoldi" deb ko'radi.
+      if ((g.players || []).some(isBot)) {
+        if (step) scheduleBotNightStep(gameId, stepIdx, dur(g, step.dur) * 1000);
+        else if (phase === 'day_discussion') { scheduleBotDay(gameId, g); scheduleBotChat(gameId, g); }
       }
       recovered++;
     }
@@ -4795,10 +5593,43 @@ function onFatal(kind, e) {
   console.error(`❗ ${kind}:`, e?.stack || e);
   if (++fatalCount >= 10) {
     console.error('❗ Bir daqiqada 10 ta ushlanmagan xato — qayta ishga tushamiz');
-    process.exit(1);   // pm2 autorestart ko'taradi
+    // Adminga XABAR BERAMIZ. Ilgari server jimgina qayta ishga tushardi:
+    // barcha jonli o'yinlar yo'qolardi va egasi bundan hech qachon
+    // xabar topmasdi (Telegram kanali esa allaqachon ishlab turibdi).
+    if (TG_ADMIN_BOT_TOKEN && TG_ADMIN_CHAT_ID) {
+      tgApi('sendMessage', {
+        chat_id: TG_ADMIN_CHAT_ID,
+        text: `\u{1F6A8} <b>Server qayta ishga tushmoqda</b>\nBir daqiqada 10 ta ushlanmagan xato.\n`
+            + `Oxirgisi: <code>${tgEsc(String(e?.message || e).slice(0, 300))}</code>`,
+        parse_mode: 'HTML',
+      }).catch(() => {});
+    }
+    // Xabar ketishiga bir soniya beramiz, keyin chiqamiz
+    setTimeout(() => process.exit(1), 1000).unref?.();
+    return;
   }
 }
 process.on('uncaughtException', (e) => onFatal('uncaughtException', e));
 process.on('unhandledRejection', (e) => onFatal('unhandledRejection', e));
 
-process.on('SIGTERM', () => httpServer.close(() => { prisma.$disconnect(); redis.disconnect(); }));
+// SIGTERM: ochiq socketlar bor ekan `httpServer.close` callback'i HECH QACHON
+// chaqirilmaydi (Socket.io ulanishlari uzoq yashaydi), ya'ni jarayon o'zi
+// tugamasdi va pm2 har deploy'da uni `kill_timeout` dan keyin SIGKILL bilan
+// uzardi. Endi: yangi ulanishlar to'xtaydi, mijozlarga xabar beriladi va
+// jarayon belgilangan muddatda TOZA chiqadi.
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} — to'xtatilmoqda...`);
+  try { io.emit('server_restart', { message: 'Server yangilanmoqda — bir zumdan keyin qayta ulanadi' }); } catch {}
+  try { httpServer.close(); } catch {}
+  try { io.close(); } catch {}
+  const done = () => {
+    Promise.allSettled([prisma.$disconnect(), redis.quit()]).finally(() => process.exit(0));
+  };
+  setTimeout(done, 1500).unref?.();
+  // Har qanday holatda 6 soniyada chiqamiz — pm2 SIGKILL gacha bormasin
+  setTimeout(() => process.exit(0), 6000).unref?.();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

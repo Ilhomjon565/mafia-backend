@@ -31,6 +31,11 @@ function hashStr(s) {
   return (h >>> 0) / 4294967296;
 }
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+// 0..2^32 oralig'idagi barqaror hash — `hashStr` ning butun sonli shakli.
+// `>>> 0` SHART: ishorali siljish manfiy son berardi va `% N` ham manfiy
+// chiqib, massiv indeksi undefined bo'lib qolardi (presence.js da bir marta
+// aynan shu xato xonalarni nomsiz qoldirgan).
+function h32(s) { return Math.floor(hashStr(s) * 4294967296) >>> 0; }
 const pick = (arr, r = Math.random()) => (arr.length ? arr[Math.floor(r * arr.length) % arr.length] : null);
 
 // Vaznli tanlov: [{ v, w }] — w qanchalik katta bo'lsa, tanlanish ehtimoli yuqori.
@@ -83,6 +88,23 @@ export function voteDelayMs(persona, dur = 60000, rnd = Math.random) {
   // ±25% tabiiy tarqoqlik
   const jitter = base * 0.25 * (rnd() * 2 - 1);
   return Math.round(clamp(base + jitter, min, Math.max(min, dur - 3500)));
+}
+
+// Tungi bosqichda kechikish. Ilgari BARCHA rollar, BARCHA botlar va BARCHA
+// tunlar uchun bitta tor oyna (2.0-4.5s) ishlatilardi va natijada har tungi
+// bosqich hisoblagichning aynan 10-22% ida yopilardi — progress-bar har safar
+// bir joyda o'lardi. Bu bot ekanini ko'rsatadigan eng aniq naqshlardan biri.
+//
+// Endi kechikish kunduzgi ovoz kabi personaga bog'liq: tez bot bosqich
+// boshida, sekin bot oxiriga yaqin harakat qiladi.
+// `stepMs` — bosqichning to'liq uzunligi (ms).
+export function nightDelayMs(persona, stepMs = 20000, rnd = Math.random) {
+  const min = 1800;
+  // Zaxira: bosqich tugashidan kamida 2.5 s oldin ulgursin
+  const window = Math.max(4000, stepMs - 8000);
+  const base = min + (1 - (persona?.speed ?? 0.5)) * window;
+  const jitter = base * 0.28 * (rnd() * 2 - 1);
+  return Math.round(clamp(base + jitter, min, Math.max(min, stepMs - 2500)));
 }
 
 // Soxta ping — har o'lchashda biroz tebranadi, aks holda qotib qolgan raqam
@@ -249,7 +271,10 @@ export function chooseDayVote(ctx, rnd = Math.random) {
 
     // komissar bot: tekshirgan natija hamma narsadan ustun
     if (checked[o.socketId] === 'mafia') w += 14;
-    if (checked[o.socketId] === 'town') w = 0.05;
+    // 0.05 -> 0.02: komissar O'ZI tekshirib toza deb bilgan odamni chiqarish
+    // o'yindagi eng og'ir xato. Ilgari ehtimol ~4.5% edi va bu bot-ai.test.mjs
+    // ni har 8-ishga tushishda yiqitardi (deploy darvozasi shu testda).
+    if (checked[o.socketId] === 'town') w = 0.02;
 
     // Mafiya bot sherigini himoya qiladi — LEKIN har doim emas. Odam mafiya
     // ham xato qiladi: shubha tortmaslik uchun ba'zan sherigiga ovoz beradi
@@ -299,9 +324,21 @@ export function chooseNightTarget(ctx, rnd = Math.random) {
   switch (role) {
     // Mafiya: eng "xavfli" tinch aholini yo'q qiladi. Xavfli = faol, ko'p
     // ovoz beradigan, jamoani boshqaradigan odam (komissar ko'pincha shunday).
-    case 'don':
-    case 'mafia':
+    // Advokat mafiyani Komissardan YASHIRADI — demak nishon sherigi (yoki
+    // o'zi) bo'lishi kerak. Ilgari u don/mafia bilan bir guruhda edi va
+    // `notMates` dan tanlardi, ya'ni HAR DOIM mafiya bo'lmagan odamni
+    // "himoya" qilib, qobiliyatini butunlay behuda sarflardi.
     case 'advokat': {
+      // O'zini ham himoya qila oladi, shuning uchun `others` emas `alive`.
+      const pool = alive.filter(x => mates.includes(x.socketId) || x.socketId === me.socketId);
+      if (!pool.length) return null;
+      // Eng ko'p shubha ostidagi sherik birinchi navbatda yopiladi.
+      const cand = pool.map(o => ({ v: o.socketId, w: 1 + (suspicion[o.socketId] || 0) * 2 }));
+      return weightedPick(cand, rnd) || pick(pool.map(o => o.socketId), rnd());
+    }
+
+    case 'don':
+    case 'mafia': {
       if (!notMates.length) return null;
       // Mafiya ham faqat OCHIQ ma'lumotni ko'radi: u komissar kim ekanini
       // bilmaydi va nishonni taxmin bilan tanlaydi. Shuning uchun tanlovning
@@ -331,7 +368,11 @@ export function chooseNightTarget(ctx, rnd = Math.random) {
     // Doktor: kechagi hujum nishonini yoki o'zini himoya qiladi, lekin
     // KETMA-KET bir odamni davolamaydi (o'yin qoidasi va odamiy mantiq).
     case 'doctor': {
-      const pool = alive.filter(o => o.socketId !== memory.healedLast);
+      // O'zini davolash FAQAT bir marta (ROLES.md). Server odam doktorga bu
+      // qoidani qo'llaydi, bot esa `na.doctor` ni to'g'ridan-to'g'ri yozgani
+      // uchun uni chetlab o'tardi — endi tanlov bosqichida hisobga olinadi.
+      const pool = alive.filter(o => o.socketId !== memory.healedLast
+        && !(memory.selfHeal && o.socketId === me.socketId));
       if (!pool.length) return null;
       const cand = pool.map(o => {
         let w = 1;
@@ -387,6 +428,152 @@ export function buildVoteWeight(events = []) {
     if (e.to && e.to !== 'skip') w[e.to] = (w[e.to] || 0) + 0.4;
   }
   return w;
+}
+
+// ---------- BOTLARNING GAPI ----------
+// Ilgari botlar o'yin davomida CHATDA BIR OG'IZ ham gapirmasdi: `botSay`
+// butun serverda faqat bitta joyda — kutish xonasida "goo" ga javob berish
+// uchun — chaqirilardi. Natijada 12 "o'yinchi" ovoz taxtasida faol harakat
+// qilib turardi, chat esa mutlaqo jim edi. Mafiya o'yinida bu mumkin emas va
+// bot ekanini ko'rsatadigan eng ochiq belgi aynan shu edi.
+//
+// Iboralar ATAYLAB telefonda shosha-pisha yozilgandek: kichik harf, imlo
+// xatolari, tinish belgisisiz. Ideal imlo o'zi shubha tug'diradi.
+//
+// Botga hech qanday MAXFIY ma'lumot berilmaydi: gap faqat ochiq shubha
+// ballaridan va o'z rolidan quriladi — ya'ni ovoz berish bilan bir manbadan.
+const LINES = {
+  // Raund boshi — umumiy gap, hech kimni aybalamaydi
+  open: [
+    'kim nima deydi', 'menda hech qanaqa info yoq', 'boshladikmi',
+    'qani gapiringlar', 'kecha kim nima kordi', 'hozircha tinchmi',
+    'menimcha shoshmaymiz', 'kim bor kim yoq', 'gapiringlar ergashaman',
+    'birinchi kun qiyin bolad', 'hech kim gapirmiyaptida', 'nima qilamiz',
+  ],
+  // Kimnidir shubha ostiga olish
+  accuse: [
+    '{n} shubhali menimcha', 'menga {n} yoqmadi', '{n} juda jim turibdi',
+    '{n} ga qaranglar', 'menimcha {n} mafiya', '{n} kecha gapirmadi ham',
+    '{n} ni tekshirish kerak', '{n} dan shubhalanyapman', 'menimcha {n}',
+    '{n} ozini chetga oladi', '{n} nima deysan ozing haqingda',
+  ],
+  // Boshqa birovning fikriga qo'shilish
+  agree: [
+    'ha {n} shubhali', 'menam {n} ga', 'togri aytasla {n} bolishi mumkin',
+    'men ham {n} deb oylayman', 'ok {n} bolsin', 'menam qoshilaman {n}',
+    'ha shunaqa {n}', 'menam shu fikrda {n}',
+  ],
+  // O'z ovozini e'lon qilish
+  vote: [
+    '{n} ga berdim', 'men {n} ni tanladim', 'ovozim {n} ga',
+    '{n} ga beryapman', 'men {n}', 'mayli {n} bolsin',
+  ],
+  // O'ziga ovoz kelganda himoyalanish
+  defend: [
+    'men tinch aholiman', 'nega menga', 'men emasman ishoninglar',
+    'meni bekorga chiqarasla', 'men mafiya emasman', 'nega menga berdila',
+    'xato qilyapsizla', 'menga berma men tinchman',
+  ],
+  // Komissar ochilishi — o'yinning eng muhim mexanikasi
+  claim: [
+    'men komissarman {n} mafiya', 'tekshirdim {n} mafiya chiqdi',
+    'men kom man {n} qora', 'ochilaman men komissar {n} mafiya',
+    'menda info bor {n} mafiya', '{n} mafiya men tekshirdim',
+  ],
+  // Komissar: toza chiqqan odam
+  clear: [
+    '{n} toza men tekshirdim', '{n} ga tegmanglar toza',
+    'tekshirdim {n} tinch', '{n} oq chiqdi',
+  ],
+  // Hech kimni chiqarmaslik taklifi
+  skip: [
+    'bugun otkazamiz', 'hech kimni chiqarmaylik', 'malumot yoq otkazamiz',
+    'bekorga odam yoqotmaylik', 'menimcha skip',
+  ],
+  // Chiqarilgan o'yinchining oxirgi so'zi
+  lastWord: [
+    'men tinch edim eh', 'xato qildinglar', 'mafiya emasman edim',
+    'omad sizlarga', 'yomon oynadingla', 'men tinch aholi edim qaranglar',
+    'eh mayli', 'men ketdim omad',
+  ],
+  // Tun tushishidan oldin
+  night: [
+    'tinch kecha bolsin', 'omon qolaylik', 'korishguncha',
+    'kechasi kim oladi ekan',
+  ],
+};
+
+// Bitta ibora tanlaydi. `avoid` — shu bot allaqachon aytgan iboralar:
+// takror gap bot ekanini darhol oshkor qiladi.
+export function botChatLine(kind, vars = {}, avoid = [], rnd = Math.random) {
+  const pool = LINES[kind];
+  if (!pool || !pool.length) return null;
+  const used = new Set(avoid);
+  let list = pool.filter(x => !used.has(x));
+  if (!list.length) list = pool;            // hammasi aytilgan — qaytadan
+  // Nom kerak bo'lgan iborani nom bo'lmasa umuman ishlatmaymiz
+  if (!vars.n) list = list.filter(x => !x.includes('{n}'));
+  if (!list.length) return null;
+  const raw = pick(list, rnd());
+  if (!raw) return null;
+  return { key: raw, text: raw.replace('{n}', vars.n || '') };
+}
+
+// Bot kunduzi NIMA deyishini tanlaydi. Qaror ovoz berish bilan BIR XIL
+// manbaga tayanadi (ochiq shubha ballari) — ya'ni bot aytgan gap uning
+// keyingi ovoziga mos keladi. Mos kelmasa, kuzatayotgan odam buni sezadi.
+//
+// Qaytadi: { kind, targetSid } yoki null (bu safar jim turadi).
+export function chooseChatAct(ctx, rnd = Math.random) {
+  const { me, alive = [], mates = [], suspicion = {}, memory = {} } = ctx;
+  const p = ctx.persona || makePersona(me?.socketId || 'x');
+  const others = alive.filter(x => x.socketId !== me.socketId);
+  if (!others.length) return null;
+
+  // 1) Komissar bot tekshiruv natijasini e'lon qiladi. Bu o'yinning eng
+  //    muhim mexanikasi: usiz komissar yakka ovoz bo'lib qoladi va shahar
+  //    deyarli hech qachon yutmaydi (bot-sim.test.mjs da o'lchangan).
+  const checked = memory.checked || {};
+  const claimed = memory.claimedSids || [];
+  const blackSid = Object.keys(checked).find(sid => checked[sid] === 'mafia'
+    && alive.some(a => a.socketId === sid) && !claimed.includes(sid));
+  if (blackSid && !ctx.iAmMafia) return { kind: 'claim', targetSid: blackSid };
+
+  // 2) O'ziga ovoz kelgan bo'lsa — himoyalanadi. Odam bunga DOIM javob beradi.
+  const againstMe = Object.values(ctx.votes || {}).filter(v => v === me.socketId).length;
+  if (againstMe > 0 && rnd() < 0.75) return { kind: 'defend', targetSid: null };
+
+  // 3) Shubha ostidagi odam. Mafiya bot sherigini HECH QACHON aybalamaydi.
+  const cand = others
+    .filter(o => !mates.includes(o.socketId))
+    .map(o => ({ sid: o.socketId, sc: suspicion[o.socketId] || 0 }))
+    .sort((a, b) => b.sc - a.sc);
+  const top = cand[0];
+
+  // 4) Ko'pchilik allaqachon kimnidir tanlagan bo'lsa — qo'shilish ehtimoli
+  //    botning bandwagon xarakteriga bog'liq (ovoz berishdagi bilan bir xil).
+  const tally = {};
+  for (const v of Object.values(ctx.votes || {})) if (v && v !== 'skip') tally[v] = (tally[v] || 0) + 1;
+  const leader = Object.entries(tally).sort((a, b) => b[1] - a[1])[0];
+  if (leader && !mates.includes(leader[0]) && leader[0] !== me.socketId
+      && rnd() < 0.3 + p.bandwagon * 0.4) {
+    return { kind: 'agree', targetSid: leader[0] };
+  }
+
+  if (top && top.sc > 0.6 && rnd() < 0.72) return { kind: 'accuse', targetSid: top.sid };
+  // Ma'lumot yo'q — birinchi raundda umumiy gap eng tabiiy
+  if ((ctx.round || 1) <= 1 || rnd() < 0.45) return { kind: 'open', targetSid: null };
+  if (rnd() < 0.25) return { kind: 'skip', targetSid: null };
+  return { kind: 'accuse', targetSid: top ? top.sid : pick(others.map(o => o.socketId), rnd()) };
+}
+
+// "Yozib turish" vaqti: uzunroq gap uzoqroq yoziladi. Bir zumda paydo
+// bo'lgan 24 belgili xabar odam yozgan bo'lishi mumkin emas — kutish
+// xonasidagi yagona javob aynan shu bilan bilinib qolardi.
+export function typingMs(text, rnd = Math.random) {
+  const len = String(text || '').length;
+  // ~4 belgi/sekund (telefonda shosha-pisha) + o'ylash vaqti
+  return Math.round(clamp(700 + len * (190 + rnd() * 150), 900, 12000));
 }
 
 // ---------- xonani to'ldiruvchi botlar ----------
@@ -465,11 +652,16 @@ export function makeFillerBots(gameId, count, usedNames = []) {
       userId,
       publicId,
       username: pool[i] || ('mafia' + crypto.randomInt(1000, 9999)),
-      // Rasm YO'Q — mijoz taxallusning birinchi harfini chizadi. Ko'p haqiqiy
-      // o'yinchida ham avatar bo'lmaydi (Google rasm bermasa), shuning uchun
-      // harf odatiy ko'rinish. `avatar.js` va /api/avatar o'z joyida qoladi:
-      // rasm kerak bo'lsa shu qatorni botAvatarUrl(publicId) ga qaytarish kifoya.
-      avatar: null, role: null, isAlive: true, connected: true, isHost: false,
+      // Botlarning ~60% ida rasm bor, qolganida yo'q (mijoz taxallusning
+      // birinchi harfini chizadi).
+      //
+      // NEGA HAMMASIDA EMAS va NEGA HECH BIRIDA EMAS: ikkala chekka ham
+      // naqsh yaratadi. Ilgari HAMMA botda rasm yo'q edi — Google orqali
+      // kirgan haqiqiy o'yinchida esa rasm bor. Natijada "harfli avatar =
+      // bot" degan qoida xonaga bir qarashda ishlardi. Aralash taqsimot shu
+      // bog'liqlikni buzadi.
+      avatar: (h32(userId) % 100) < 60 ? botAvatarUrl(publicId) : null,
+      role: null, isAlive: true, connected: true, isHost: false,
       isBot: true,
       // Haqiqiy qo'shilish vaqti server tomonda yoziladi: botlar xonaga
       // bittalab, 2-9 soniya oralig'ida kiradi (server.js: scheduleBotJoins).

@@ -23,14 +23,26 @@ test('avatar haqiqiy SVG va ixcham', () => {
   }
 });
 
-test("botlarda rasm yo'q — taxallusning birinchi harfi ko'rsatiladi", () => {
-  // Foydalanuvchi qarori: soxta o'yinchilarda profil rasmi bo'lmasin.
-  // Mijoz avatarsiz o'yinchi uchun ismning birinchi harfini chizadi —
-  // haqiqiy o'yinchilarning ko'pida ham avatar yo'q, ya'ni bu odatiy ko'rinish.
-  for (const b of makeFillerBots('g1', 6, [])) {
-    assert.equal(b.avatar, null, "botda rasm bolmasligi kerak");
+test("botlarning rasmi ARALASH — 'harfli avatar = bot' qoidasi ishlamasin", () => {
+  // Ilgari HAMMA botda rasm yo'q edi, Google orqali kirgan haqiqiy
+  // o'yinchida esa bor. Natijada xonaga bir qarashda botlarni ajratish
+  // mumkin edi — "harfli avatar = bot" degan oddiy qoida ishlardi.
+  //
+  // Endi taqsimot aralash: botlarning ~60% ida rasm bor. Ikkala chekka ham
+  // (hammasida bor / hech birida yo'q) naqsh yaratadi, shuning uchun bu
+  // yerda AYNAN ikkalasi ham uchrashi tekshiriladi.
+  let withPic = 0, without = 0;
+  for (const b of makeFillerBots('g1', 200, [])) {
     assert.ok(b.username && b.username.length > 1, 'harf uchun ism kerak');
+    if (b.avatar === null) { without++; continue; }
+    withPic++;
+    // URL publicId dan yasaladi — bot userId'si ('bot-...') unda ko'rinmasa bo'ldi
+    assert.ok(b.avatar.startsWith('/api/avatar/'), 'kutilmagan avatar: ' + b.avatar);
+    assert.ok(!b.avatar.includes('bot-'), 'avatar URL bot ekanini oshkor qildi');
+    assert.ok(b.avatar.includes(b.publicId), 'avatar publicId dan yasalishi kerak');
   }
+  assert.ok(withPic > 20, 'rasmli bot juda kam: ' + withPic);
+  assert.ok(without > 20, 'rasmsiz bot juda kam: ' + without);
 });
 
 test('avatarlar XILMA-XIL — bir xonada bir xil uslub takrorlanmaydi', () => {

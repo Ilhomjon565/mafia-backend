@@ -173,67 +173,104 @@ export function randomRoomName(host = '', used = []) {
   return `${pick(ROOM_TOPICS)} ${1 + Math.floor(Math.random() * 99)}`.slice(0, 40);
 }
 
+// ==================== XONANING HAYOT DAVRI ====================
+// Ilgari ro'yxat har 7 daqiqada BUTUNLAY qayta yasalardi: xonalar
+// sababsiz paydo bo'lib, sababsiz yo'qolardi va "jangda" turgan xona
+// hech qachon tugamasdi — o'yin tugagach yopilishi kerak bo'lgan narsa
+// abadiy turardi.
+//
+// Endi har xonaning O'Z UMRI bor:
+//   tug'iladi -> KUTADI (2-6 daqiqa, odamlar kirib-chiqadi, xona to'ladi)
+//            -> TO'LGANDA O'YIN BOSHLANADI (18-28 daqiqa)
+//            -> YOPILADI (ro'yxatdan butunlay chiqadi)
+//
+// Har 3 daqiqada bitta yangi xona tug'ilishi MUMKIN; ehtimoli soatga
+// bog'liq (kechqurun deyarli har safar, tunda kamdan-kam — onlayn
+// egri chizig'idan olinadi). Shu sababli ro'yxatda doim ochilayotgan,
+// to'layotgan va tugayotgan xonalar bo'ladi.
+//
+// Xona ID si butun umri davomida O'ZGARMAYDI — bu muhim: odam xonani
+// ko'rib, bosganda aynan o'sha xona ochiladi (/api/games/:id/open).
+const BIRTH_MS = 3 * 60000;        // har 3 daqiqada bitta tug'ilish imkoni
+const LOOKBACK = 12;               // eng uzun umr / BIRTH_MS + zaxira
+
 export function fakeRooms(now = Date.now(), enabled = true) {
   if (!enabled) return [];
-  const slot = Math.floor(now / (7 * 60000));
-  const count = 5 + (h32(slot) % 6);            // 5-10 ta
   const out = [];
-  // Nomlar takrorlanmasin: lobbida ikkita "Mafia UZ" turgani g'alati ko'rinadi
   const usedNames = new Set();
-  for (let i = 0; i < count; i++) {
-    // DIQQAT: `>>>` (unsigned), `>>` EMAS. h32() 32-bitli musbat son qaytaradi,
-    // lekin `>>` uni ishorali deb hisoblaydi va 2^31 dan katta qiymatlarda
-    // MANFIY natija beradi. JS'da manfiy son bilan `%` ham manfiy chiqadi,
-    // natijada `ROOM_NAMES[-5]` = undefined bo'lib, xonalar nomsiz qolardi.
-    const s = h32(slot * 977 + i * 31);
-    const total = [8, 9, 10, 10, 12, 12, 14, 16][s % 8];
-    // Xonalarning 45% i OCHIQ: 2-4 joy bo'sh, ya'ni odam kirib o'ynay oladi.
-    // Ilgari hammasi to'la yoki jangda edi va lobbiga qaragan odam "hech
-    // qayerga kira olmayman" degan xulosaga kelardi. Bunday xonaga bosilganda
-    // server HAQIQIY bot xonasi yaratib beradi (/api/games/:id/open).
-    const open = ((s >>> 3) % 100) < 45;
-    // Qolganlarining 70% i jangda, 30% i to'lib boshlanishini kutmoqda
-    const playing = !open && ((s >>> 11) % 10) < 7;
-    const free = open ? 2 + ((s >>> 17) % 3) : 0;
-    let filled = Math.max(3, total - free);
+  const current = Math.floor(now / BIRTH_MS);
 
-    // ===== JONLI HARAKAT (faqat ochiq xonalarda) =====
-    // Ochiq xona muzlab turmasligi kerak: odamlar kirib-chiqib turadi.
-    // Har ~22 soniyada bitta hodisa bo'ladi (kirdi yoki chiqdi) va
-    // o'yinchi soni shunga qarab bir-ikkiga o'zgaradi.
-    //
-    // Hammasi VAQTdan hisoblanadi (Math.random() yo'q): uchta frontend
-    // instansiyasi ham, 2 soniyalik kesh ham AYNI natijani beradi —
-    // aks holda ro'yxat har yangilanishda sakrab turardi.
+  // Eng yangi xona birinchi bo'lib chiqadi (lobbida tepada turadi)
+  for (let k = 0; k <= LOOKBACK; k++) {
+    const b = current - k;                    // tug'ilish indeksi
+    const s = h32(b * 2654435761 + 12345);
+
+    // Tug'ilish ehtimoli soatga bog'liq: tunda 5-10 odam bo'lganda
+    // 8 xona turishi ishonchsiz ko'rinadi.
+    const hour = new Date(b * BIRTH_MS + TZ_MS).getUTCHours();
+    // Pastki chegara 18: tunda ham lobbi butunlay bo'sh qolmasligi kerak
+    // (1-2 xona), aks holda kirgan odam "sayt o'lgan" deb o'ylaydi.
+    const chance = Math.max(18, Math.min(92, Math.round(ONLINE_CURVE[hour] * 0.62)));
+    if ((s % 100) >= chance) continue;
+
+    // Kutish 3-9 daqiqa: umrning ~25% i. Qisqa bo'lsa lobbida qo'shilish
+    // mumkin bo'lgan xona deyarli qolmaydi (hammasi jangda bo'lib turadi).
+    const waitMs = (3 + ((s >>> 7) % 7)) * 60000;
+    const playMs = (18 + ((s >>> 11) % 11)) * 60000;     // 18-28 daqiqa o'yin
+    const age = now - b * BIRTH_MS;
+    if (age < 0 || age >= waitMs + playMs) continue;      // hali yo'q yoki YOPILGAN
+
+    const total = [8, 9, 10, 10, 12, 12, 14, 16][s % 8];
+    const mafiaCount = Math.max(1, Math.round(total * 0.3));
+
+    // ===== O'yinchilar soni va holat =====
+    // Kutish davrida xona asta to'ladi (3 dan boshlanadi). Xonalarning
+    // 45% i TO'LIQ to'ladi — ular to'lgan zahoti o'yin boshlanadi;
+    // qolganida 1-3 joy bo'sh qoladi va o'yin vaqt bo'yicha boshlanadi.
+    const fillsUp = ((s >>> 15) % 100) < 45;
+    const free = fillsUp ? 0 : 1 + ((s >>> 17) % 3);
+    const target = Math.max(3, total - free);
+    const grow = Math.min(1, age / Math.max(1, waitMs));
+    const filledNow = Math.max(3, Math.round(3 + (target - 3) * grow));
+    // TO'LGANDA o'yin boshlanadi (vaqtni kutmasdan), aks holda kutish
+    // vaqti tugaganda.
+    const playing = age >= waitMs || (fillsUp && filledNow >= total);
+
+    let filled = playing ? total - ((s >>> 19) % 2) : filledNow;
+
+    // ===== JONLI HARAKAT (faqat kutayotgan xonada) =====
+    // Har ~22 soniyada bitta hodisa: kimdir kirdi yoki chiqdi. Hammasi
+    // VAQTdan hisoblanadi (Math.random() yo'q) — uchta frontend
+    // instansiyasi va nginx keshi AYNI natijani berishi kerak, aks holda
+    // ro'yxat har yangilanishda sakrab turardi.
     const events = [];
-    if (open) {
+    if (!playing) {
       const tick = Math.floor(now / EVENT_MS);
       let delta = 0;
-      // Oxirgi uch hodisa: birinchisi eng yangi
-      for (let k = 0; k < 3; k++) {
-        const e = h32(slot * 7919 + i * 131 + (tick - k) * 17);
+      for (let j = 0; j < 3; j++) {
+        const e = h32(b * 7919 + (tick - j) * 17);
         const join = (e % 100) < 58;          // 58% kirdi, 42% chiqdi
         const name = PLAYER_NAMES[(e >>> 6) % PLAYER_NAMES.length];
-        // Hodisa qancha vaqt oldin bo'lgani (sekund)
-        const ago = Math.floor((now - (tick - k) * EVENT_MS) / 1000);
+        const ago = Math.floor((now - (tick - j) * EVENT_MS) / 1000);
         events.push({ n: name, t: join ? 'join' : 'leave', s: Math.max(1, ago) });
-        if (k === 0) delta = join ? 1 : -1;
+        if (j === 0) delta = join ? 1 : -1;
       }
-      // Son chegaradan chiqmasin: xona to'lib ketmasin va bo'shab qolmasin
       filled = Math.min(total - 1, Math.max(3, filled + delta));
     }
-    const mafiaCount = Math.max(1, Math.round(total * 0.3));
+
     const players = [];
     const shift = s % PLAYER_NAMES.length;
-    for (let k = 0; k < filled; k++) {
+    for (let j = 0; j < filled; j++) {
       players.push({
-        userId: 'c' + (h32(slot * 7919 + i * 101 + k) >>> 0).toString(16).padStart(8, '0') + i + k,
-        username: PLAYER_NAMES[(shift + k * 7) % PLAYER_NAMES.length],
+        userId: 'c' + (h32(b * 7919 + j * 101) >>> 0).toString(16).padStart(8, '0') + j,
+        username: PLAYER_NAMES[(shift + j * 7) % PLAYER_NAMES.length],
         isAlive: true,
       });
     }
+
     out.push({
-      id: 'c' + (h32(slot * 104729 + i) >>> 0).toString(16).padStart(8, '0') + 'x' + i,
+      // ID umr bo'yi o'zgarmaydi: tug'ilish indeksidan yasaladi
+      id: 'c' + (h32(b * 104729) >>> 0).toString(16).padStart(8, '0') + 'x' + (b % 97),
       name: pickName(usedNames, (s >>> 7)),
       status: playing ? 'playing' : 'waiting',
       // Frontend shu belgiga qarab "ochish" so'rovini yuboradi
@@ -244,11 +281,33 @@ export function fakeRooms(now = Date.now(), enabled = true) {
       doctorCount: 1,
       civilCount: Math.max(0, total - mafiaCount - 2),
       hostId: 'fake',
-      createdAt: new Date(now - ((s % 25) + 2) * 60000).toISOString(),
+      createdAt: new Date(b * BIRTH_MS).toISOString(),
       phase: playing ? 'day_discussion' : 'waiting',
-      players,               // `open` bo'lsa joy bor, aks holda xona to'lgan
-      events,                // lobbi kartasidagi "kim kirdi / kim chiqdi"
-                             // (jangdagi xonada bo'sh: u yerda harakat yo'q)
+      players,
+      events,                // "kim kirdi / kim chiqdi" (jangda bo'sh)
+    });
+  }
+
+  // ===== KAMIDA BITTA OCHIQ XONA =====
+  // Barcha xonalar bir vaqtda "jangda" bo'lib qolishi mumkin (umrning
+  // ~75% i o'yin). O'sha paytda lobbiga kirgan odam hech qayerga
+  // qo'shila olmasdi. Shuning uchun bunday holatda ENG YANGI xona ochiq
+  // ko'rsatiladi: u eng kam o'ynagan, ya'ni "hozir boshlangan" deb
+  // ko'rsatish eng ishonarli.
+  if (out.length && !out.some((r) => r.status === 'waiting')) {
+    const r = out[0];
+    const free = 1 + (h32(r.totalPlayers * 31 + out.length) % 3);
+    r.status = 'waiting';
+    r.phase = 'waiting';
+    r.players = r.players.slice(0, Math.max(3, r.totalPlayers - free));
+    const tick = Math.floor(now / EVENT_MS);
+    r.events = [0, 1, 2].map((j) => {
+      const e = h32(r.totalPlayers * 977 + (tick - j) * 17);
+      return {
+        n: PLAYER_NAMES[(e >>> 6) % PLAYER_NAMES.length],
+        t: (e % 100) < 58 ? 'join' : 'leave',
+        s: Math.max(1, Math.floor((now - (tick - j) * EVENT_MS) / 1000)),
+      };
     });
   }
   return out;

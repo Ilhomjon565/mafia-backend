@@ -3155,6 +3155,16 @@ function scheduleBotJoins(gameId, bots, fast = false) {
       logEvent(g, '👋', `${bot.username} o'yinga qo'shildi`, 'playerJoined', { name: bot.username });
       io.to(`game:${gameId}`).emit('game_state', publicGame(g));
       tgRoomTouch(gameId);   // guruhdagi e'londa o'yinchilar soni yangilanadi
+
+      // XONA TO'LDI -> o'yin 5-10 soniyada boshlanadi.
+      // Nega darhol emas: o'yinchi kimlar bilan o'ynayotganini ko'rib
+      // olishi kerak, ekran ostidan sirg'alib ketmasligi kerak.
+      // Nega kutilmaydi: to'lgan xonada kutishning ma'nosi yo'q —
+      // yangi odam baribir sig'maydi.
+      if ((g.players || []).length >= (g.totalPlayers || 99)) {
+        cancelBotStart(gameId);
+        armBotStart(gameId, 5000 + crypto.randomInt(5000));
+      }
     }), delay));
   }
   botJoinTimers.set(gameId, timers);
@@ -4089,9 +4099,12 @@ io.on('connection', (socket) => {
         setTimeout(() => withLock(gameId, () => beginGame(gameId)), 700);
       } else if (g.status === 'waiting' && (g.players || []).some(isBot)
                  && g.players.length >= (g.minPlayers || 5)) {
-        // Oddiy xona botlar bilan to'lgan va ODAM kirdi — 10-15 soniyada
-        // boshlanadi. Uzoq kutish odamni yo'qotadi: u lobbiga qaytib ketadi.
-        if (armBotStart(gameId, 10000 + crypto.randomInt(5000))) {
+        // Odam kirdi. Xona TO'LGAN bo'lsa 5-10 soniya, aks holda 10-15:
+        // to'lmagan xonada yana bir-ikki odam kirib qolishi mumkin,
+        // to'lganida esa kutishning ma'nosi yo'q.
+        const full = g.players.length >= (g.totalPlayers || 99);
+        const wait = full ? 5000 + crypto.randomInt(5000) : 10000 + crypto.randomInt(5000);
+        if (armBotStart(gameId, wait)) {
           logEvent(g, '\u23F3', "O'yin boshlanmoqda...", 'startingSoon');
           await saveG(gameId, g);
           io.to(key).emit('game_state', publicGame(g));

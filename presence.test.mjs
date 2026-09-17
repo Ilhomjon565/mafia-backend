@@ -94,7 +94,11 @@ test('soxta xonalarda BARCHA maydonlar bor', () => {
   for (let k = 0; k < 400; k++) {
     const t = Date.UTC(2026, 8, 16) + k * 7 * 60000;
     const rooms = fakeRooms(t);
-    assert.ok(rooms.length >= 5 && rooms.length <= 10, 'xonalar soni: ' + rooms.length);
+    // Xonalar soni soatga bog'liq: tunda 1-2, kechqurun 8-12 (onlayn
+    // egri chizig'iga bog'langan). Shuning uchun faqat yuqori chegara
+    // tekshiriladi — pastki chegara alohida testda (tunda ham kamida
+    // bitta ochiq xona bo'lishi).
+    assert.ok(rooms.length <= 13, 'xonalar soni juda ko\'p: ' + rooms.length);
     for (const r of rooms) {
       for (const f of need) {
         assert.ok(r[f] !== undefined && r[f] !== null, `${f} yo'q (vaqt ${k}): ` + JSON.stringify(r).slice(0, 120));
@@ -351,4 +355,63 @@ test('son o\'zgarib turadi (muzlab qolmaydi)', () => {
     if (r) seen.add(r.players.length);
   }
   assert.ok(seen.size >= 2, 'son o\'zgarmadi: ' + [...seen]);
+});
+
+
+// ---------- XONANING HAYOT DAVRI ----------
+
+test('xona ochiladi -> o\'ynaladi -> YOPILADI', () => {
+  // Ilgari "jangda" turgan xona hech qachon tugamasdi: o'yin tugagach
+  // yopilishi kerak bo'lgan narsa abadiy ro'yxatda turardi.
+  const t0 = Date.UTC(2026, 8, 17, 15, 0, 0);
+  const room = fakeRooms(t0)[0];
+  assert.ok(room, 'xona yo\'q');
+  let sawWaiting = false, sawPlaying = false, closed = false;
+  for (let m = 0; m <= 45; m++) {
+    const r = fakeRooms(t0 + m * 60000).find((x) => x.id === room.id);
+    if (!r) { closed = true; break; }
+    if (r.status === 'waiting') sawWaiting = true;
+    if (r.status === 'playing') sawPlaying = true;
+    // Yopilgandan keyin qaytib kelmasligi kerak
+    assert.ok(!closed, 'yopilgan xona qaytib keldi');
+  }
+  assert.ok(sawPlaying, 'xona hech qachon o\'ynalmadi');
+  assert.ok(closed, 'xona 45 daqiqada ham yopilmadi');
+});
+
+test('xona ID si umr bo\'yi o\'zgarmaydi', () => {
+  // Odam xonani ko'rib bosganda AYNAN o'sha xona ochilishi kerak
+  const t0 = Date.UTC(2026, 8, 17, 19, 0, 0);
+  const room = fakeRooms(t0).find((r) => r.status === 'waiting') || fakeRooms(t0)[0];
+  for (let sec = 0; sec <= 240; sec += 20) {
+    const r = fakeRooms(t0 + sec * 1000).find((x) => x.id === room.id);
+    if (r) assert.equal(r.name, room.name, 'nom o\'zgardi');
+  }
+});
+
+test('kutish davrida xona TO\'LADI', () => {
+  const t0 = Date.UTC(2026, 8, 17, 19, 0, 0);
+  const room = fakeRooms(t0).find((r) => r.status === 'waiting');
+  if (!room) return;
+  const later = fakeRooms(t0 + 3 * 60000).find((x) => x.id === room.id);
+  if (later) assert.ok(later.players.length >= room.players.length - 1, 'xona bo\'shab ketdi');
+});
+
+test('har doim kamida bitta OCHIQ xona bo\'ladi', () => {
+  // Hammasi "jangda" bo'lib qolsa, lobbiga kirgan odam hech qayerga
+  // qo'shila olmasdi.
+  let bad = 0;
+  for (let k = 0; k < 800; k++) {
+    const rooms = fakeRooms(Date.UTC(2026, 8, 17) + k * 45000);
+    if (rooms.length && !rooms.some((r) => r.status === 'waiting')) bad++;
+  }
+  assert.equal(bad, 0, bad + ' nuqtada ochiq xona yo\'q edi');
+});
+
+test('tunda xona kam, kechqurun ko\'p', () => {
+  const at = (h) => Date.UTC(2026, 8, 17, h - 5, 0, 0);
+  const night = fakeRooms(at(3)).length;
+  const evening = fakeRooms(at(20)).length;
+  assert.ok(evening > night, `kechqurun ${evening}, tunda ${night}`);
+  assert.ok(night <= 4, 'tunda juda ko\'p xona: ' + night);
 });

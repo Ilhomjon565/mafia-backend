@@ -23,7 +23,7 @@ import * as recStore from './recordings.js';
 // Onlayn ko'rsatkichi egri chizig'i — alohida modulda, testlari presence.test.mjs da
 import {
   fakeOnlineBase, fakePlayersBase, fakeGamesPlayed, fakeRooms, dueBotGameSlot,
-  randomRoomName,
+  randomRoomName, pseudoTier,
 } from './presence.js';
 // FAKE_ONLINE=0 — soxta qo'shimchani butunlay o'chiradi (faqat haqiqiy onlayn)
 const FAKE_ONLINE = process.env.FAKE_ONLINE !== '0';
@@ -1242,6 +1242,8 @@ app.get('/api/me', authMiddleware, async (req, res) => {
       dailyBonus: ECONOMY.dailyBonus,
       dailyLimit, roomsToday, roomsLeft: Math.max(0, dailyLimit - roomsToday),
       stats: u.stats || { gamesPlayed: 0, gamesWon: 0, winRate: 0, rating: RATING_START, xp: 0 },
+      // Liga — lobbi o'ziga mos xonalarni ajratib ko'rsatishi uchun
+      tier: tierOf(u.stats?.rating ?? RATING_START),
       // profil ma'lumotlari va to'liqlik darajasi
       profile: {
         fullName: u.fullName || null,
@@ -1796,6 +1798,12 @@ app.get('/api/games', async (_, res) => {
         hostId: publicHostId({ hostId: g.hostId, players: state?.players || [] }),
         createdAt: g.createdAt,
         phase: state?.phase || 'waiting',
+        // Liga — o'yinchi o'ziga MOS xonani ko'rib tanlashi uchun. Odam
+        // o'ynayotgan xonada haqiqiy reytingdan, bot bilan to'lgan xonada
+        // barqaror pseudo-ligadan olinadi. Maydon HAMMA xonada bo'lishi
+        // shart: ba'zisida bo'lib ba'zisida bo'lmasa, aynan shu farq bot
+        // xonasini oshkor qilardi.
+        tier: roomTier(state, g.id),
         // DIQQAT: `p.userId` EMAS, `p.publicId`. Bot userId'si 'bot-' bilan
         // boshlanadi va u ochiq ro'yxatda ko'rinsa, xonadagi botlar darhol
         // bilinib qolardi (butun "botlar odamga o'xshasin" talabi buzilardi).
@@ -1941,7 +1949,12 @@ app.post('/api/games/:id/open', authMiddleware, limitByUser(25), async (req, res
       take: OPEN_WAITING_CAP + 1,
     }).catch(() => []);
     if (waiting.length > OPEN_WAITING_CAP) {
-      return res.json({ id: waiting[0].id });
+      // Kutayotgan xona ko'p — yangisini yaratmaymiz. Qaysi biriga yuborishni
+      // RETING hal qiladi: ilgari shunchaki eng yangisi berilardi va kuchli
+      // o'yinchi yangi boshlovchilar orasiga tushib qolardi.
+      const rating = await myRating(req.user.userId);
+      const best = await pickRoomForRating(rating, { userId: req.user.userId });
+      return res.json({ id: best || waiting[0].id });
     }
 
     const id = await startBotGame({ name: room.name, totalPlayers: room.totalPlayers, quick: true });
@@ -1951,6 +1964,27 @@ app.post('/api/games/:id/open', authMiddleware, limitByUser(25), async (req, res
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ===== TEZ O'YIN: reytingga mos xonaga tushirish =====
+//
+// O'yinchi ro'yxatni ko'rib o'tirmasdan darhol o'ynashni xohlaydi. Server
+// unga KUCHI YAQIN odamlar bor xonani tanlab beradi; bunday xona bo'lmasa
+// bot bilan to'ldiriladigan yangisini ochadi.
+app.post('/api/games/quick', authMiddleware, limitByUser(20), async (req, res) => {
+  try {
+    const rating = await myRating(req.user.userId);
+    const id = await pickRoomForRating(rating, { userId: req.user.userId });
+    if (id) return res.json({ id, mos: true });
+
+    // Mos xona yo'q — yangisini ochamiz (umumiy chegara amal qiladi)
+    const settings = await getSettings();
+    const active = await prisma.game.count({ where: { status: { in: ['waiting', 'playing'] } } });
+    if (active >= (settings.maxRooms || 50)) return res.status(503).json({ error: 'tooManyRooms' });
+    const fresh = await startBotGame({ quick: true });
+    if (!fresh) return res.status(503).json({ error: 'busy' });
+    res.json({ id: fresh, mos: false });
+  } catch (e) { serverFail(res, e); }
 });
 
 // Xona nomi: tozalangan va cheklangan. Bo'sh yoki qoidaga mos kelmasa —
@@ -2843,6 +2877,101 @@ app.put('/api/admin/settings', authMiddleware, adminMiddleware, async (req, res)
 // ==================== GAME ENGINE ====================
 
 const timers = new Map();
+
+// ==================== RETING BO'YICHA MOSLASHTIRISH ====================
+//
+// Maqsad: o'yinchilar ko'payganda kuchi yaqin odamlar bitta xonaga tushsin.
+//
+// NEGA "o'yinchilar ko'p bo'lsa" degan ALOHIDA shart kerak emas: xonaning
+// reytingi FAQAT HAQIQIY o'yinchilardan hisoblanadi. Odam kam bo'lganda
+// xonalar bo'sh (reytingsiz) bo'ladi va hammasi bir xil mos keladi — ya'ni
+// hech qanday bo'linish yuz bermaydi va odam kutib qolmaydi. Odam ko'paygani
+// sari xonalar reyting oladi va guruhlanish O'ZI boshlanadi. Bu — qat'iy
+// chegaradan ancha barqaror: "nechta odam ko'p hisoblanadi?" degan savolga
+// javob berish shart emas.
+//
+// Botlar hisobga OLINMAYDI: ular to'ldiruvchi, reytingi yo'q. Aks holda
+// har bir xona RATING_START atrofida ko'rinib, moslashtirish ma'nosini
+// yo'qotardi.
+function roomRating(g) {
+  const real = (g?.players || []).filter((p) => !isBot(p) && Number.isFinite(p.rating));
+  if (!real.length) return null;
+  return Math.round(real.reduce((a, p) => a + p.rating, 0) / real.length);
+}
+
+// Xona ligasi — lobbi ro'yxati uchun. Odam bo'lmasa barqaror pseudo-liga
+// (maydon HAR DOIM bo'lishi kerak, aks holda bot xonasi oshkor bo'lardi).
+function roomTier(g, gameId) {
+  const r = roomRating(g);
+  if (r != null) return tierOf(r);
+  return pseudoTier(hashId(gameId));
+}
+function hashId(id) {
+  let h = 2166136261;
+  for (let i = 0; i < String(id).length; i++) { h ^= String(id).charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+
+// Reyting oynasi: taxminan bitta liga kengligi. Undan tashqarida ham xona
+// topilmasa, odam KUTIB QOLMASLIGI uchun eng yaqini beriladi — bo'sh
+// o'tirgandan ko'ra biroz kuchsiz/kuchli raqib yaxshiroq.
+const MATCH_BAND = 250;
+
+// Berilgan reytingga ENG MOS kutayotgan xonani tanlaydi.
+// Qaytadi: gameId yoki null (mos xona yo'q — yangisini yaratish kerak).
+async function pickRoomForRating(rating, { excludeId = null, userId = null } = {}) {
+  const rows = await prisma.game.findMany({
+    where: { status: 'waiting', isPrivate: false },
+    orderBy: { createdAt: 'desc' },
+    take: 25,
+    select: { id: true, totalPlayers: true, createdAt: true },
+  }).catch(() => []);
+
+  const withReal = [], neutral = [];
+  for (const row of rows) {
+    if (excludeId && row.id === excludeId) continue;
+    const g = await getG(row.id).catch(() => null);
+    if (!g || g.status !== 'waiting') continue;
+    if (userId && g.kicked?.[userId]) continue;          // chiqarib yuborilgan
+    if (g.vsBots) continue;                              // "botlar bilan" xonasi shaxsiy
+    const cap = g.totalPlayers || row.totalPlayers || 8;
+    const free = cap - (g.players || []).length;
+    if (free <= 0) continue;
+    const rr = roomRating(g);
+    const item = { id: row.id, free, rr, at: new Date(row.createdAt).getTime() };
+    (rr == null ? neutral : withReal).push(item);
+  }
+
+  // 1) Oynaga tushadigan, ODAM BOR xonalar — eng yaqini
+  const inBand = withReal.filter((x) => Math.abs(x.rr - rating) <= MATCH_BAND);
+  if (inBand.length) {
+    inBand.sort((a, b) => Math.abs(a.rr - rating) - Math.abs(b.rr - rating) || b.at - a.at);
+    return inBand[0].id;
+  }
+  // 2) Odam yo'q (bot bilan to'lgan) xona — hammaga bir xil mos
+  if (neutral.length) {
+    neutral.sort((a, b) => b.at - a.at);
+    return neutral[0].id;
+  }
+  // 3) Oynadan tashqarida bo'lsa ham eng yaqini — kutib qolgandan yaxshiroq
+  if (withReal.length) {
+    withReal.sort((a, b) => Math.abs(a.rr - rating) - Math.abs(b.rr - rating));
+    return withReal[0].id;
+  }
+  return null;
+}
+
+// So'rov yuborgan foydalanuvchining reytingi (keshlanadi — lobbi tez-tez so'raydi)
+async function myRating(userId) {
+  if (!isRealUser(userId)) return RATING_START;
+  const ck = 'rating:' + userId;
+  const hot = memGet(ck);
+  if (hot != null) return hot;
+  const s = await prisma.userStats.findUnique({ where: { userId }, select: { rating: true } }).catch(() => null);
+  const r = s?.rating ?? RATING_START;
+  memSet(ck, r, 30000);
+  return r;
+}
 
 // ==================== BO'SH XONA AVTO-O'CHIRISH ====================
 // Xona yaratilgach yoki barcha o'yinchilar chiqib ketib 0 ga tushganda 2 daqiqa kutiladi.
@@ -5137,13 +5266,21 @@ io.on('connection', (socket) => {
       const isHost = g.hostId && g.hostId === userId;
       let avatar = null;
       let verified = false;
+      let rating = RATING_START;
       if (userId && !String(userId).startsWith('guest-')) {
         const u = await prisma.user.findUnique({
           where: { id: userId },
-          select: { avatar: true, fullName: true, birthDate: true, region: true, gender: true, tgId: true },
+          select: {
+            avatar: true, fullName: true, birthDate: true, region: true, gender: true, tgId: true,
+            // Reyting o'yinchi bilan birga holatga yoziladi — xonaning
+            // moslashtirish reytingi shundan hisoblanadi. Alohida so'rov
+            // qo'shilmaydi: bu so'rov baribir bajarilyapti.
+            stats: { select: { rating: true } },
+          },
         }).catch(() => null);
         avatar = u?.avatar || null;
         verified = u ? profileState(u).verified : false;
+        rating = u?.stats?.rating ?? RATING_START;
       }
       const player = {
         socketId: socket.id,
@@ -5151,6 +5288,7 @@ io.on('connection', (socket) => {
         username: username || 'O\'yinchi-' + socket.id.slice(0, 4),
         avatar,
         verified,
+        rating,
         role: null, isAlive: true, connected: true, isHost, joinedAt: Date.now()
       };
       g.players.push(player);

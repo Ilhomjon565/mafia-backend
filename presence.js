@@ -172,6 +172,25 @@ const PLAYER_NAMES = [
   'baxtiyor', 'iskandar', 'jamshid', 'komil', 'lochin', 'mahmud', 'normurod',
 ];
 
+// ==================== LIGA (ishonarli taqsimot) ====================
+// Lobbi ro'yxatidagi HAR BIR xona ligasini ko'rsatadi — o'yinchi o'ziga mos
+// xonani tanlay olsin. Maydon HAR DOIM bo'lishi SHART: ba'zi xonada bo'lib
+// ba'zisida bo'lmasa, aynan shu farq bot xonasini oshkor qilardi.
+//
+// Odam o'ynayotgan xonada liga HAQIQIY reytingdan hisoblanadi (server.js).
+// Bot bilan to'lgan va soxta xonalarda esa shu yerdagi barqaror taqsimot
+// ishlatiladi. Og'irliklar haqiqiy o'yinchilar taqsimotiga o'xshash: ko'pchilik
+// past-o'rta ligada, yuqori liga kam uchraydi.
+const TIER_WEIGHTS = [
+  ['bronze', 22], ['silver', 28], ['gold', 24],
+  ['platinum', 14], ['diamond', 8], ['master', 3], ['legend', 1],
+];
+export function pseudoTier(seed) {
+  let x = h32(seed) % 100;
+  for (const [key, w] of TIER_WEIGHTS) { if (x < w) return key; x -= w; }
+  return 'silver';
+}
+
 // Deterministik hash — bir xil kirish har doim bir xil natija beradi.
 function h32(n) {
   let x = (n | 0) ^ 0x9e3779b9;
@@ -391,6 +410,9 @@ export function fakeRooms(now = Date.now(), enabled = true) {
       // xonaga barqaror 0-179 soniyalik siljish qo'shiladi.
       createdAt: new Date(b * BIRTH_MS + (h32(b * 7757) % 180) * 1000).toISOString(),
       phase: playing ? 'day_discussion' : 'waiting',
+      // Liga — o'yinchi o'ziga mos xonani tanlashi uchun. Soxta xonada
+      // barqaror taqsimotdan olinadi (haqiqiy xonada haqiqiy reytingdan).
+      tier: pseudoTier(b * 60013),
       players,
       events,                // "kim kirdi / kim chiqdi" (jangda bo'sh)
     });

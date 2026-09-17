@@ -1733,12 +1733,44 @@ app.get('/api/games', async (_, res) => {
     // emas, unga kirmoqchi bo'lgan odam "Xona topilmadi" xatosini ko'rardi.
     // Haqiqiy xonalar tepada turadi — odamlar bir-birini topa olsin.
     const real = enriched.filter(Boolean);
-    const list = [...real, ...fakeRooms(Date.now(), FAKE_ONLINE)];
+    const list = dedupeLobbyNames(real, fakeRooms(Date.now(), FAKE_ONLINE));
     await redis.set('cache:games', JSON.stringify(list), 'EX', 3).catch(() => {});
     memSet('games', list, 1500);
     res.json(list);
   } catch (e) { serverFail(res, e); }
 });
+
+// Lobbi bo'ylab TAXALLUSLAR takrorlanmasin.
+//
+// Ikki mustaqil manba bor: HAQIQIY xonalarni to'ldiruvchi botlar (bot-ai.js —
+// BOT_NAMES) va ro'yxatga qo'shiladigan soxta xonalar (presence.js —
+// PLAYER_NAMES). Har biri o'z ichida takrorlanmaydi, lekin ikki ro'yxat
+// kesishadi — natijada bitta taxallus lobbining ikki xonasida BIR VAQTDA
+// ko'rinardi. Jonli saytda bunday bo'lmaydi va buni payqash oson.
+//
+// Faqat SOXTA xonaning o'yinchilari qayta nomlanadi: ularning nomi shunchaki
+// ko'rsatiladi, hech qanday holatga bog'lanmagan. Haqiqiy xonadagi nom esa
+// o'yin holatining o'zi — uni javobda o'zgartirish xona ichidagi ko'rinish
+// bilan ziddiyat yaratardi.
+//
+// Haqiqiy xonalar birinchi kelgani uchun ularning nomlari HAR DOIM ustun:
+// soxta xonalardagi nom o'zgarishi faqat haqiqiy xonalar o'zgarganda sodir
+// bo'ladi, ya'ni ro'yxat har yangilanishda sakrab turmaydi.
+function dedupeLobbyNames(realRooms, fakeRoomsList) {
+  const taken = new Set();
+  for (const r of realRooms) for (const p of r.players || []) taken.add(String(p.username).toLowerCase());
+  for (const r of fakeRoomsList) {
+    for (const p of r.players || []) {
+      const low = String(p.username).toLowerCase();
+      if (!taken.has(low)) { taken.add(low); continue; }
+      // Band bo'lmagan birinchi zaxira nomni olamiz (barqaror tartibda)
+      const free = BOT_NAMES.find((n) => !taken.has(n.toLowerCase()));
+      p.username = free || (p.username + crypto.randomInt(10, 99));
+      taken.add(String(p.username).toLowerCase());
+    }
+  }
+  return [...realRooms, ...fakeRoomsList];
+}
 
 // Kutayotgan xonaning jurnalidan oxirgi kirish/chiqish hodisalarini
 // oladi. Faqat KUTISH holatida: o'yin boshlangach lobbi kartasida bu

@@ -2241,7 +2241,11 @@ async function finishRecording(gameId, g, winner) {
     // `id` — ovoz fayllari nomi bilan bir xil (publicId), shuning uchun admin
     // qaysi fayl kimniki ekanini aniqlay oladi.
     players: (g.players || []).map((p) => ({
-      id: p.publicId || p.socketId,
+      // DIQQAT: kalit /api/voice-chunk dagi fayl nomi bilan AYNAN bir xil
+      // bo'lishi shart (`p.publicId || p.userId`) — admin ovozni o'yinchiga
+      // shu orqali bog'laydi. Ilgari bu yerda `socketId` edi va haqiqiy
+      // o'yinchining ovozi hech qachon egasiga bog'lanmasdi.
+      id: p.publicId || p.userId,
       userId: isRealUser(p.userId) ? p.userId : null,
       username: p.username,
       role: p.role || null,

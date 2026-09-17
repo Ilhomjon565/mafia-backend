@@ -79,7 +79,10 @@ export function hasAngle(input) {
 // DIQQAT: o'yinda raqam KO'P ishlatiladi ("3 ga beraman", "5-raqam shubhali"),
 // shuning uchun telefon qoidasi kamida 7 ta ketma-ket raqamni talab qiladi.
 const LINKY = /(https?:\/\/|www\.|t\.me\/|telegram\.me\/|wa\.me\/|\b[a-z0-9-]{2,}\.(uz|com|ru|net|org|me|io|co|info|site|online|xyz)\b)/i;
-const PHONE = /(?:\+?\d[\s\-().]*){7,}/;
+// 9 ta raqam — O'zbekiston raqamining uzunligi (901234567). 7 chegarasi
+// haqiqiy raqamni to'sish uchun kerak emas edi, lekin o'yindagi oddiy uzun
+// sonni (sana, hisob, xona raqami) to'sib qo'yardi.
+const PHONE = /(?:\+?\d[\s\-().]*){9,}/;
 
 export function checkChat(text, recent = []) {
   const t = String(text || '').trim();

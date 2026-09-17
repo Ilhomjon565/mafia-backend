@@ -111,6 +111,10 @@ pm2 restart mafia-backend
 > (drift bor), shuning uchun `migrate deploy` yiqiladi. Drift tuzatilsa
 > `migrate deploy` ga qaytish mumkin.
 
+> **E2E sinovlari:** `npm test` sof modullarni tekshiradi. Yozuv, shikoyat va
+> jazo oqimi esa HAQIQIY serverga qarshi sinaladi — `e2e/README.md` ga qarang
+> (61 ta tekshiruv; birinchi ishga tushirishda 3 ta haqiqiy nuqson topgan).
+
 > **Nega `npm test` majburiy:** oʻyin qoidalari, bot xulqi, chat filtri va
 > soxta xonalarning “bot ekani koʻrinmasin” shartlari aynan shu testlar bilan
 > qulflangan. Ular yiqilsa deploy qilinmaydi.

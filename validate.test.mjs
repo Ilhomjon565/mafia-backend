@@ -187,6 +187,15 @@ test('havola yuborib bo\'lmaydi', () => {
   }
 });
 
+test('oddiy uzun son TO\'SILMAYDI (o\'yinda sana/hisob ishlatiladi)', () => {
+  // E2E sinovida topilgan: 7 ta raqam chegarasi juda tor edi va o'yindagi
+  // oddiy xabarlar ham bloklanib, dalilga chat umuman tushmay qolgandi.
+  for (const good of ['xona 1234567', 'hisob 45 : 12 bo\'ldi', '2026 yil 17 sentabr']) {
+    const r = checkChat(good);
+    assert.equal(r.ok, true, 'bekorga to\'sdi: ' + good + ' (' + r.code + ')');
+  }
+});
+
 test('telefon raqam yuborib bo\'lmaydi', () => {
   for (const bad of ['+998901234567', '90 123 45 67 ga qongiroq qil', '998-90-123-45-67']) {
     const r = checkChat(bad);

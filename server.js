@@ -34,6 +34,14 @@ import {
 // Bir marta jimgina ishlamay qolgan mantiq (startedAt holatga yozilmagan edi),
 // shuning uchun endi testlar bilan qulflangan.
 import { gameElapsed as pacingElapsed, phaseDuration, isTimeUp, GAME_HARD_MS } from './pacing.js';
+// Matn tekshiruvi va tozalash — testlari validate.test.mjs da.
+// `<` va `>` HAR QANDAY kelgan matndan olib tashlanadi (to'liq kenglikdagi
+// belgilar, HTML mohiyatlari va ko'rinmas belgilar bilan qilingan
+// "aylanma yo'llar" ham yopilgan).
+import {
+  cleanText, cleanDeep, validateNick, validateRoomName,
+  NICK_MIN, NICK_MAX,
+} from './validate.js';
 
 
 // override: true — .env HAR DOIM ustun. Busiz pm2 (yoki shell) dan kelgan bo'sh
@@ -266,6 +274,23 @@ app.use(express.json({ limit: '800kb' })); // avatar (base64) sig'adi, lekin ulk
 app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); next(); });
 // PANIC eng oldinda: to'lqin kelganda hech qanday qimmat ish bajarilmasin
 app.use(panicMiddleware);
+
+// BURCHAKLI QAVSLARNI OLIB TASHLASH — bitta joyda, hamma yo'l uchun.
+// Har bir route o'zi tozalashga tayanib bo'lmaydi: bitta yangi endpoint
+// yozilganda u esdan chiqadi va teshik paydo bo'ladi. Shuning uchun
+// tozalash so'rov ZANJIRINING boshida turadi.
+//
+// Avatar (base64) va boshqa uzun satrlar shikast ko'rmaydi: ular ichida
+// qavs bo'lmaydi.
+app.use((req, _res, next) => {
+  if (req.body && typeof req.body === 'object') cleanDeep(req.body);
+  if (req.query && typeof req.query === 'object') {
+    for (const k of Object.keys(req.query)) {
+      if (typeof req.query[k] === 'string') req.query[k] = cleanText(req.query[k], { maxLen: 300 });
+    }
+  }
+  next();
+});
 app.use(limitGlobal); // umumiy IP xavfsizlik to'ri (saxiy — CGNAT'ni hisobga olib)
 
 // 🕵️ Admin panelni yashirish: maxfiy kalitsiz BARCHA /api/admin/* — 404 (mavjud emasdek).
@@ -827,6 +852,22 @@ async function adminMiddleware(req, res, next) {
   }
 }
 
+// Taxallus xatosining O'ZBEKCHA matni. Mijoz `code` ni olib o'z tilida
+// ko'rsatadi — bu matn faqat zaxira (API ni to'g'ridan-to'g'ri
+// chaqirganlar va loglar uchun).
+function nickError(code) {
+  return {
+    empty: 'Taxallus bo\'sh bo\'lmasin',
+    short: `Taxallus kamida ${NICK_MIN} belgi bo\'lishi kerak`,
+    long: `Taxallus ${NICK_MAX} belgidan oshmasin`,
+    edge: 'Taxallus harf yoki raqam bilan boshlanib, shunday tugashi kerak',
+    sep: 'Ketma-ket "_", "." yoki "-" bo\'lmasin',
+    chars: 'Faqat harf, raqam va "_", ".", "-" — lotin yoki kirill (aralash emas)',
+    digits: 'Taxallus faqat raqamdan iborat bo\'lmasin',
+    reserved: 'Bu taxallus band',
+  }[code] || 'Taxallus qoidaga mos emas';
+}
+
 // ==================== AUTH ROUTES ====================
 
 app.post('/api/register', limitAuth, async (req, res) => {
@@ -834,8 +875,11 @@ app.post('/api/register', limitAuth, async (req, res) => {
     const s = await getSettings();
     if (!s.allowPasswordAuth) return res.status(403).json({ error: 'Ro\'yxatdan o\'tish faqat Google orqali' });
     let { username, password } = req.body;
-    username = (username || '').trim();
-    if (username.length < 2) return res.status(400).json({ error: 'Username kamida 2 belgi' });
+    const nick = validateNick(username);
+    if (!nick.ok) {
+      return res.status(400).json({ error: nickError(nick.code), code: 'nick_' + nick.code });
+    }
+    username = nick.value;
     if (!password || password.length < 3) return res.status(400).json({ error: 'Parol kamida 3 belgi' });
 
     const exists = await prisma.user.findUnique({ where: { username } });
@@ -882,17 +926,33 @@ app.post('/api/login', limitAuth, async (req, res) => {
 // "Sign in with Google" tugmasi yuborgan ID token (credential) ni tekshiradi,
 // gmail/ism/rasm oladi, foydalanuvchini yaratadi yoki topadi va token qaytaradi.
 
+// Google'dan kelgan ismdan TAXALLUS yasaydi. Natija validateNick()
+// qoidalariga mos bo'lishi SHART: aks holda o'yinchi keyin taxallusini
+// o'zgartirmoqchi bo'lganda "mavjud nomingiz qoidaga mos emas" degan
+// tushunarsiz holatga tushardi.
 async function uniqueUsername(base) {
-  let candidate = (base || 'player')
-    .normalize('NFKD').replace(/[^a-zA-Z0-9_]/g, '').slice(0, 20) || 'player';
+  // Lotin va kirill variantlari alohida yig'iladi va UZUNROG'I olinadi:
+  // ism kirill bo'lsa ("Иван Петров") kirill taxallus chiqadi, aralash
+  // bo'lsa qoidaga ko'ra faqat bitta yozuv tizimi qoladi.
+  const raw = String(base || '').normalize('NFKC');
+  const lat = raw.replace(/[^A-Za-z0-9]/g, '');
+  const cyr = raw.replace(/[^Ѐ-ӿ0-9]/g, '');
+  let candidate = (cyr.length > lat.length ? cyr : lat)
+    .replace(/^[0-9]+/, '')          // raqam bilan boshlanmasin
+    .slice(0, NICK_MAX);
+  while (candidate.length && candidate.length < NICK_MIN) candidate += 'x';
+  if (!candidate || !validateNick(candidate).ok) candidate = 'player';
+
   let username = candidate;
-  // band bo'lsa raqam qo'shib ketamiz
+  // band bo'lsa raqam qo'shib ketamiz (uzunlik chegarasini buzmasdan)
   for (let i = 0; i < 50; i++) {
     const taken = await prisma.user.findUnique({ where: { username } });
     if (!taken) return username;
-    username = `${candidate}${Math.floor(1000 + Math.random() * 9000)}`;
+    const suffix = String(Math.floor(1000 + Math.random() * 9000));
+    username = candidate.slice(0, NICK_MAX - suffix.length) + suffix;
   }
-  return `${candidate}${Date.now().toString().slice(-6)}`;
+  const tail = Date.now().toString().slice(-6);
+  return candidate.slice(0, NICK_MAX - tail.length) + tail;
 }
 
 app.post('/api/auth/google', limitAuth, async (req, res) => {
@@ -1260,9 +1320,11 @@ app.put('/api/me/profile', authMiddleware, limitByUser(15), async (req, res) => 
     let { username, avatar } = req.body;
     const data = {};
     if (username !== undefined) {
-      username = String(username || '').trim();
-      if (username.length < 2) return res.status(400).json({ error: 'Nikname kamida 2 belgi bo\'lishi kerak' });
-      if (username.length > 20) return res.status(400).json({ error: 'Nikname 20 belgidan oshmasin' });
+      const nick = validateNick(username);
+      if (!nick.ok) {
+        return res.status(400).json({ error: nickError(nick.code), code: 'nick_' + nick.code });
+      }
+      username = nick.value;
       const taken = await prisma.user.findFirst({ where: { username, NOT: { id: req.user.userId } } });
       if (taken) return res.status(409).json({ error: 'Bu nikname band' });
       data.username = username;
@@ -1579,6 +1641,14 @@ app.post('/api/games/:id/open', authMiddleware, limitByUser(6), async (req, res)
   }
 });
 
+// Xona nomi: tozalangan va cheklangan. Bo'sh yoki qoidaga mos kelmasa —
+// egasining taxallusidan yasaladi (o'yinchi nom yozishga majbur emas).
+function roomName(raw, owner) {
+  const r = validateRoomName(raw);
+  if (r.ok) return r.value;
+  return cleanText(`${owner} xonasi`, { maxLen: 40 });
+}
+
 // yangi xona yaratish (ko'p xona ruxsat etilgan)
 app.post('/api/games', authMiddleware, limitByUser(30), async (req, res) => {
   try {
@@ -1616,7 +1686,7 @@ app.post('/api/games', authMiddleware, limitByUser(30), async (req, res) => {
 
     const game = await prisma.game.create({
       data: {
-        name: (name || '').trim().slice(0, 40) || `${req.user.username} xonasi`,
+        name: roomName(name, req.user.username),
         status: 'waiting', hostId: req.user.userId, isPrivate: !!isPrivate,
         totalPlayers, maxPlayers: 20, minPlayers: settings.minPlayers || 5,
         mafiaCount, sheriffCount, doctorCount, civilCount
@@ -3840,6 +3910,20 @@ io.use((socket, next) => {
 
 io.on('connection', (socket) => {
   console.log(`✅ ${socket.id}`);
+
+  // SOCKET UCHUN HAM tozalash. HTTP middleware bu yo'lni ko'rmaydi, chat
+  // esa aynan socket orqali keladi — ya'ni bu qatlam bo'lmasa qavslar
+  // faqat bitta yo'ldan to'silgan bo'lardi.
+  socket.use((packet, next) => {
+    try {
+      for (let i = 1; i < packet.length; i++) {
+        const a = packet[i];
+        if (typeof a === 'string') packet[i] = cleanText(a, { maxLen: 4000 });
+        else if (a && typeof a === 'object') cleanDeep(a);
+      }
+    } catch {}
+    next();
+  });
   // Ulangan, lekin hech qaysi o'yinga kirmagan socketni tozalaymiz:
   // bot ulanib jim turib xotira egallashi mumkin emas.
   socket.data.idleTimer = setTimeout(() => {

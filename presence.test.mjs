@@ -298,3 +298,57 @@ test('onlayn hech qachon 0 ko\'rsatmaydi', () => {
     }
   }
 });
+
+
+// ---------- Ochiq xonalardagi jonli harakat ----------
+
+test('ochiq xonada kirish/chiqish hodisalari bo\'ladi', () => {
+  const t = Date.UTC(2026, 8, 17, 16, 0, 0);
+  const open = fakeRooms(t).filter((r) => r.status === 'waiting' && r.players.length < r.totalPlayers);
+  assert.ok(open.length > 0, 'ochiq xona yo\'q');
+  for (const r of open) {
+    assert.ok(Array.isArray(r.events) && r.events.length > 0, 'hodisa yo\'q: ' + r.name);
+    for (const e of r.events) {
+      assert.ok(e.n && e.n.length > 1, 'ism yo\'q');
+      assert.ok(e.t === 'join' || e.t === 'leave', 'turi: ' + e.t);
+      assert.ok(e.s >= 1 && e.s <= 120, 'vaqt: ' + e.s);
+    }
+  }
+});
+
+test('jangdagi xonada harakat ko\'rsatilmaydi', () => {
+  const t = Date.UTC(2026, 8, 17, 16, 0, 0);
+  for (const r of fakeRooms(t)) {
+    if (r.status === 'playing') assert.equal(r.events.length, 0, r.name);
+  }
+});
+
+test('hodisalar VAQTdan hisoblanadi (uch instansiya bir xil ko\'rsatadi)', () => {
+  // Bir xil vaqtda ikki marta chaqirilsa natija AYNAN bir xil bo'lishi kerak:
+  // aks holda uchta frontend instansiyasi turli ro'yxat ko'rsatardi.
+  const t = Date.UTC(2026, 8, 17, 16, 3, 7);
+  assert.deepEqual(fakeRooms(t), fakeRooms(t));
+});
+
+test('o\'yinchi soni chegaradan chiqmaydi', () => {
+  for (let k = 0; k < 300; k++) {
+    const t = Date.UTC(2026, 8, 17) + k * 11000;
+    for (const r of fakeRooms(t)) {
+      assert.ok(r.players.length >= 3, 'juda bo\'sh: ' + r.players.length);
+      assert.ok(r.players.length <= r.totalPlayers, 'sig\'imdan oshdi');
+      if (r.status === 'waiting' && r.events.length) {
+        assert.ok(r.players.length < r.totalPlayers, 'ochiq xona to\'lib qoldi: ' + r.name);
+      }
+    }
+  }
+});
+
+test('son o\'zgarib turadi (muzlab qolmaydi)', () => {
+  const seen = new Set();
+  for (let k = 0; k < 40; k++) {
+    const t = Date.UTC(2026, 8, 17, 16, 0, 0) + k * 22000;
+    const r = fakeRooms(t).find((x) => x.status === 'waiting' && x.events.length);
+    if (r) seen.add(r.players.length);
+  }
+  assert.ok(seen.size >= 2, 'son o\'zgarmadi: ' + [...seen]);
+});

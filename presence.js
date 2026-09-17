@@ -145,6 +145,12 @@ const ROOM_CITIES = [
 ];
 const ROOM_SUFFIX = ['xonasi', 'davrasi', 'o\'yini', 'jangi', 'kechasi', 'stoli'];
 
+// Ochiq xonada har qancha vaqtda bitta kirish/chiqish hodisasi bo'ladi.
+// 22 soniya: lobbi ro'yxati 6 soniyada yangilanadi, ya'ni o'yinchi bir
+// xonani kuzatib turganda har 3-4 yangilanishda yangi hodisa ko'radi —
+// jonli, lekin bezovta qiladigan darajada tez emas.
+const EVENT_MS = 22000;
+
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
 // `host` — xona ochgan (bot) taxallusi, `used` — hozir ochiq xonalar nomlari.
@@ -189,7 +195,33 @@ export function fakeRooms(now = Date.now(), enabled = true) {
     // Qolganlarining 70% i jangda, 30% i to'lib boshlanishini kutmoqda
     const playing = !open && ((s >>> 11) % 10) < 7;
     const free = open ? 2 + ((s >>> 17) % 3) : 0;
-    const filled = Math.max(3, total - free);
+    let filled = Math.max(3, total - free);
+
+    // ===== JONLI HARAKAT (faqat ochiq xonalarda) =====
+    // Ochiq xona muzlab turmasligi kerak: odamlar kirib-chiqib turadi.
+    // Har ~22 soniyada bitta hodisa bo'ladi (kirdi yoki chiqdi) va
+    // o'yinchi soni shunga qarab bir-ikkiga o'zgaradi.
+    //
+    // Hammasi VAQTdan hisoblanadi (Math.random() yo'q): uchta frontend
+    // instansiyasi ham, 2 soniyalik kesh ham AYNI natijani beradi —
+    // aks holda ro'yxat har yangilanishda sakrab turardi.
+    const events = [];
+    if (open) {
+      const tick = Math.floor(now / EVENT_MS);
+      let delta = 0;
+      // Oxirgi uch hodisa: birinchisi eng yangi
+      for (let k = 0; k < 3; k++) {
+        const e = h32(slot * 7919 + i * 131 + (tick - k) * 17);
+        const join = (e % 100) < 58;          // 58% kirdi, 42% chiqdi
+        const name = PLAYER_NAMES[(e >>> 6) % PLAYER_NAMES.length];
+        // Hodisa qancha vaqt oldin bo'lgani (sekund)
+        const ago = Math.floor((now - (tick - k) * EVENT_MS) / 1000);
+        events.push({ n: name, t: join ? 'join' : 'leave', s: Math.max(1, ago) });
+        if (k === 0) delta = join ? 1 : -1;
+      }
+      // Son chegaradan chiqmasin: xona to'lib ketmasin va bo'shab qolmasin
+      filled = Math.min(total - 1, Math.max(3, filled + delta));
+    }
     const mafiaCount = Math.max(1, Math.round(total * 0.3));
     const players = [];
     const shift = s % PLAYER_NAMES.length;
@@ -215,6 +247,8 @@ export function fakeRooms(now = Date.now(), enabled = true) {
       createdAt: new Date(now - ((s % 25) + 2) * 60000).toISOString(),
       phase: playing ? 'day_discussion' : 'waiting',
       players,               // `open` bo'lsa joy bor, aks holda xona to'lgan
+      events,                // lobbi kartasidagi "kim kirdi / kim chiqdi"
+                             // (jangdagi xonada bo'sh: u yerda harakat yo'q)
     });
   }
   return out;

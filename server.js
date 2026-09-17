@@ -1565,7 +1565,10 @@ app.get('/api/games', async (_, res) => {
         // Haqiqiy o'yinchining ichki ID si ham tashqariga chiqmasligi kerak.
         players: (state?.players || []).map(p => ({
           userId: p.publicId || p.userId, username: p.username, isAlive: p.isAlive,
-        }))
+        })),
+        // Lobbi kartasida "kim kirdi / kim chiqdi" — o'yinchi xonaga
+        // kirmasdan ham u tirik ekanini ko'radi.
+        events: lobbyEvents(state),
       };
     }));
     // Lobbi bo'sh ko'rinmasin: soxta xonalar qo'shiladi. Ularning HAMMASI
@@ -1580,6 +1583,26 @@ app.get('/api/games', async (_, res) => {
     res.json(list);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// Kutayotgan xonaning jurnalidan oxirgi kirish/chiqish hodisalarini
+// oladi. Faqat KUTISH holatida: o'yin boshlangach lobbi kartasida bu
+// ma'lumotning ma'nosi yo'q (xonaga kira olmaysiz).
+//
+// Bot ham, odam ham bir xil ko'rinadi — jurnalda faqat taxallus bor.
+function lobbyEvents(state) {
+  if (!state || state.status !== 'waiting') return [];
+  const log = Array.isArray(state.log) ? state.log : [];
+  const out = [];
+  for (let i = log.length - 1; i >= 0 && out.length < 3; i--) {
+    const e = log[i];
+    const t = e?.reason === 'playerJoined' ? 'join' : e?.reason === 'playerLeft' ? 'leave' : null;
+    if (!t) continue;
+    const name = e?.args?.name;
+    if (!name) continue;
+    out.push({ n: name, t, s: Math.max(1, Math.round((Date.now() - (e.at || Date.now())) / 1000)) });
+  }
+  return out;
+}
 
 // ===== SOXTA XONANI OCHISH =====
 // Lobbidagi soxta xonaning ID si haqiqiy emas — unga to'g'ridan-to'g'ri
@@ -3259,17 +3282,19 @@ async function startBotGame(opts = {}) {
   };
   await saveG(game.id, state);
 
-  // Qolgan botlar bittalab kiradi (2-9 s), keyin xona UZOQ OCHIQ turadi —
-  // lobbi ro'yxatini ko'rgan odam kirib ulgursin. Bu asosiy maqsad: lobbida
-  // doim qo'shilib o'ynash mumkin bo'lgan xona turishi kerak. Odam kirmasa
-  // 4-9 daqiqadan keyin botlar o'zlari boshlaydi.
+  // Qolgan botlar bittalab kiradi (2-9 s), keyin xona qisqa vaqt OCHIQ
+  // turadi: odam kirsa u bilan o'ynaydi, kirmasa botlar o'zlari boshlaydi.
+  //
+  // NEGA QISQA (15-30 s): uzoq kutgan xona lobbida "muzlab qolgan" bo'lib
+  // ko'rinadi. Tez aylanma yaxshiroq: xona to'ladi, o'yin boshlanadi,
+  // tugaydi, o'rniga yangisi ochiladi — ro'yxat doim tirik. Odam uchun
+  // qo'shilish imkoni yo'qolmaydi: soxta xonaga bosilganda bir zumda
+  // haqiqiy xona yaratiladi (botlar allaqachon ichida).
   const rest = bots.slice(1 + upfront.length);
   scheduleBotJoins(game.id, rest, !!opts.quick);
-  // Tez rejimda odam kirishi bilan 10-15 soniyalik taymer ishga tushadi,
-  // bu esa faqat zaxira: odam kirmay qolsa ham xona muzlab turmasin.
   const startAfter = opts.quick
-    ? 90000 + crypto.randomInt(60000)
-    : rest.length * 9000 + 4 * 60000 + crypto.randomInt(5 * 60000);
+    ? 20000 + crypto.randomInt(15000)
+    : rest.length * 9000 + 15000 + crypto.randomInt(15000);
   setTimeout(() => withLock(game.id, async () => {
     const g = await getG(game.id);
     if (!g || g.status !== 'waiting') return;
@@ -3290,7 +3315,10 @@ async function startBotGame(opts = {}) {
 // Kuniga nechta bot o'yini: jadvalda 4-10 ta, zanjir bilan ham shundan
 // oshmasin. Botlar o'yini "sayt tirik" hissi uchun, lobbining asosiy
 // mazmuni uchun emas.
-const BOT_GAMES_MAX = 12;
+// Kuniga nechta bot o'yini. Aylanma tez bo'lgani uchun (xona 15-30
+// soniya kutadi, o'yin 20-30 daqiqa) bir kunda ~30 ta o'yin chiqadi.
+// Chegara shundan yuqori: tunda o'yin ochilmaydi va zaxira bo'lib qoladi.
+const BOT_GAMES_MAX = 44;
 function tashkentHour(now = Date.now()) {
   return new Date(now + 5 * 3600 * 1000).getUTCHours();
 }
@@ -3306,8 +3334,9 @@ async function chainNextBotGame() {
     const mark = -Date.now();
     await redis.sadd(dayKey, String(mark)).catch(() => {});
     await redis.expire(dayKey, 3 * 86400).catch(() => {});
-    // 6-16 daqiqa tanaffus: xona tugagan zahoti yangisi chiqsa sun'iy ko'rinadi
-    const delay = (6 + Math.random() * 10) * 60000;
+    // 2-6 daqiqa tanaffus: xona tugagan zahoti yangisi chiqsa sun'iy
+    // ko'rinadi, uzoq kutilsa esa lobbi bo'shab qoladi.
+    const delay = (2 + Math.random() * 4) * 60000;
     setTimeout(() => { startBotGame().catch(() => {}); }, delay);
     console.log(`\u{1F501} yangi bot xonasi ${Math.round(delay / 60000)} daqiqadan keyin`);
   } catch (e) {

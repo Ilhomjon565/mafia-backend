@@ -81,14 +81,69 @@ export function fakeGamesPlayed(now = Date.now(), enabled = true) {
 
 // ---------- lobbidagi xonalar ----------
 
-// Xona nomlari — haqiqiy o'yinchilar yozadigan uslubda.
-const ROOM_NAMES = [
-  'Tungi shahar', 'Tez o\'yin', 'Faqat tajribalilar', 'Kim mafiya?',
-  'Do\'stlar davrasi', 'Mafiya 12', 'Kechki o\'yin', 'Toshkent',
-  'Yangi boshlovchilar', 'Klassik', 'Ovozli chat bor', 'Qizg\'in jang',
-  'Sokin xona', 'Tezkor', 'Katta o\'yin', 'Mafia UZ', 'Kim kim?',
-  'Shahar uxlaydi', 'Tunda ov', 'Oltin xona',
+// ==================== XONA NOMLARI ====================
+// Nomlar HAQIQIY o'yinchi yozadigan uslubda bo'lishi kerak.
+//
+// Ilgari ro'yxat "marketing" uslubida edi: 'Tungi shahar', 'Oltin xona',
+// 'Sirli xona', 'Toshbo'ron' va shahar nomlari ('Samarqand mafiyasi').
+// Odam xonasiga bunday nom qo'ymaydi — bu sayt o'zi o'ylab topgani darhol
+// bilinadi. Haqiqiy o'yinchi ikki narsadan birini yozadi:
+//   1) xonani O'Z NOMI bilan ataydi — "Aziz xonasi", "Sardor bilan o'ynaymiz";
+//   2) qisqa, AMALIY narsa yozadi — "tez boshlaymiz", "mikrofon bor",
+//      "2 kishi yetmayapti".
+// Ko'pincha kichik harfda va imlo belgilarisiz (telefonda tez yozilgani uchun).
+
+// Egasi nomi bilan — eng ko'p uchraydigan shakl. {n} — taxallus.
+const ROOM_OWNED = [
+  '{n} xonasi',
+  '{n} bilan oynaymiz',
+  '{n}ning xonasi',
+  '{n} davrasi',
+  '{n} va dostlar',
+  '{n} xonasiga kiring',
+  '{n} bilan mafiya',
+  '{n} chaqiryapti',
 ];
+
+// Raqamli shakl. "qani ketdik 21" kabi narsa g'aliz chiqadi — odam raqamni
+// O'YINCHILAR SONI ma'nosida yozadi ("mafiya 12", "10 kishilik").
+const ROOM_COUNT = ['{k} kishilik', 'mafiya {k}', '{k} kishi', '{k} lik oyin'];
+
+// Shaxssiz, qisqa iboralar — odam nima yozsa, shu.
+const ROOM_PLAIN = [
+  'tez boshlaymiz', 'kim bor', 'kiring tez', 'joy bor', 'mikrofon bor',
+  'faqat ovozli', 'ovozsiz ham boladi', 'yangilar uchun', 'tajribalilar',
+  'oddiy oyin', 'keling oynaymiz', 'birga oynaymiz', 'kim qoshiladi',
+  'kechki oyin', 'tungi oyin', 'zerikdim oynaymiz', 'gaplashamiz',
+  'sekin oynaymiz', 'hammaga ochiq', 'salom hammaga', 'mafiya oynaymiz',
+  'qani ketdik', 'yaxshi oyin bolsin', 'urishmaymiz', 'ovozli chat bor',
+  'tajriba kerak emas', 'kim mafiya', '2 kishi yetmayapti', '3 kishi kerak',
+  '5 kishi kerak', 'kirveringlar', 'tayyormisiz', 'oxirgi joy', 'bosh joy bor',
+  'Tez oyin', 'Kim bor', 'Dostlar', 'Kechqurun', 'Mafiya', 'Oddiy xona',
+];
+
+// Xona nomini SEED dan yasaydi (deterministik — lobbi ro'yxati uchun shart:
+// uchta frontend instansiyasi va nginx keshi AYNI natijani berishi kerak).
+// "{n}ning xonasi" faqat TOZA ismga yarashadi: "sardor_7ning xonasi" g'aliz
+// chiqadi. Raqam yoki pastki chiziq bo'lsa boshqa shakl tanlanadi.
+function ownedFor(name, i) {
+  const clean = /^[A-Za-z\u0100-\u024F']+$/.test(String(name));
+  const list = clean ? ROOM_OWNED : ROOM_OWNED.filter((t) => !t.includes('{n}ning'));
+  return list[i % list.length].replace('{n}', name);
+}
+
+function makeRoomName(seed) {
+  const r = h32(seed) % 100;
+  const who = PLAYER_NAMES[h32(seed * 31 + 7) % PLAYER_NAMES.length];
+  // 45% — egasi nomi bilan ("kimningdir xonasi"), qolgani qisqa ibora
+  if (r < 45) return ownedFor(who, h32(seed * 7 + 3));
+  // Ba'zan o'yinchilar soni yoziladi — odamlar shunday qiladi
+  if (r >= 90) {
+    return ROOM_COUNT[h32(seed * 19) % ROOM_COUNT.length]
+      .replace('{k}', String(8 + (h32(seed * 17) % 9)));
+  }
+  return ROOM_PLAIN[h32(seed * 13 + 5) % ROOM_PLAIN.length];
+}
 // Lobbidagi soxta xonalarda ko'rinadigan taxalluslar.
 //
 // Ro'yxatda ATIGI 26 ta nom bor edi, lobbida esa bir vaqtda 40-80 "o'yinchi"
@@ -134,13 +189,17 @@ function h32(n) {
 //
 // To'plam har 7 daqiqada yangilanadi: xonalar "tugaydi", o'rniga boshqasi
 // "ochiladi" — lobbi jonli ko'rinadi.
-// Ishlatilmagan nom tanlaydi (ro'yxat tugasa oxirgisini qaytaradi).
+// Ishlatilmagan nom tanlaydi. Seed'ni siljitib qayta urinadi — nom
+// generatordan yasalgani uchun ro'yxat "tugab" qolmaydi.
 function pickName(used, seed) {
-  for (let k = 0; k < ROOM_NAMES.length; k++) {
-    const nm = ROOM_NAMES[(seed + k) % ROOM_NAMES.length];
+  for (let k = 0; k < 60; k++) {
+    const nm = makeRoomName(seed + k * 7919);
     if (!used.has(nm)) { used.add(nm); return nm; }
   }
-  return ROOM_NAMES[seed % ROOM_NAMES.length];
+  // Deyarli bo'lmaydigan holat: oxiriga raqam qo'shib ajratamiz
+  const nm = makeRoomName(seed) + ' ' + (2 + (h32(seed * 23) % 90));
+  used.add(nm);
+  return nm;
 }
 
 // ==================== XONA NOMI GENERATORI ====================
@@ -151,20 +210,10 @@ function pickName(used, seed) {
 // Shuning uchun bir nechta QOLIP aralashtiriladi: taxallus + qo'shimcha,
 // shahar nomi, mavzu, raqam. Emoji ishlatilmaydi va nom 🤖 bilan
 // boshlanmaydi — server bot rejimini (vsBots) aynan shu belgidan taniydi.
-const ROOM_TOPICS = [
-  'Tungi shahar', 'Kim mafiya?', 'Kechki o\'yin', 'Klassik', 'Tezkor o\'yin',
-  'Sokin xona', 'Qizg\'in jang', 'Shahar uxlaydi', 'Tunda ov', 'Oltin xona',
-  'Do\'stlar davrasi', 'Faqat tajribalilar', 'Yangi boshlovchilar',
-  'Ovozli chat bor', 'Katta o\'yin', 'Kim kim?', 'Tun bo\'yi',
-  'Oqshom o\'yini', 'Mafiya kechasi', 'Sirli xona', 'Ochiq jang',
-  'Shubhali xona', 'Yarim tunda', 'Toshbo\'ron', 'Jimjit tun',
-];
-const ROOM_CITIES = [
-  'Toshkent', 'Samarqand', 'Buxoro', 'Andijon', 'Farg\'ona', 'Namangan',
-  'Xiva', 'Nukus', 'Qo\'qon', 'Jizzax', 'Navoiy', 'Termiz', 'Guliston',
-  'Urganch', 'Qarshi', 'Chirchiq', 'Marg\'ilon', 'Shahrisabz',
-];
-const ROOM_SUFFIX = ['xonasi', 'davrasi', 'o\'yini', 'jangi', 'kechasi', 'stoli'];
+// DIQQAT: shahar nomlari ('Samarqand mafiyasi') ATAYLAB olib tashlandi —
+// odam xonasiga shahar nomini qo'ymaydi va bu sayt o'zi nom o'ylab
+// topayotganini darhol ko'rsatib qo'yardi. Nomlar endi yuqoridagi
+// ROOM_OWNED / ROOM_PLAIN dan olinadi.
 
 // Ochiq xonada har qancha vaqtda bitta kirish/chiqish hodisasi bo'ladi.
 // 22 soniya: lobbi ro'yxati 6 soniyada yangilanadi, ya'ni o'yinchi bir
@@ -181,17 +230,16 @@ export function randomRoomName(host = '', used = []) {
   const h = String(host || '').trim();
   const make = () => {
     const r = Math.random();
-    if (h && r < 0.34) return `${h} ${pick(ROOM_SUFFIX)}`;
-    if (r < 0.62) return pick(ROOM_TOPICS);
-    if (r < 0.78) return `${pick(ROOM_CITIES)} ${pick(['mafiyasi', 'kechasi', 'xonasi'])}`;
-    if (r < 0.9) return `${pick(ROOM_TOPICS)} ${2 + Math.floor(Math.random() * 20)}`;
-    return h ? `${h} bilan o\'ynaymiz` : pick(ROOM_TOPICS);
+    // Xona egasi bor — odamlar ko'pincha xonani O'Z NOMI bilan ataydi
+    if (h && r < 0.5) return ownedFor(h, Math.floor(Math.random() * 1e6));
+    if (r < 0.9) return pick(ROOM_PLAIN);
+    return pick(ROOM_COUNT).replace('{k}', String(8 + Math.floor(Math.random() * 9)));
   };
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < 20; i++) {
     const nm = make().slice(0, 40).trim();
     if (nm && !taken.has(nm.toLowerCase())) return nm;
   }
-  return `${pick(ROOM_TOPICS)} ${1 + Math.floor(Math.random() * 99)}`.slice(0, 40);
+  return `${pick(ROOM_PLAIN)} ${1 + Math.floor(Math.random() * 99)}`.slice(0, 40);   // zaxira: takror bo'lmasin
 }
 
 // ==================== XONANING HAYOT DAVRI ====================

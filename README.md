@@ -52,6 +52,32 @@ node --check server.js
 | `TG_GROUP_CHAT_ID` / `TG_GROUP_LINK` | Yangi xona eʼlonlari uchun guruh |
 | `CF_TURN_KEY_ID` / `CF_TURN_API_TOKEN` | Cloudflare TURN (ovozli chat) |
 
+### Oʻyin yozuvlari (shikoyat uchun dalil)
+
+Shikoyat kelgan oʻyinning ovozli chati, matnli chati va toʻliq tarixi
+saqlanadi. **Shikoyatsiz oʻyin yozuvi oʻyin tugagach oʻchiriladi** — disk
+toʻlib qolmasligi uchun.
+
+| Oʻzgaruvchi | Sukut | Tavsif |
+|---|---|---|
+| `VOICE_RECORD` | `1` | `0` — ovoz yozuvini butunlay oʻchiradi |
+| `RECORD_DIR` | `/srv/mafia/recordings` | Yozuvlar katalogi |
+| `RECORD_MAX_MB` | `1500` | UMUMIY chegara; oshsa yangi yozuv boshlanmaydi va eng eskisi oʻchadi |
+| `RECORD_GAME_MB` | `30` | Bitta oʻyin uchun chegara |
+| `RECORD_USER_MB` | `6` | Bitta oʻyinchi uchun chegara |
+| `RECORD_KEEP_DAYS` | `14` | Shikoyatli yozuv shuncha kun saqlanadi |
+| `RECORD_GRACE_MS` | `180000` | Shikoyatsiz yozuv shuncha vaqtdan keyin oʻchadi (natija ekranidan ham shikoyat qilish mumkin) |
+| `REPORT_DAILY` | `20` | Bitta odam kuniga nechta TURLI oʻyinchiga shikoyat qila oladi |
+
+**Hajm hisobi.** Yozuv faqat gapirilayotgan paytda ishlaydi (push-to-talk) va
+bitrate 16 kbit/s: 20 daqiqalik oʻyinda odam odatda 2-4 daqiqa gapiradi, yaʼni
+~300-500 KB. 12 kishilik oʻyin ≈ 4-6 MB. Shikoyatlar kam boʻlgani uchun
+amaldagi hajm chegaradan ancha past qoladi. Holatni koʻrish:
+`curl 'localhost:4100/health?key=<kalit>'` → `yozuvlar` boʻlimi.
+
+**Botlar oʻyinlari yozilmaydi** (`botOnly`, `vsBots`): u yerda shikoyat
+qiladigan ham, shikoyat qilinadigan ham yoʻq — sof disk isrofi boʻlardi.
+
 ### Himoya chegaralari (ixtiyoriy)
 
 | Oʻzgaruvchi | Sukut | Tavsif |
@@ -98,6 +124,9 @@ pm2 restart mafia-backend
 | `rooms:created:<userId>:<kun>` | Kunlik xona hisobi (xona oʻchirilsa ham kamaymaydi, TTL 36 soat) |
 | `reports` | Oʻyinchilarning shikoyatlari (oxirgi 500 ta) |
 | `admin:audit` | Admin choralari jurnali: ban, admin berish, hisob oʻchirish (oxirgi 1000 ta) |
+| `rep:by:<userId>:<kun>` | Kim kimga shikoyat qilgani — kunlik chegara (bitta odamga 1 marta, kuniga 20 ta odam) |
+| `rep:game:<gameId>` | Shu oʻyin shikoyatlari; mavjudligi YOZUV SAQLANISHI belgisi |
+| `penalty:<userId>` | Amaldagi jazolar: `chat`, `voice`, `avatar` → tugash vaqti |
 | `banned:users` | Bloklangan hisoblar keshi |
 | `presence:auth` / `presence:anon` | Onlayn qurilmalar |
 | `settings:global` | Admin sozlamalari |

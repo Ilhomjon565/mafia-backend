@@ -16,6 +16,10 @@ import {
   nightDelayMs, botChatLine, chooseChatAct, typingMs, weightedPick,
 } from './bot-ai.js';
 import { botAvatar } from './avatar.js';
+// O'yin yozuvlari (shikoyat uchun dalil) — disk chegaralari shu modulda.
+// `recStore` nomi ATAYLAB: `rec` shikoyat ishlovchisidagi mahalliy o'zgaruvchi
+// bilan to'qnashardi.
+import * as recStore from './recordings.js';
 // Onlayn ko'rsatkichi egri chizig'i — alohida modulda, testlari presence.test.mjs da
 import {
   fakeOnlineBase, fakePlayersBase, fakeGamesPlayed, fakeRooms, dueBotGameSlot,
@@ -811,6 +815,80 @@ function signToken(user, deviceId) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
 }
 
+// ==================== JAZOLAR (admin choralari) ====================
+// Ban — eng og'ir chora va u ko'pincha haddan ortiq. Shikoyat bo'yicha ko'proq
+// kerak bo'ladigan narsa NUQTALI chora: odam o'ynay olsin, lekin muammo
+// bo'lgan kanaldan vaqtincha chetlatilsin.
+//
+//   chat   — chatda yoza olmaydi
+//   voice  — ovozli chatga umuman ulana olmaydi (mesh'ga kiritilmaydi, ya'ni
+//            o'zgartirilgan mijoz ham gapira olmaydi)
+//   avatar — profil rasmi hech kimga ko'rsatilmaydi (harf ko'rinadi)
+//
+// Redis'da `penalty:<userId>` hash, qiymati — TUGASH vaqti (epoch ms).
+// Xotirada kesh: tekshiruv chat/ovoz/har `publicPlayers` chaqiruvida bo'ladi,
+// ya'ni u SINXRON va arzon bo'lishi shart.
+const PENALTY_KINDS = ['chat', 'voice', 'avatar'];
+const penaltyCache = new Map();   // userId -> { chat, voice, avatar } (epoch ms)
+
+function penaltyKey(userId) { return 'penalty:' + userId; }
+
+// Sinxron tekshiruv (keshdan). Muddati o'tgan yozuv o'zi e'tiborsiz qoladi.
+function hasPenalty(userId, kind) {
+  if (!userId) return false;
+  const p = penaltyCache.get(String(userId));
+  if (!p) return false;
+  const until = p[kind];
+  return !!until && until > Date.now();
+}
+function penaltyOf(userId) {
+  const p = penaltyCache.get(String(userId)) || {};
+  const out = {};
+  for (const k of PENALTY_KINDS) if (p[k] && p[k] > Date.now()) out[k] = p[k];
+  return out;
+}
+async function setPenalty(userId, kind, untilMs) {
+  if (!PENALTY_KINDS.includes(kind) || !isRealUser(userId)) return null;
+  const cur = penaltyCache.get(String(userId)) || {};
+  if (untilMs && untilMs > Date.now()) cur[kind] = untilMs; else delete cur[kind];
+  if (Object.keys(cur).length) penaltyCache.set(String(userId), cur);
+  else penaltyCache.delete(String(userId));
+  try {
+    if (untilMs && untilMs > Date.now()) {
+      await redis.hset(penaltyKey(userId), kind, String(untilMs));
+      // Eng uzoq jazodan keyin kalit o'zi yo'qolsin (axlat to'planmasin)
+      const max = Math.max(...Object.values(cur));
+      await redis.expire(penaltyKey(userId), Math.ceil((max - Date.now()) / 1000) + 3600);
+    } else {
+      await redis.hdel(penaltyKey(userId), kind);
+    }
+  } catch {}
+  return penaltyOf(userId);
+}
+// Restartdan keyin keshni tiklaymiz (jazolar yo'qolib ketmasin)
+async function loadPenalties() {
+  try {
+    let cursor = '0';
+    let n = 0;
+    do {
+      const [next, keys] = await redis.scan(cursor, 'MATCH', 'penalty:*', 'COUNT', 200);
+      cursor = next;
+      for (const k of keys) {
+        const uid = k.slice('penalty:'.length);
+        const h = await redis.hgetall(k).catch(() => null);
+        if (!h) continue;
+        const obj = {};
+        for (const kind of PENALTY_KINDS) {
+          const v = parseInt(h[kind] || '0');
+          if (v > Date.now()) obj[kind] = v;
+        }
+        if (Object.keys(obj).length) { penaltyCache.set(uid, obj); n++; }
+      }
+    } while (cursor !== '0');
+    if (n) console.log(`\u{1F507} ${n} ta amaldagi jazo keshga yuklandi`);
+  } catch (e) { console.error('loadPenalties:', e.message); }
+}
+
 // ==================== BAN KESHI ====================
 // JWT 30 kun yashaydi va o'z-o'zidan bekor bo'lmaydi. Bloklangan foydalanuvchi
 // eski tokeni bilan hamma narsadan foydalanaverardi. Har so'rovda bazaga bormaslik
@@ -1535,6 +1613,9 @@ app.get('/health', async (req, res) => {
     uptimeSec: Math.round(process.uptime()),
     bogliqliklar: { soz: dep.ok, redis: dep.redis, postgres: dep.db },
     oyinlar: { taymerlar: timers.size, qulflar: chains.size, xonalar: voiceCtx.size },
+    // Disk: yozuvlar nazoratdan chiqmayotganini shu yerdan ko'rish mumkin
+    yozuvlar: recStore.stats(),
+    jazolar: penaltyCache.size,
     sockets: { ochiq: io.engine.clientsCount, chegara: MAX_TOTAL_SOCKETS, ipLar: ipConns.size },
     ramMb: { rss: Math.round(mem.rss / 1048576), heap: Math.round(mem.heapUsed / 1048576) },
     // rad etilgan ulanishlar (server ishga tushgandan beri)
@@ -2078,6 +2159,110 @@ app.get('/api/games/:id', async (req, res) => {
   } catch (e) { serverFail(res, e); }
 });
 
+// ==================== SHIKOYAT VA DALIL ====================
+//
+// TURLAR. Bo'sh matn o'rniga aniq tur tanlanadi: admin yuzlab shikoyatni
+// o'qib chiqmasdan ham qaysi kanalga qarash kerakligini biladi (ovoz yozuvimi,
+// chat tariximi, profil rasmimi).
+const REPORT_TYPES = ['voice_abuse', 'chat_abuse', 'avatar', 'nickname', 'cheating', 'afk', 'other'];
+const REPORT_LABEL = {
+  voice_abuse: 'Ovozli chatda so\'kindi',
+  chat_abuse: 'Chatda so\'kindi / haqorat',
+  avatar: 'Nomaqbul profil rasmi',
+  nickname: 'Nomaqbul taxallus',
+  cheating: 'Aldov / rol sotish',
+  afk: 'O\'yinni tashlab ketdi',
+  other: 'Boshqa',
+};
+// FLOOD HIMOYASI: bitta odamga kuniga BIR MARTA, kuniga ko'pi bilan 20 ta
+// TURLI odamga. Ya'ni haqiqiy shikoyat qilish erkin, lekin bitta odamni
+// ko'pchilik bo'lib ko'mib tashlash yoki bir kishini qayta-qayta bosish yo'q.
+const REPORT_DAILY_TARGETS = Math.max(1, parseInt(process.env.REPORT_DAILY || '20'));
+const repDayKey = (userId) => `rep:by:${userId}:${dayKeySuffix()}`;
+const repGameKey = (gameId) => `rep:game:${gameId}`;
+
+// Shikoyatsiz o'yin yozuvi shuncha vaqtdan keyin o'chadi. Darhol emas:
+// o'yinchi NATIJA EKRANIDAN ham shikoyat qilishi mumkin.
+const REC_GRACE_MS = Math.max(30000, parseInt(process.env.RECORD_GRACE_MS || '180000'));
+const recDropTimers = new Map();
+
+// Tugagan o'yinning o'yinchilari — natija ekranidan kelgan shikoyat uchun
+// (Redis holati endGame'dan keyin o'chadi).
+const endedPlayers = new Map();   // gameId -> { sid -> { userId, username } }
+
+function rememberEnded(gameId, g) {
+  const map = {};
+  for (const p of g.players || []) {
+    if (isBot(p)) continue;
+    map[p.socketId] = { userId: p.userId, username: p.username };
+  }
+  endedPlayers.set(gameId, map);
+  setTimeout(() => endedPlayers.delete(gameId), REC_GRACE_MS + 60000).unref?.();
+}
+
+async function gameReportCount(gameId) {
+  try { return await redis.llen(repGameKey(gameId)); } catch { return 0; }
+}
+
+// Shikoyat kelmagan bo'lsa yozuvni o'chiramiz. Taymer ichida QAYTA
+// tekshiriladi: shu oraliqda shikoyat kelgan bo'lishi mumkin.
+function scheduleRecDrop(gameId) {
+  if (recDropTimers.has(gameId)) return;
+  const t = setTimeout(async () => {
+    recDropTimers.delete(gameId);
+    try {
+      if (await gameReportCount(gameId) > 0) return;   // shikoyat bor — saqlanadi
+      recStore.drop(gameId);
+    } catch (e) { console.error('recDrop:', e?.message || e); }
+  }, REC_GRACE_MS);
+  t.unref?.();
+  recDropTimers.set(gameId, t);
+}
+
+// O'yin tugadi: tarixni yozuvga tushiramiz va taqdirini hal qilamiz.
+//
+// game.json HAR DOIM yoziladi (bir necha KB), chunki shikoyat natija
+// ekranidan ham kelishi mumkin — o'sha paytda Redis'dagi chat allaqachon
+// yo'qolgan bo'lardi. Ovoz fayllari esa shikoyat bo'lmasa o'chiriladi.
+async function finishRecording(gameId, g, winner) {
+  if (!recStore.isOpen(gameId)) return;
+  let chat = [];
+  try {
+    const raw = await redis.lrange(`chat:${gameId}`, 0, -1);
+    chat = (raw || []).map((r) => { try { return JSON.parse(r); } catch { return null; } }).filter(Boolean);
+  } catch {}
+  recStore.saveJson(gameId, 'game', {
+    gameId,
+    name: g.name,
+    winner,
+    startedAt: g.startedAt || null,
+    endedAt: g.endedAt || Date.now(),
+    rounds: g.round || 0,
+    // `id` — ovoz fayllari nomi bilan bir xil (publicId), shuning uchun admin
+    // qaysi fayl kimniki ekanini aniqlay oladi.
+    players: (g.players || []).map((p) => ({
+      id: p.publicId || p.socketId,
+      userId: isRealUser(p.userId) ? p.userId : null,
+      username: p.username,
+      role: p.role || null,
+      bot: p.isBot === true,
+      alive: p.isAlive !== false,
+    })),
+    chat,
+    log: fullLog(g),
+  });
+  const n = await gameReportCount(gameId);
+  if (n > 0) {
+    try {
+      const rows = await redis.lrange(repGameKey(gameId), 0, -1);
+      recStore.saveJson(gameId, 'reports', rows.map((r) => { try { return JSON.parse(r); } catch { return null; } }).filter(Boolean));
+    } catch {}
+    console.log(`\u{1F6A9} ${gameId}: ${n} ta shikoyat — yozuv saqlanadi`);
+  } else {
+    scheduleRecDrop(gameId);
+  }
+}
+
 // ==================== AVATAR RASMLARI ====================
 // Xonani to'ldiruvchi o'yinchilarning profil rasmi. Avatar SVG sifatida
 // generatsiya qilinadi (identicon uslubi) va BIR YIL keshlanadi — brauzer
@@ -2094,6 +2279,65 @@ app.get('/api/avatar/:seed', (req, res) => {
   res.set('Content-Type', 'image/svg+xml; charset=utf-8');
   res.set('Cache-Control', 'public, max-age=31536000, immutable');
   res.send(botAvatar(seed));
+});
+
+// ==================== OVOZ YOZUVI: BO'LAKLARNI QABUL QILISH ====================
+//
+// Mijoz O'Z mikrofonini yozadi (faqat gapirgan paytida) va bo'laklarni
+// ketma-ket shu yerga yuboradi. Server ularni faylga QO'SHIB boradi.
+//
+// Nega mijozda: ovoz WebRTC mesh orqali to'g'ridan-to'g'ri oqadi, server uni
+// umuman ko'rmaydi. Aralashtirish uchun SFU kerak bo'lardi.
+//
+// `express.raw` FAQAT shu yo'lda: global `express.json` binary tanani
+// buzib yuborardi.
+const voiceChunkBody = express.raw({ type: '*/*', limit: recStore.MAX_CHUNK + 4096 });
+
+app.post('/api/voice-chunk', authMiddleware, limitByUser(600), voiceChunkBody, async (req, res) => {
+  try {
+    if (!recStore.ON) return res.status(204).end();
+    const gameId = String(req.headers['x-game-id'] || '');
+    const ext = String(req.headers['x-rec-ext'] || 'webm');   // Safari 'mp4' yuboradi
+    if (!gameId || !Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'bad' });
+    if (!recStore.isOpen(gameId)) return res.status(410).json({ code: 'closed' });
+
+    // Yuboruvchi HAQIQATAN shu o'yinning o'yinchisimi?
+    const g = await getG(gameId);
+    const me = (g?.players || []).find((p) => p.userId === req.user.userId);
+    if (!g || g.status !== 'playing' || !me) return res.status(403).json({ code: 'notInGame' });
+
+    // Fayl nomi — MASKALANGAN publicId (haqiqiy userId fayl tizimida qolmasin)
+    const key = me.publicId || me.userId;
+    const r = recStore.append(gameId, key, req.body, ext);
+    if (!r.ok) {
+      // Chegaraga yetdi — mijoz yozishni to'xtatadi. Bu XATO emas: o'yin
+      // davom etaveradi, faqat bu o'yinchining ovozi boshqa yozilmaydi.
+      return res.status(r.code === 'diskFull' || r.code === 'gameFull' || r.code === 'userFull' ? 507 : 400)
+        .json({ code: r.code });
+    }
+    res.json({ ok: true, bytes: r.bytes });
+  } catch (e) { serverFail(res, e); }
+});
+
+// Gap bo'laklarining VAQT BELGILARI: audio faqat gapirilgan paytlarni
+// o'z ichiga oladi, shuning uchun "audio 40-soniya" o'yinning qaysi daqiqasi
+// ekanini bilish uchun shu ro'yxat kerak.
+app.post('/api/voice-marks', authMiddleware, limitByUser(60), async (req, res) => {
+  try {
+    if (!recStore.ON) return res.status(204).end();
+    const gameId = String(req.body?.gameId || '');
+    const marks = Array.isArray(req.body?.marks) ? req.body.marks.slice(0, 2000) : null;
+    if (!gameId || !marks) return res.status(400).json({ error: 'bad' });
+    if (!recStore.isOpen(gameId)) return res.status(410).json({ code: 'closed' });
+    const g = await getG(gameId);
+    const me = (g?.players || []).find((p) => p.userId === req.user.userId);
+    if (!me) return res.status(403).json({ code: 'notInGame' });
+    const clean = marks
+      .filter((m) => m && Number.isFinite(m.at) && Number.isFinite(m.dur))
+      .map((m) => ({ at: Math.round(m.at), dur: Math.round(m.dur) }));
+    recStore.saveJson(gameId, (me.publicId || me.userId) + '.marks', { player: me.username, marks: clean });
+    res.json({ ok: true, n: clean.length });
+  } catch (e) { serverFail(res, e); }
 });
 
 // ==================== ICE SERVERLAR (ovozli chat) ====================
@@ -2262,6 +2506,7 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) =>
         coins: u.coins ?? 0,
         roomLimit: overrides[u.id] != null ? parseInt(overrides[u.id]) : null, // null = default ishlatiladi
         defaultRoomLimit,
+        jazo: penaltyOf(u.id),   // amaldagi chat/ovoz/rasm cheklovlari
         stats: u.stats || { gamesPlayed: 0, gamesWon: 0, winRate: 0, rating: RATING_START, xp: 0 }
       }))
     });
@@ -2287,12 +2532,112 @@ async function adminAudit(actor, action, targetId, targetName) {
 app.get('/api/admin/reports', authMiddleware, adminMiddleware, async (_req, res) => {
   try {
     const [reports, audit] = await Promise.all([
-      redis.lrange('reports', -200, -1).catch(() => []),
+      redis.lrange('reports', -300, -1).catch(() => []),
       redis.lrange('admin:audit', -200, -1).catch(() => []),
     ]);
     const parse = (rows) => rows.map(r => { try { return JSON.parse(r); } catch { return null; } })
       .filter(Boolean).reverse();
-    res.json({ reports: parse(reports), audit: parse(audit) });
+    const list = parse(reports).map((r) => ({
+      ...r,
+      label: REPORT_LABEL[r.type] || REPORT_LABEL.other,
+      // Dalil hali diskdami? (shikoyatsiz o'yinlarniki o'chirilgan bo'ladi)
+      dalil: r.gameId ? recStore.isOpen(r.gameId) : false,
+      jazo: penaltyOf(r.onId),
+    }));
+    res.json({
+      reports: list,
+      audit: parse(audit),
+      turlar: REPORT_TYPES.map((t) => ({ id: t, label: REPORT_LABEL[t] })),
+      yozuvlar: recStore.stats(),
+    });
+  } catch (e) { serverFail(res, e); }
+});
+
+// ===== DALIL: bitta o'yinning to'liq yozuvi =====
+app.get('/api/admin/evidence/:gameId', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const id = String(req.params.gameId || '');
+    if (!recStore.isOpen(id)) return res.status(404).json({ error: 'Yozuv topilmadi yoki o\'chirilgan' });
+    const game = recStore.readJson(id, 'game');
+    const reports = recStore.readJson(id, 'reports') || [];
+    const files = recStore.files(id);
+    // Ovoz fayllarini o'yinchiga bog'lab beramiz (fayl nomi = publicId)
+    const byId = new Map((game?.players || []).map((p) => [p.id, p]));
+    const audio = files
+      .filter((f) => /\.(webm|mp4|ogg|m4a)$/i.test(f.name))
+      .map((f) => {
+        const key = f.name.replace(/\.[^.]+$/, '');
+        const marks = recStore.readJson(id, key + '.marks');
+        return {
+          file: f.name, size: f.size,
+          player: byId.get(key)?.username || '?',
+          role: byId.get(key)?.role || null,
+          marks: marks?.marks || [],
+        };
+      });
+    res.json({ gameId: id, game, reports, audio, files });
+  } catch (e) { serverFail(res, e); }
+});
+
+// Ovoz faylini berish. Yo'l `recStore.filePath` da tozalanadi (traversal yo'q).
+app.get('/api/admin/evidence/:gameId/file/:name', authMiddleware, adminMiddleware, (req, res) => {
+  try {
+    const p = recStore.filePath(String(req.params.gameId || ''), String(req.params.name || ''));
+    if (!p) return res.status(404).json({ error: 'Fayl topilmadi' });
+    const ext = p.split('.').pop().toLowerCase();
+    const TYPE = { webm: 'audio/webm', mp4: 'audio/mp4', m4a: 'audio/mp4', ogg: 'audio/ogg', json: 'application/json' };
+    res.set('Content-Type', TYPE[ext] || 'application/octet-stream');
+    res.set('Cache-Control', 'private, max-age=60');
+    res.sendFile(p);
+  } catch (e) { serverFail(res, e); }
+});
+
+// Dalilni qo'lda o'chirish (ko'rib bo'lingach — disk bo'shasin)
+app.delete('/api/admin/evidence/:gameId', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const id = String(req.params.gameId || '');
+    const ok = recStore.drop(id);
+    await redis.del(repGameKey(id)).catch(() => {});
+    await adminAudit(req.user, 'deleteEvidence', id, id);
+    res.json({ ok, yozuvlar: recStore.stats() });
+  } catch (e) { serverFail(res, e); }
+});
+
+// ===== JAZO: chat / ovoz / profil rasmi =====
+// Ban emas: odam o'ynayveradi, faqat muammo bo'lgan kanaldan chetlatiladi.
+// `hours: 0` — jazoni olib tashlash.
+app.post('/api/admin/users/:id/penalty', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { kind, hours } = req.body || {};
+    if (!PENALTY_KINDS.includes(kind)) return res.status(400).json({ error: 'Noma\'lum jazo turi' });
+    const h = Number(hours);
+    if (!Number.isFinite(h) || h < 0 || h > 24 * 365) return res.status(400).json({ error: 'Muddat 0-8760 soat oralig\'ida' });
+    const u = await prisma.user.findUnique({ where: { id: req.params.id }, select: { username: true } });
+    if (!u) return res.status(404).json({ error: 'Topilmadi' });
+    const until = h > 0 ? Date.now() + h * 3600000 : 0;
+    const now = await setPenalty(req.params.id, kind, until);
+    await adminAudit(req.user, (h > 0 ? 'penalty:' : 'unpenalty:') + kind + (h > 0 ? `:${h}s` : ''), req.params.id, u.username);
+    // Chat/ovoz jazosi DARHOL kuchga kirsin: o'yinchiga xabar beramiz
+    if (h > 0) {
+      for (const [sid, dd] of socketData) {
+        if (dd?.userId !== req.params.id) continue;
+        io.to(sid).emit('game_error', {
+          code: kind === 'chat' ? 'chatBanned' : kind === 'voice' ? 'voiceBanned' : 'avatarHidden',
+          message: kind === 'chat' ? '🔇 Chatda yozish vaqtincha taqiqlandi'
+                 : kind === 'voice' ? '🔇 Ovozli chat vaqtincha taqiqlandi'
+                 : '🖼 Profil rasmingiz vaqtincha yashirildi',
+        });
+      }
+      if (kind === 'voice') {
+        // Ovozli seansdan ham chiqaramiz — keyingi o'yinni kutmaymiz
+        for (const [sid, dd] of socketData) {
+          if (dd?.userId !== req.params.id || !dd.gameId) continue;
+          voiceLeave(dd.gameId, sid);
+          io.to(`game:${dd.gameId}`).emit('voice_peer_leave', { socketId: sid });
+        }
+      }
+    }
+    res.json({ id: req.params.id, jazo: now });
   } catch (e) { serverFail(res, e); }
 });
 
@@ -2599,7 +2944,10 @@ function publicPlayers(players, { light = false } = {}) {
       // ko'rinishi muhim: odam kim bilan o'ynayotganini bilib turadi.
       verified: p.verified === true,
     };
-    if (!light) o.avatar = p.avatar || null;
+    // Jazo bo'lsa rasm KO'RSATILMAYDI — mijoz taxallusning birinchi harfini
+    // chizadi. Admin panelida original rasm ko'rinishda qoladi (u qaror qabul
+    // qilishi uchun kerak).
+    if (!light) o.avatar = hasPenalty(p.userId, 'avatar') ? null : (p.avatar || null);
     return o;
   });
 }
@@ -2613,7 +2961,7 @@ function revealPlayers(players) {
     socketId: p.socketId,
     userId: p.publicId || p.userId,
     username: p.username,
-    avatar: p.avatar || null,
+    avatar: hasPenalty(p.userId, 'avatar') ? null : (p.avatar || null),
     isAlive: p.isAlive,
     isHost: p.isHost === true,
     verified: p.verified === true,
@@ -3821,6 +4169,13 @@ async function beginGame(gameId) {
   // ishlamasdi: vaqt chegarasi (25 daqiqa), fazalarning tezlashuvi va
   // Telegram natijasidagi "⏱ N daqiqa" qatori.
   g.startedAt = Date.now();
+  // DALIL YOZUVI — faqat ODAM o'ynaydigan xonalarda.
+  //
+  // Botlarning o'zaro o'yinlari (botOnly) va "Botlar bilan o'ynash" (vsBots)
+  // rejimida shikoyat qiladigan ham, shikoyat qilinadigan ham yo'q —
+  // ularni yozish sof disk isrofi bo'lardi (kuniga 10-15 ta bot o'yini).
+  const humans = (g.players || []).filter((p) => isRealUser(p.userId)).length;
+  g.recording = (humans > 0 && !g.botOnly && !g.vsBots) ? recStore.open(gameId) : false;
   await saveG(gameId, g);
   prisma.game.update({ where: { id: gameId }, data: { status: 'playing', startedAt: new Date(g.startedAt) } }).catch(() => {});
   tgRoomTouch(gameId); // guruhdagi e'lon: "o'yin boshlandi"
@@ -4280,6 +4635,11 @@ async function endGame(gameId, winner) {
   await saveG(gameId, g);
   prisma.game.update({ where: { id: gameId }, data: { status: 'finished', winner, endedAt: new Date() } }).catch(() => {});
   await recordStats(g, winner);
+  // Dalil: tarix yoziladi, ovoz fayllarining taqdiri shikoyatga qarab hal bo'ladi
+  if (g.recording) {
+    rememberEnded(gameId, g);
+    await finishRecording(gameId, g, winner).catch((e) => console.error('finishRecording:', e?.stack || e));
+  }
   tgRoomFinish(gameId).catch(() => {}); // guruhdagi e'lonni yakunlash
   // Botlar xonasi tugadi — o'rniga yangisi ochiladi
   if (g.botOnly) chainNextBotGame().catch(() => {});
@@ -5055,6 +5415,11 @@ io.on('connection', (socket) => {
       socket.emit('game_error', { code: 'muted', message: '🔇 Xona egasi sizni jim qildirdi' });
       return;
     }
+    // Admin bergan chat jazosi (shikoyat bo'yicha chora)
+    if (hasPenalty(player.userId, 'chat')) {
+      socket.emit('game_error', { code: 'chatBanned', message: '🔇 Chatda yozish vaqtincha taqiqlangan' });
+      return;
+    }
 
     // Tarkib tekshiruvi (validate.js — sof funksiya, testlari bor)
     const recent = (g.chatRecent && g.chatRecent[player.userId]) || [];
@@ -5328,39 +5693,91 @@ io.on('connection', (socket) => {
 
   // ===== Shikoyat =====
   // Ilgari o'yinchi suiiste'molni BILDIRA olmasdi — hech qanday kanal yo'q edi.
-  // Shikoyat Redis'ga yoziladi (admin ko'rishi uchun) va darhol Telegram'ga
-  // ketadi: admin xonaga kirib ulgursin, chunki o'yin 15-20 daqiqada tugaydi.
-  sOn('report_player', async ({ gameId, targetSocketId, reason } = {}) => {
-    if (!guard(socket, 'report', 3, 600000)) {
-      socket.emit('game_error', { code: 'reportLimit', message: 'Juda ko\'p shikoyat yubordingiz' });
-      return;
-    }
+  //
+  // Shikoyat kelishi o'yin YOZUVINI saqlab qoladi: ovozli chat, matnli chat va
+  // to'liq o'yin tarixi. Shikoyat bo'lmasa yozuv o'chiriladi (disk).
+  sOn('report_player', async ({ gameId, targetSocketId, type, reason } = {}) => {
+    if (!guard(socket, 'report', 6, 60000)) return;
     const d = socketData.get(socket.id);
     if (!d?.gameId || d.gameId !== gameId) return;
+
+    const kind = REPORT_TYPES.includes(type) ? type : 'other';
+
+    // Nishonni topamiz. O'yin TUGAGAN bo'lishi mumkin (natija ekranidan
+    // shikoyat qilinadi) — o'sha holda tugash paytidagi ro'yxatdan olamiz.
     const g = await getG(gameId);
-    const target = (g?.players || []).find(p => p.socketId === targetSocketId);
-    if (!target || isBot(target)) { socket.emit('game_error', { code: 'reportBad', message: 'Shikoyat yuborilmadi' }); return; }
-    const why = cleanText(String(reason || ''), { maxLen: 200 });
-    const rec = {
-      at: Date.now(), gameId,
+    let target = (g?.players || []).find((p) => p.socketId === targetSocketId && !isBot(p));
+    if (!target) {
+      const snap = endedPlayers.get(gameId);
+      const t = snap?.[targetSocketId];
+      if (t) target = { userId: t.userId, username: t.username };
+    }
+    if (!target || !isRealUser(target.userId) || target.userId === d.userId) {
+      socket.emit('report_result', { ok: false, code: 'reportBad', message: 'Shikoyat yuborilmadi' });
+      return;
+    }
+
+    // ===== FLOOD HIMOYASI =====
+    // Bitta odamga kuniga BIR MARTA; kuniga ko'pi bilan 20 ta TURLI odamga.
+    const dayKey = repDayKey(d.userId);
+    try {
+      if (await redis.sismember(dayKey, String(target.userId))) {
+        socket.emit('report_result', {
+          ok: false, code: 'reportDup',
+          message: 'Siz bu o\'yinchiga bugun allaqachon shikoyat qilgansiz',
+        });
+        return;
+      }
+      if (await redis.scard(dayKey) >= REPORT_DAILY_TARGETS) {
+        socket.emit('report_result', {
+          ok: false, code: 'reportDaily', n: REPORT_DAILY_TARGETS,
+          message: `Kuniga ko'pi bilan ${REPORT_DAILY_TARGETS} ta o'yinchiga shikoyat qilish mumkin`,
+        });
+        return;
+      }
+      await redis.sadd(dayKey, String(target.userId));
+      await redis.expire(dayKey, 36 * 3600);
+    } catch {
+      // Redis uzilgan bo'lsa shikoyatni BLOKLAMAYMIZ — u chegaradan muhimroq
+    }
+
+    const why = cleanText(String(reason || ''), { maxLen: 300 });
+    const entry = {
+      at: Date.now(), gameId, type: kind,
       byId: d.userId, by: d.username,
       onId: target.userId, on: target.username,
-      reason: why || '—',
+      reason: why || '',
     };
     try {
-      await redis.rpush('reports', JSON.stringify(rec));
+      await redis.rpush('reports', JSON.stringify(entry));
       await redis.ltrim('reports', -500, -1);
+      // Shu o'yinning shikoyatlari — YOZUV SAQLANISHI uchun belgi ham shu
+      await redis.rpush(repGameKey(gameId), JSON.stringify(entry));
+      await redis.expire(repGameKey(gameId), recStore.LIMITS.keepDays * 86400);
     } catch {}
-    await logActivity(d.userId, 'report', { detail: `${target.username}: ${rec.reason}`, gameId });
+
+    // O'chirish taymeri qo'yilgan bo'lsa bekor qilamiz va dalilni saqlaymiz
+    if (recDropTimers.has(gameId)) { clearTimeout(recDropTimers.get(gameId)); recDropTimers.delete(gameId); }
+    if (recStore.isOpen(gameId)) {
+      try {
+        const rows = await redis.lrange(repGameKey(gameId), 0, -1);
+        recStore.saveJson(gameId, 'reports', rows.map((r) => { try { return JSON.parse(r); } catch { return null; } }).filter(Boolean));
+      } catch {}
+    }
+
+    await logActivity(d.userId, 'report', { detail: `${target.username}: ${REPORT_LABEL[kind]}`, gameId });
     if (TG_ADMIN_BOT_TOKEN && TG_ADMIN_CHAT_ID) {
       tgApi('sendMessage', {
         chat_id: TG_ADMIN_CHAT_ID,
-        text: `\u{1F6A9} <b>Shikoyat</b>\n${tgEsc(rec.by)} \u2192 <b>${tgEsc(rec.on)}</b>\n`
-            + `Sabab: ${tgEsc(rec.reason)}\nXona: <code>${tgEsc(gameId)}</code>`,
+        text: `\u{1F6A9} <b>Shikoyat</b>\n${tgEsc(entry.by)} \u2192 <b>${tgEsc(entry.on)}</b>\n`
+            + `Tur: <b>${tgEsc(REPORT_LABEL[kind])}</b>\n`
+            + (why ? `Izoh: ${tgEsc(why)}\n` : '')
+            + `Xona: <code>${tgEsc(gameId)}</code>\n`
+            + (recStore.isOpen(gameId) ? '\u{1F3A4} Yozuv saqlandi' : 'Yozuv yo\'q'),
         parse_mode: 'HTML',
       }).catch(() => {});
     }
-    socket.emit('report_sent', { ok: true });
+    socket.emit('report_result', { ok: true, code: 'reportSent', message: 'Shikoyat yuborildi' });
   });
 
   // ===== Ovozli chat signaling =====
@@ -5370,6 +5787,12 @@ io.on('connection', (socket) => {
     // begona odam "arvoh peer" bo'lib kirib, xonadagi socketId'lar ro'yxatini olardi
     const d = socketData.get(socket.id);
     if (!d?.gameId || d.gameId !== gameId) return;
+    // Ovoz jazosi: mesh'ga UMUMAN kiritilmaydi. Shuning uchun o'zgartirilgan
+    // mijoz ham gapira olmaydi — hech kim unga ulanmaydi.
+    if (hasPenalty(d.userId, 'voice')) {
+      socket.emit('game_error', { code: 'voiceBanned', message: '🔇 Ovozli chat vaqtincha taqiqlangan' });
+      return;
+    }
     const set = voicePeers.get(gameId) || new Set();
     // qo'shiluvchiga mavjud ovozli o'yinchilar ro'yxatini yuboramiz (u ularga ulanadi)
     socket.emit('voice_peers', { peers: [...set] });
@@ -5605,7 +6028,30 @@ httpServer.listen(PORT, BIND_HOST, () => {
   Ready! 🎮
   `);
   loadBans();      // bloklangan hisoblar keshini tiklaymiz
+  loadPenalties(); // amaldagi jazolar (chat/ovoz/rasm) keshini tiklaymiz
   recoverTimers(); // restart'dan keyin ketayotgan o'yinlarni davom ettiramiz
+  // Dalil yozuvlari: katalog, hajm hisobi va tozalash jadvali
+  {
+    const r = recStore.init();
+    if (r.ok) {
+      console.log(`\u{1F3A4} Yozuvlar: ${recStore.LIMITS.dir} — ${r.totalMb} MB band, chegara ${recStore.LIMITS.maxTotalMb} MB`);
+      // Soatiga bir marta: muddati o'tganini o'chiramiz, hajmni chegarada ushlaymiz.
+      // KETAYOTGAN o'yinlarga tegilmaydi.
+      const sweepTimer = setInterval(() => {
+        try {
+          const live = new Set(timers.keys());
+          const res = recStore.sweep(live);
+          if (res.ochirildi) console.log(`\u{1F9F9} ${res.ochirildi} ta eski yozuv o'chirildi (${res.hajmMb} MB qoldi)`);
+          recStore.resync();   // xotiradagi hisob haqiqiy holatdan uzoqlashmasin
+        } catch (e) { console.error('recSweep:', e?.message || e); }
+      }, 3600000);
+      sweepTimer.unref?.();
+      // Ishga tushgandan 1 daqiqa keyin birinchi tozalash
+      setTimeout(() => { try { recStore.sweep(new Set(timers.keys())); } catch {} }, 60000).unref?.();
+    } else if (recStore.ON) {
+      console.warn('Yozuvlar o\'chirilgan holatda ishlayapti:', r.reason);
+    }
+  }
   if (TG_ADMIN_BOT_TOKEN) {
     tgApi('deleteWebhook', {}).finally(() => tgPoll()); // getUpdates uchun webhook bo'lmasligi kerak
     console.log('🤖 Telegram admin-tasdiq boti ishga tushdi');

@@ -167,6 +167,10 @@ async function main() {
     // Har fayl aynan bitta bo'lak — ya'ni sarlavhalar QO'SHILIB ketmagan
     const sizes = audio.map((f) => fs.statSync(path.join(dirOf(gameId), f)).size);
     ok(sizes.every((n) => n === 4096), 'har fayl aynan bitta bo\'lak (sarlavha qo\'shilmagan)', sizes.join(','));
+    // Gap belgilari ham BO'LAK bo'yicha: ikkinchi bo'lakniki birinchisini o'chirmasin
+    const m0 = await http('/api/voice-marks', { method: 'POST', token: me.token, body: { gameId, marks: [{ at: 1000, dur: 500 }], seg: 0 } });
+    const m1 = await http('/api/voice-marks', { method: 'POST', token: me.token, body: { gameId, marks: [{ at: 2000, dur: 700 }], seg: 1 } });
+    ok(m0.status === 200 && m1.status === 200, 'ikki bo\'lakning belgilari qabul qilindi', m0.status + ',' + m1.status);
 
     log('\n=== 4. Kunlik chegara ATOMIK (poyga yo\'q) ===');
     const oldRep = Number(redis('llen reports')) || 0;
@@ -225,6 +229,10 @@ async function main() {
   ok(egalar.length === 1 && egalar[0] === users[0].username,
     'uchala fayl AYNAN bitta o\'yinchiga bog\'landi', 'egalar: ' + JSON.stringify(egalar));
   ok(list.filter((a) => a.qism).length === 2, 'bo\'lak raqami ko\'rsatildi', JSON.stringify(list.map((a) => a.qism)));
+  // Belgilar har bo'lakning O'Z fayliga bog'langan (birinchisi ustidan yozilmagan)
+  const b1 = list.find((a) => !a.qism), b2 = list.find((a) => a.qism === '2');
+  ok(b1?.marks?.[0]?.at === 1000, 'birinchi bo\'lakning belgilari saqlanib qoldi', JSON.stringify(b1?.marks));
+  ok(b2?.marks?.[0]?.at === 2000, 'ikkinchi bo\'lak belgilari O\'Z fayliga bog\'landi', JSON.stringify(b2?.marks));
   // Fayl haqiqatan yuklab olinadimi
   const bir = list.find((a) => /\.2\.webm$/.test(a.file));
   if (bir) {

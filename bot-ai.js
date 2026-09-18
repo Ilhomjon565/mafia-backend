@@ -739,7 +739,11 @@ export function mentionedPlayers(text, players = [], { authorSid = null, seats =
 // Xabarning turi: salomlashish, komissar da'vosi, savol, skip, ayblov, boshqa.
 const RX = {
   greet: /(^|\s)(salom\w*|assalom\w*|alaykum|hello|hi|privet|привет|салом)(\s|$)/i,
-  claim: /(komissar|\bkom\b|kom\s?man|tekshirdim|sherif|шериф|комиссар|проверил)/i,
+  claim: /(komissar|\bkom\b|kom\s?man|tekshirdim|sherif|шериф|комиссар|проверил|\bcop\b|sheriff|detective|\bchecked\b|investigat)/i,
+  // Komissar gapi ichida "tinch/toza/oq" bo'lsa bu OQLASH — ayblov emas.
+  // Ilgari "tekshirdim 3 tinch" ham ayblov bo'lib tarixga tushardi va botlar
+  // aynan komissar oqlagan odamga shubha qilardi.
+  clear: /(\btinch\b|\btoza\b|\boq\b|мирн|\bбел(ый|ая)\b|чист|innocent|\bclear\b|\bwhite\b)/i,
   skip: /(\bskip\b|otkaz\w*|o'tkaz\w*|oʻtkaz\w*|chiqarmaylik|пропус)/i,
   accuse: /(mafiya|mafia|мафия|shubha\w*|chiqar\w*|\bberaman\b|\bberamiz\b|ovoz|голос|qora|подозр)/i,
   question: /\?|(^|\s)(kim|kimni|nima deysan|nima deysizla|кто)(\s|$)/i,
@@ -748,7 +752,7 @@ export function classifyChat(text) {
   const t = String(text || '').trim();
   if (!t) return 'other';
   if (RX.greet.test(t)) return 'greet';
-  if (RX.claim.test(t)) return 'claim';
+  if (RX.claim.test(t)) return RX.clear.test(t) ? 'clear' : 'claim';
   if (RX.skip.test(t)) return 'skip';
   // Savol ayblovdan OLDIN: "kim mafiya?" — bu savol, ayblov emas
   if (RX.question.test(t)) return 'question';
@@ -771,6 +775,15 @@ export function chooseReaction(ctx, rnd = Math.random) {
   // Kutish xonasi: faqat salomga javob
   if (ctx.phase === 'waiting') {
     if (kind === 'greet' && rnd() < 0.7) return { kind: 'greetReply', targetSid: authorSid };
+    return null;
+  }
+
+  // 0) Komissar kimnidir OQLADI — bu ayblov emas: himoya kerak emas. Tinch bot
+  //    ba'zan tekshiruvni so'raydi, mafiya bot ba'zan shubha bildiradi (nomsiz
+  //    iboralar — "{n} ni chiqaramiz" kabi ayblov iboralari bu yerga to'g'ri kelmaydi).
+  if (kind === 'clear') {
+    if (iAmMafia && rnd() < 0.35) return { kind: 'doubtClaim', targetSid: null };
+    if (rnd() < 0.3) return { kind: 'askClaim', targetSid: null };
     return null;
   }
 

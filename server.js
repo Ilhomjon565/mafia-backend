@@ -2419,7 +2419,13 @@ app.post('/api/voice-marks', authMiddleware, limitByUser(60), async (req, res) =
     const clean = marks
       .filter((m) => m && Number.isFinite(m.at) && Number.isFinite(m.dur))
       .map((m) => ({ at: Math.round(m.at), dur: Math.round(m.dur) }));
-    recStore.saveJson(gameId, (me.publicId || me.userId) + '.marks', { player: me.username, marks: clean });
+    // Bo'lak raqami ovoz fayli bilan BIR XIL (`kalit.2.webm` <-> `kalit.2.marks`):
+    // belgilar shu bo'lakning boshidan hisoblanadi. Ilgari hamma bo'lak bitta
+    // `.marks` ga yozilib, qayta boshlangan yozuvning belgilari birinchisinikini
+    // o'chirib yuborardi.
+    const seg = Math.min(30, Math.max(0, parseInt(req.body?.seg ?? 0, 10) || 0));
+    const key = (me.publicId || me.userId) + (seg > 0 ? '.' + (seg + 1) : '');
+    recStore.saveJson(gameId, key + '.marks', { player: me.username, marks: clean });
     res.json({ ok: true, n: clean.length });
   } catch (e) { serverFail(res, e); }
 });
@@ -2652,9 +2658,11 @@ app.get('/api/admin/evidence/:gameId', authMiddleware, adminMiddleware, async (r
       .map((f) => {
         // `abc.webm` -> `abc`; `abc.2.webm` -> `abc` (2 — yozuv qayta
         // boshlangandagi bo'lak raqami, u o'yinchini almashtirmaydi).
-        const key = f.name.replace(/\.[^.]+$/, '').replace(/\.\d+$/, '');
+        const base = f.name.replace(/\.[^.]+$/, '');          // `abc.2`
+        const key = base.replace(/\.\d+$/, '');                 // `abc` — o'yinchi
         const qism = /\.(\d+)\.[^.]+$/.exec(f.name)?.[1] || null;
-        const marks = recStore.readJson(id, key + '.marks');
+        // Belgilar BO'LAK bo'yicha: `abc.2.webm` uchun `abc.2.marks`
+        const marks = recStore.readJson(id, base + '.marks');
         return {
           file: f.name, size: f.size, qism,
           player: byId.get(key)?.username || '?',
@@ -4626,7 +4634,10 @@ async function botReactToHuman(gameId, g, human, text, channel) {
   const now = Date.now();
   if (now - (botReactAt.get(gameId) || 0) < 2500) return;
   const kind = classifyChat(text);
-  const seatsOn = g.status === 'playing';
+  // O'rin raqami faqat AYBLOV/DA'VO/SAVOL gapida odam degani: "2 kishi yetmayapti"
+  // yoki "5 daqiqa" dagi raqam 2-/5-o'rindagi botni "nega menga" deyishga
+  // majbur qilmasin.
+  const seatsOn = g.status === 'playing' && ['accuse', 'claim', 'clear', 'question'].includes(kind);
   const roster = (g.players || []).map((p, i) => ({ socketId: p.socketId, username: p.username, seat: i + 1 }));
   const targets = mentionedPlayers(text, roster, { authorSid: human.socketId, seats: seatsOn });
 
@@ -4690,11 +4701,12 @@ async function botReactToHuman(gameId, g, human, text, channel) {
   });
   // Odamning komissar da'vosi botlar tarixiga tushadi: ular buni keyingi
   // ovozda hisobga oladi (haqiqiy o'yinchi ham "kom" gapini eshitadi).
-  if (kind === 'claim' && targets.length) {
+  if ((kind === 'claim' || kind === 'clear') && targets.length) {
     withLock(gameId, async () => {
       const fresh = await getG(gameId);
       if (!fresh || fresh.status !== 'playing') return;
-      botEvent(fresh, { type: 'claim', round: fresh.round || 0, from: human.socketId, target: targets[0] });
+      // 'clear' — komissar oqladi: shubha KAMAYADI (buildSuspicion buni biladi)
+      botEvent(fresh, { type: kind, round: fresh.round || 0, from: human.socketId, target: targets[0] });
       await saveG(gameId, fresh);
     }).catch(() => {});
   }

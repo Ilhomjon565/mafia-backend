@@ -703,3 +703,33 @@ test('xarakter: chatty va style chegarada, faollik oshdi', () => {
     assert.ok(p.activity >= 0.9, 'activity: ' + p.activity);
   }
 });
+
+
+// ==================== OQLASH (clear) — 2026-09-18 auditi ====================
+// "tekshirdim 3 tinch" — bu AYBLOV emas, komissarning oqlashi. Ilgari 'claim'
+// deb tasniflanib tarixga ayblov bo'lib tushar va botlar aynan oqlangan odamga
+// shubha qilardi.
+
+test("komissarning 'tinch/oq' gapi oqlash deb tasniflanadi", () => {
+  for (const t of ['tekshirdim 3 tinch', 'men kom man 3 oq chiqdi', 'komissarman Aziz toza', 'проверил 4 мирный', 'checked Aziz innocent']) {
+    assert.equal(classifyChat(t), 'clear', t);
+  }
+  for (const t of ['men komissarman 3 mafiya', 'tekshirdim Aziz qora', 'комиссар: 5 мафия', 'I am the cop, 3 is mafia']) {
+    assert.equal(classifyChat(t), 'claim', t);
+  }
+});
+
+test('oqlashga bot himoyalanmaydi va ayblov iborasi ishlatmaydi', () => {
+  const alive = [{ socketId: 'a' }, { socketId: 'b' }, { socketId: 'h' }];
+  for (let i = 0; i < 300; i++) {
+    // meni oqladi
+    const r1 = chooseReaction({ kind: 'clear', targets: ['a'], authorSid: 'h', me: { socketId: 'a', role: 'civil' },
+      mates: [], iAmMafia: false, alive, suspicion: {}, persona: makePersona('a'), phase: 'day_discussion' });
+    assert.ok(!r1 || ['askClaim', 'doubtClaim'].includes(r1.kind), JSON.stringify(r1));
+    if (r1) assert.equal(r1.targetSid, null, 'oqlashda nomli ibora (ayblov) chiqdi');
+    // mafiya bot: sherigi oqlandi — indamaydi yoki shubha bildiradi, hech qachon qo'shilmaydi
+    const r2 = chooseReaction({ kind: 'clear', targets: ['b'], authorSid: 'h', me: { socketId: 'a', role: 'mafia' },
+      mates: ['a', 'b'], iAmMafia: true, alive, suspicion: {}, persona: makePersona('a'), phase: 'day_discussion' });
+    assert.ok(!r2 || ['askClaim', 'doubtClaim'].includes(r2.kind), JSON.stringify(r2));
+  }
+});

@@ -118,8 +118,32 @@ async function main() {
   ok(!!hi, 'bot salomga javob berdi', hi ? hi.username + ': ' + hi.message : 'javob yo\'q');
 
   // ================= 2-4. KUNDUZ =================
+  // ================= 1b. "BOSMAY TURING" =================
+  log('\n=== 1b. Bosmay turing — boshlanish kechikadi, xona egasi so\'raydi (3 marta) ===');
+  const ASK = /boshlaymizmi|kiradimi|kutamizmi|keldimi|boladimi|kim keladi|necha daqiqa|kutaveramizmi|boshlasak/i;
+  const FIN = /boshlayapmiz|boshlaymiz|bosaman|kutyapti|kutvotti|kutib boldik|kutdik/i;
+  const holat = () => s.last('game_state')?.status;
+  const tH = Date.now();
+  s.emit('chat_message', { gameId, message: 'bosmay turila yana bir kishi keladi' });
+  const ack = await waitMsg(s, u.username, tH, (m) => m.channel === 'public' && !ASK.test(m.message) && !FIN.test(m.message), 8000);
+  ok(!!ack, 'bot "ok kutamiz" dedi', ack ? ack.username + ': ' + ack.message : "yo'q");
+  const q1 = await waitMsg(s, u.username, tH, (m) => ASK.test(m.message), 26000);
+  ok(!!q1, 'xona egasi so\'radi (1)', q1 ? q1.username + ': ' + q1.message : "yo'q");
+  ok(holat() === 'waiting', 'o\'yin hali boshlanmadi (1)', holat());
+  const tW2 = Date.now();
+  s.emit('chat_message', { gameId, message: 'xa kiradi hoz' });
+  const q2 = await waitMsg(s, u.username, tW2, (m) => ASK.test(m.message), 26000);
+  ok(!!q2, 'javobdan keyin yana so\'radi (2)', q2 ? q2.username + ': ' + q2.message : "yo'q");
+  ok(q1 && q2 && q1.username === q2.username, 'so\'ragan — xona egasi (bir xil odam)', (q1?.username) + ' / ' + (q2?.username));
+  ok(holat() === 'waiting', 'o\'yin hali boshlanmadi (2)', holat());
+  const tW3 = Date.now();
+  s.emit('chat_message', { gameId, message: 'kiradi' });
+  const fin = await waitMsg(s, u.username, tW3, (m) => FIN.test(m.message), 32000);
+  ok(!!fin, 'uchinchi kutishdan keyin "boshlayapmiz, hamma kutyapti"', fin ? fin.username + ': ' + fin.message : "yo'q");
+  ok(!s.all('chat_message').some((m) => m.username !== u.username && (m.timestamp || 0) >= tW3 && ASK.test(m.message)), 'uchinchi marta so\'ramadi (chegara 3)');
+
   log('\n=== 2. Kunduzgi muhokamada botlar yozadi ===');
-  s.emit('chat_message', { gameId, message: 'goo' });
+  // O'yin o'zi boshlanadi ("goo" kerak emas)
   const day = await kutFaza(s, 'day_discussion', 60000);
   ok(day, 'o\'yin boshlandi, kunduz keldi');
   const dayAt = Date.now();

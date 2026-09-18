@@ -8,6 +8,7 @@ import {
   makeFillerBots, BOT_NAMES,
   nightDelayMs, botChatLine, chooseChatAct, typingMs,
   styleLine, mentionedPlayers, classifyChat, chooseReaction, chooseDayOpener, pickSpeakers, LINE_KINDS,
+  isWaitAsk, isWaitYes, isWaitNo,
 } from './bot-ai.js';
 
 const P = (sid, role) => ({ socketId: sid, username: sid, role });
@@ -731,5 +732,42 @@ test('oqlashga bot himoyalanmaydi va ayblov iborasi ishlatmaydi', () => {
     const r2 = chooseReaction({ kind: 'clear', targets: ['b'], authorSid: 'h', me: { socketId: 'a', role: 'mafia' },
       mates: ['a', 'b'], iAmMafia: true, alive, suspicion: {}, persona: makePersona('a'), phase: 'day_discussion' });
     assert.ok(!r2 || ['askClaim', 'doubtClaim'].includes(r2.kind), JSON.stringify(r2));
+  }
+});
+
+
+// ==================== KUTISH XONASI: shoshilmang, yana odam keladi ====================
+// Foydalanuvchi talabi: "bosmay turing / yana bir kishi bor" desa o'yin
+// boshlanmasin — 10-15 s kutib xona egasi so'rasin. Eng nozik joyi:
+// "boshlamay turing" ichida "boshla" bor va u ilgari START deb tushunilardi.
+
+test("kutish so'zlari tanilib, START so'zlari bilan aralashmaydi", () => {
+  const kut = ['shoshilmang', 'Shoshmang!', 'bosmay turing', 'bosmay turila', 'bosmang', 'bosmaylik',
+    'boshlamay turila', 'boshlamay turinglar', 'boshlamang', 'boshlamela', 'kutib turing', 'kuting',
+    'kutila', 'yana odam bor', 'yana bir kishi bor', 'yana 2 kishi keladi', 'dostim kiradi',
+    "do'stim kelyapti", 'ukam kiradi', 'hozir keladi', 'chaqirdim', "to'xtang", 'toxtab turing',
+    '1 minut', 'bir daqiqa', 'sal kuting', 'biroz turing', 'hali erta', 'wait', 'подожди', 'не начинайте',
+    'ещё один человек', 'yana bitta odam kiradi', 'kutamiz'];
+  for (const t of kut) assert.equal(isWaitAsk(t), true, 'kutish deb tanilmadi: ' + t);
+  const bosh = ['boshlaymiz', 'boshla', 'goo', 'bosdim', 'bosing', 'ketdik', 'salom', 'kim mafiya',
+    'kutmaymiz', 'boshlang endi', 'start', 'davay', 'men tayyor'];
+  for (const t of bosh) assert.equal(isWaitAsk(t), false, 'START gapi kutish deb tanildi: ' + t);
+});
+
+test("egasi so'raganidan keyingi javoblar: ha/yo'q", () => {
+  const ha = ['xa kiradi', 'kradi', 'kiradi hoz', 'hoz', 'hozir', 'ha', 'xa', 'ok', 'keladi', 'kelyapti',
+    'chaqirdim', 'yozdim unga', 'kut', 'сейчас зайдёт', 'yes coming', 'bir daqiqa', 'bosmay turing'];
+  for (const t of ha) assert.equal(isWaitYes(t), true, "'ha' deb tanilmadi: " + t);
+  const yoq = ["yo'q", 'yoq', 'kelmaydi', 'kirmadi', 'нет', 'no', 'boshla', 'bosing'];
+  for (const t of yoq) assert.equal(isWaitNo(t), true, "'yo'q' deb tanilmadi: " + t);
+  for (const t of ['xa kiradi', 'kiradi', 'salom', 'hozir']) assert.equal(isWaitNo(t), false, "'ha' gapi 'yo'q' bo'ldi: " + t);
+});
+
+test('kutish iboralari mavjud va nomsiz', () => {
+  for (const k of ['waitAck', 'waitAsk', 'waitStart']) {
+    const keys = new Set();
+    for (let i = 0; i < 300; i++) { const l = botChatLine(k, {}); if (l) keys.add(l.key); }
+    assert.ok(keys.size >= 6, k + ': ' + keys.size);
+    for (const key of keys) assert.ok(!key.includes('{n}'), k + ' nom talab qiladi: ' + key);
   }
 });

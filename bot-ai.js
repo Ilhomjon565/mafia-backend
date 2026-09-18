@@ -616,6 +616,23 @@ const LINES = {
     'kutamizmi yana', 'tez boshlaylik', 'hamma tayyormi', 'kimda mikrofon bor',
     'ovozli oynaymizmi', 'yana 2 kishi kerak', 'kim host', 'boshlang endi',
   ],
+  // KUTISH XONASI: odam "bosmay turing" dedi — tasdiq
+  waitAck: [
+    'ok', 'mayli', 'ok kutamiz', 'xop', 'mayli kutamiz', 'ok kut', 'yaxshi kutamiz',
+    'hop kutamiz', 'ok bosmayman', 'mayli bosmayman', 'kutamiz unda', 'ok kutib turamiz',
+  ],
+  // KUTISH XONASI: xona egasi so'raydi (kutishdan keyin)
+  waitAsk: [
+    'boshlaymizmi', 'kiradimi', 'dosting kiradimi', 'boshlasak boladimi', 'kutamizmi yana',
+    'kiradimi yoki boshlaymizmi', 'keldimi', 'kim keladi', 'necha daqiqa kutamiz',
+    'boshlaymizmi endi', 'kutaveramizmi', 'kiradimi u', 'boshlaymizmi yo kutamizmi',
+  ],
+  // KUTISH XONASI: ko'p kutildi — boshlaymiz
+  waitStart: [
+    'boshlayapmiz hamma sizni kutyapti', 'boshlaymiz hamma kutvotti', 'kop kutdik boshlaymiz',
+    'hamma kutyapti bosaman', 'boshlayapmiz keyin kiradi', 'boshlaymiz kutib boldik',
+    'bosaman hamma kutvotti', 'kirsa keyingi oyinga kiradi boshlaymiz', 'boldi boshlaymiz hamma kutyapti',
+  ],
   // Tun tushishidan oldin
   night: [
     'tinch kecha bolsin', 'omon qolaylik', 'korishguncha',
@@ -694,6 +711,50 @@ export function typingMs(text, rnd = Math.random) {
   // ~4 belgi/sekund (telefonda shosha-pisha) + o'ylash vaqti
   return Math.round(clamp(700 + len * (190 + rnd() * 150), 900, 12000));
 }
+
+// ---------- kutish xonasi: "shoshilmang, yana odam keladi" ----------
+//
+// Odam o'yin boshlanishini kechiktirishni so'raydi. Bu so'zlar START so'zlaridan
+// USTUN: "boshlamay turing" ichida "boshla" bor va u ilgari START deb
+// tushunilib, o'yin aynan odam so'ramagan paytda boshlanib ketardi.
+// Matn avval normallashtiriladi: kichik harf, tutuq belgilari olib tashlanadi
+// (to'xtang / toʻxtang / toxtang — bir xil).
+const normChat = (t) => String(t || '').toLowerCase().replace(/[\u02bb\u02bc\u2019\u2018'`]/g, '').replace(/\s+/g, ' ').trim();
+
+const WAIT_ASK = [
+  /\bshosh(il|m)/,                                   // shoshilmang, shoshmang, shoshmayin
+  /\bbosma/,                                         // bosmang, bosmay turila, bosmaylik
+  /\bboshlam[ae]/,                                   // boshlamang, boshlamay turinglar, boshlamela
+  /\bkut(ib|ing|ila|inglar|aylik|vor|a ?tur|amiz\b)/,  // kuting, kutib turing, kutaylik, kutamiz
+  /\byana (bir|bitta|1|2|3|ikki|uch)? ?(odam|kishi|dost|dostim|ukam|akam|oyinchi|bola|jora|birov)/,
+  /\b(dostim|dostlarim|ukam|akam|singlim|opam|jonam|joram|birov|bir odam|bir kishi|bittasi|kishi|odam) (kiradi|kradi|keladi|kelyapti|kelvotti|kirvotti|kiryapti|kelmoqchi|kirmoqchi|bor)\b/,
+  /\b(hozir|hoz|hozi|hozr) (kiradi|kradi|keladi|kelyapti|kirvotti|kelvotti)/,
+  /\bchaqir(dim|yapman|aman|vomman|ib kel)/,
+  /\btoxta/,                                          // to'xtang, toxtab turing
+  /\b(bir|1|2|ikki|3|uch) ?(daqiqa|daq|min|minut)\b/,
+  /\b(biroz|sal|ozgina|picha|birpas|bir pas) (kut|tur|sabr)/,
+  /\bsabr ?(qil|et)/,
+  /\bhali (erta|boshlama|bosma|kut)/,
+  /\b(wait|hold on|dont start|not yet|one more|is coming|one sec)\b/,
+  /(подожд|погод|не начина|не нажим|ещё (один|одна|человек|друг)|еще (один|одна|человек|друг)|сейчас (придёт|придет|зайдёт|зайдет)|минут(у|ку)|стоп)/,
+];
+// Xona egasi "kiradimi?" deb so'raganidan keyingi "ha, kutamiz" javoblari
+const WAIT_YES = [
+  /^(xa|ha|a|aha|xop|hop|ok|okey|okay|da|yes|yeah|ага|да)\b/,
+  /\b(kiradi|kradi|kiryapti|kirvotti|kirmoqchi|keladi|kelyapti|kelvotti|kelmoqchi|kiradilar|keladilar|kelishadi|kirishadi|kelyabdi|kiryabdi)\b/,
+  /\b(hoz|hozir|hozi|hozr|hoziroq|zamon|birpas|bir pas|sal|biroz)\b/,
+  /\b(kut|kuting|kutila|kutib tur|kutamiz|sabr|chaqir|yozdim|aytdim|xabar ber|bor|keladi deb)\b/,
+  /\b(coming|on the way|wait|sec|minute|yes)\b/,
+  /(идёт|идет|сейчас|подожд|минут|да|зайдёт|зайдет|придёт|придет)/,
+];
+// "yo'q, kelmaydi" — boshlash mumkin
+const WAIT_NO = [
+  /^(yoq|yo q|yuq|net|нет|no|nope)\b/,
+  /\b(kelmaydi|kirmaydi|kelmadi|kirmadi|kelmas ekan|kirmas ekan|boshlang|boshla|bosing|bos)\b/,
+];
+export function isWaitAsk(text) { const t = normChat(text); return !!t && WAIT_ASK.some((r) => r.test(t)); }
+export function isWaitYes(text) { const t = normChat(text); return !!t && (WAIT_ASK.some((r) => r.test(t)) || WAIT_YES.some((r) => r.test(t))); }
+export function isWaitNo(text)  { const t = normChat(text); return !!t && WAIT_NO.some((r) => r.test(t)); }
 
 // ---------- yozish uslubi ----------
 

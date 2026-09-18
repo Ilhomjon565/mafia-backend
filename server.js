@@ -16,6 +16,8 @@ import {
   nightDelayMs, botChatLine, chooseChatAct, typingMs, weightedPick,
   // Odam gapiga javob, kun boshidagi munosabat, yozish uslubi (2026-09-18)
   styleLine, mentionedPlayers, classifyChat, chooseReaction, chooseDayOpener, pickSpeakers,
+  // Kutish xonasida "shoshilmang, yana odam keladi" (2026-09-18)
+  isWaitAsk, isWaitYes, isWaitNo,
 } from './bot-ai.js';
 import { botAvatar } from './avatar.js';
 // O'yin yozuvlari (shikoyat uchun dalil) — disk chegaralari shu modulda.
@@ -4082,7 +4084,7 @@ function scheduleBotJoins(gameId, bots, fast = false) {
       // olishi kerak, ekran ostidan sirg'alib ketmasligi kerak.
       // Nega kutilmaydi: to'lgan xonada kutishning ma'nosi yo'q —
       // yangi odam baribir sig'maydi.
-      if ((g.players || []).length >= (g.totalPlayers || 99)) {
+      if ((g.players || []).length >= (g.totalPlayers || 99) && !g.waitAsk) {
         cancelBotStart(gameId);
         armBotStart(gameId, 5000 + crypto.randomInt(5000));
       }
@@ -4174,6 +4176,80 @@ const START_REPLIES = [
   'yaxshi boshlaymiz', 'ketdik unda', 'mayli bosdm',
   'ha endi boshlasa bo\'ladi', 'bosaman ha', 'qani ketdik',
 ];
+
+// ==================== KUTISH XONASI: "SHOSHILMANG, YANA ODAM KELADI" ====================
+// Odam "bosmay turing / yana bir kishi bor" desa, boshlanish 10-15 s ga
+// kechiktiriladi, keyin xona egasi (bot) "boshlaymizmi? kiradimi?" deb
+// so'raydi. Odam "xa kiradi / hozir" desa yana 10-15 s kutiladi — ko'pi bilan
+// 3 marta; keyin "boshlayapmiz, hamma sizni kutyapti" deb boshlab yuboriladi.
+// Savolga javob bo'lmasa ~15-20 s dan keyin ham shunday.
+//
+// Holat `g.waitAsk = { n, pending }` Redis'da (restartdan keyin recoverTimers
+// uni tozalaydi), taymerlar xotirada.
+const waitAskTimers = new Map();   // gameId -> timer
+const WAIT_MAX = 3;
+function clearWaitAsk(gameId) {
+  const t = waitAskTimers.get(gameId);
+  if (t) { clearTimeout(t); waitAskTimers.delete(gameId); }
+}
+// Xona egasi bot bo'lsa u so'raydi, aks holda istalgan bot
+function hostBotOf(g) {
+  const bots = (g.players || []).filter(isBot);
+  return bots.find(p => p.isHost || p.userId === g.hostId) || bots[0] || null;
+}
+async function holdBotStart(gameId) {
+  const g = await getG(gameId);
+  if (!g || g.status !== 'waiting') return;
+  cancelBotStart(gameId);
+  clearWaitAsk(gameId);
+  const wa = g.waitAsk || { n: 0, pending: false };
+  wa.n += 1; wa.pending = false; wa.at = Date.now();
+  g.waitAsk = wa;
+  g.startAsked = false;   // keyin "goo" desa yana ishlasin
+  logEvent(g, '\u23F8', 'Yana bir oz kutamiz \u2014 odam kelyapti...', 'startHeld');
+  await saveG(gameId, g);
+  io.to(`game:${gameId}`).emit('game_state', publicGame(g));
+  // Tasdiq: "ok kutamiz" (80%) — istalgan bot
+  const bots = g.players.filter(isBot);
+  if (bots.length && crypto.randomInt(100) < 80) {
+    scheduleBotLine(gameId, bots[crypto.randomInt(bots.length)].socketId, { kind: 'waitAck', targetSid: null }, 1200 + crypto.randomInt(1800), 'public', true);
+  }
+  const n = wa.n;
+  const t = setTimeout(() => { withLock(gameId, () => waitAskStep(gameId, n)).catch(() => {}); }, 10000 + crypto.randomInt(5000));
+  t.unref?.();
+  waitAskTimers.set(gameId, t);
+}
+// Kutishdan keyin: 3 martagacha — egasi so'raydi; keyin boshlaymiz
+async function waitAskStep(gameId, n) {
+  const g = await getG(gameId);
+  if (!g || g.status !== 'waiting' || !g.waitAsk || g.waitAsk.n !== n) return;
+  const asker = hostBotOf(g);
+  if (!asker) return;
+  if (n < WAIT_MAX) {
+    g.waitAsk.pending = true;
+    await saveG(gameId, g);
+    await botSayLine(gameId, asker.socketId, 'waitAsk', null, { force: true });
+    // Javob bo'lmasa — boshlaymiz
+    const t = setTimeout(() => { withLock(gameId, () => waitAskFinish(gameId, n)).catch(() => {}); }, 15000 + crypto.randomInt(5000));
+    t.unref?.();
+    waitAskTimers.set(gameId, t);
+  } else {
+    await waitAskFinish(gameId, n);
+  }
+}
+async function waitAskFinish(gameId, n) {
+  const g = await getG(gameId);
+  if (!g || g.status !== 'waiting' || !g.waitAsk || g.waitAsk.n !== n) return;
+  const asker = hostBotOf(g);
+  delete g.waitAsk;
+  logEvent(g, '\u23F3', "O'yin boshlanmoqda...", 'startingSoon');
+  await saveG(gameId, g);
+  io.to(`game:${gameId}`).emit('game_state', publicGame(g));
+  if (asker) await botSayLine(gameId, asker.socketId, 'waitStart', null, { force: true });
+  cancelBotStart(gameId);
+  // Gap yozilib ko'ringuncha (typingMs) + odam o'qib ulgurishi uchun
+  armBotStart(gameId, 9000 + crypto.randomInt(4000));
+}
 
 // ==================== BOTLARNING O'ZARO O'YINLARI ====================
 // Sayt faol ko'rinishi uchun kuniga 10-15 marta FAQAT BOTLAR o'ynaydigan
@@ -4484,7 +4560,7 @@ async function botSayLine(gameId, botSid, kind, targetSid = null, opts = {}) {
   if (channel === 'mafia' && (!bot.isAlive || sideOf(bot.role) !== 'mafia')) return false;
   const tgt = targetSid ? g.players.find(p => p.socketId === targetSid) : null;
   if (targetSid && !tgt) return false;
-  if (!chatBudgetOk(gameId, g, channel)) return false;
+  if (!opts.force && !chatBudgetOk(gameId, g, channel)) return false;
   bot.mem = bot.mem || {};
   if (!bot.persona) bot.persona = makePersona(bot.userId || bot.socketId);
   // Takror gap bot ekanini darhol oshkor qiladi: bot o'zining oxirgi 12 ta
@@ -4522,9 +4598,9 @@ async function botSayLine(gameId, botSid, kind, targetSid = null, opts = {}) {
   return true;
 }
 // Kechiktirib gapirish (qulf ostida)
-function scheduleBotLine(gameId, sid, act, delay, channel = 'public') {
+function scheduleBotLine(gameId, sid, act, delay, channel = 'public', force = false) {
   const t = setTimeout(() => {
-    withLock(gameId, () => botSayLine(gameId, sid, act.kind, act.targetSid, { channel })).catch(() => {});
+    withLock(gameId, () => botSayLine(gameId, sid, act.kind, act.targetSid, { channel, force })).catch(() => {});
   }, delay);
   t.unref?.();
 }
@@ -4746,6 +4822,7 @@ function scheduleWaitingChatter(gameId, human) {
       const g = await getG(gameId);
       if (!g || g.status !== 'waiting') return;
       if (!g.players.some(p => !isBot(p) && p.connected !== false)) return;
+      if (g.waitAsk) return;   // "kutib turing" oqimi ketayotganda bekorchi gap yo'q
       const bots = g.players.filter(isBot);
       if (!bots.length) return;
       const b = bots[crypto.randomInt(bots.length)];
@@ -5793,6 +5870,8 @@ io.on('connection', (socket) => {
         // to'lganida esa kutishning ma'nosi yo'q.
         const full = g.players.length >= (g.totalPlayers || 99);
         const wait = full ? 5000 + crypto.randomInt(5000) : 10000 + crypto.randomInt(5000);
+        // "Kutib turing" oqimi ketayotgan bo'lsa sanoqni u o'zi quradi
+        if (g.waitAsk) { /* kutilmoqda */ } else
         if (armBotStart(gameId, wait)) {
           logEvent(g, '\u23F3', "O'yin boshlanmoqda...", 'startingSoon');
           await saveG(gameId, g);
@@ -6089,10 +6168,26 @@ io.on('connection', (socket) => {
     // o'yin boshlanadi (darhol emas).
     // Javob har safar boshqa bo'ladi — bir xil javob bot ekanini oshkor
     // qiladi.
-    if (g.status === 'waiting' && !isBot(player) && START_ASK.test(text)) {
+    // ===== Kutish xonasida "shoshilmang / yana odam keladi" =====
+    // START so'zidan USTUN tekshiriladi: "boshlamay turing" ichida "boshla" bor.
+    let held = false, wantsStart = false;
+    if (g.status === 'waiting' && !isBot(player) && (g.players || []).some(isBot)
+        && (g.players || []).length >= (g.minPlayers || 5)) {
+      const pending = g.waitAsk?.pending === true;
+      const isWait = isWaitAsk(text);
+      wantsStart = !isWait && (START_ASK.test(text) || (pending && isWaitNo(text)));
+      if (!wantsStart && (g.waitAsk?.n || 0) < WAIT_MAX && (isWait || (pending && isWaitYes(text)))) {
+        held = true;
+        withLock(gameId, () => holdBotStart(gameId)).catch(() => {});
+      }
+    }
+
+    if (g.status === 'waiting' && !isBot(player) && !held && (wantsStart || START_ASK.test(text)) && !isWaitAsk(text)) {
       const bots = (g.players || []).filter(isBot);
       if (bots.length && (g.players || []).length >= (g.minPlayers || 5) && !g.startAsked) {
         g.startAsked = true;
+        // Kutish oqimi bo'lsa — odam boshlashni so'radi, uni to'xtatamiz
+        if (g.waitAsk) { delete g.waitAsk; clearWaitAsk(gameId); }
         await saveG(gameId, g);
         const bot = bots[crypto.randomInt(bots.length)];
         const reply = START_REPLIES[crypto.randomInt(START_REPLIES.length)];
@@ -6619,6 +6714,8 @@ async function recoverTimers() {
         // Xonada ODAM bor va botlar bilan to'lgan: restartdan keyin "boshlash"
         // taymeri ham yo'qolgan. Qayta qurmasak xona lobbida abadiy kutib
         // qolardi — odam ichkarida o'tirib, o'yin hech qachon boshlanmaydi.
+        // Restartda "kutib turing" taymerlari yo'qoladi — holat ham tozalansin
+        if (g.waitAsk) { delete g.waitAsk; await saveG(gameId, g); }
         if ((g.players || []).some(isBot) && g.players.length >= (g.minPlayers || 5)) {
           armBotStart(gameId, 8000 + crypto.randomInt(7000));
         }

@@ -109,7 +109,12 @@ async function main() {
 
   const t0 = Date.now();
   s.emit('chat_message', { gameId, message: 'salom hammaga' });
-  const hi = await waitMsg(s, u.username, t0, null, 12000);
+  let hi = await waitMsg(s, u.username, t0, null, 12000);
+  if (!hi) {
+    // Javob ehtimolli (5+ bot bilan ~95%). Odam ham javob bo'lmasa yana salom beradi.
+    s.emit('chat_message', { gameId, message: 'salom' });
+    hi = await waitMsg(s, u.username, Date.now(), null, 12000);
+  }
   ok(!!hi, 'bot salomga javob berdi', hi ? hi.username + ': ' + hi.message : 'javob yo\'q');
 
   // ================= 2-4. KUNDUZ =================

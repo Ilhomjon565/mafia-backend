@@ -4645,10 +4645,20 @@ async function botReactToHuman(gameId, g, human, text, channel) {
   if (g.status === 'waiting') {
     if (kind !== 'greet') return;
     const bots = g.players.filter(isBot);
-    if (!bots.length || crypto.randomInt(100) >= 70) return;
+    if (!bots.length) return;
+    // Javob ehtimoli xonadagi odamlar soniga bog'liq: 2 kishi bo'lsa salom
+    // javobsiz qolishi tabiiy, 5-6 kishilik xonada esa kimdir albatta javob
+    // beradi. Ilgari bitta 70% zar edi — to'la xonada ham har uchinchi salom
+    // havoda qolardi.
+    if (crypto.randomInt(100) >= Math.min(95, 40 + bots.length * 12)) return;
     botReactAt.set(gameId, now);
     const b = bots[crypto.randomInt(bots.length)];
     scheduleBotLine(gameId, b.socketId, { kind: 'greetReply', targetSid: crypto.randomInt(100) < 40 ? human.socketId : null }, 1200 + crypto.randomInt(2500));
+    // Katta xonada ba'zan ikkinchi odam ham salom beradi
+    if (bots.length >= 4 && crypto.randomInt(100) < 30) {
+      const b2 = bots.filter(x => x !== b)[crypto.randomInt(bots.length - 1)];
+      if (b2) scheduleBotLine(gameId, b2.socketId, { kind: 'greetReply', targetSid: null }, 4500 + crypto.randomInt(3000));
+    }
     return;
   }
   if (g.status !== 'playing') return;

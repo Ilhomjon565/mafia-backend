@@ -2227,7 +2227,8 @@ const endedPlayers = new Map();   // gameId -> { sid -> { userId, username } }
 function rememberEnded(gameId, g) {
   const map = {};
   for (const p of g.players || []) {
-    if (isBot(p)) continue;
+    // Botlar ham kiritiladi: natija ekranidan botga shikoyat qilinganda
+    // javob odamnikidan farq qilmasligi kerak (aks holda bot detektori).
     map[p.socketId] = { userId: p.userId, username: p.username };
   }
   endedPlayers.set(gameId, map);
@@ -5870,7 +5871,11 @@ io.on('connection', (socket) => {
     // Nishonni topamiz. O'yin TUGAGAN bo'lishi mumkin (natija ekranidan
     // shikoyat qilinadi) — o'sha holda tugash paytidagi ro'yxatdan olamiz.
     const g = await getG(gameId);
-    let target = (g?.players || []).find((p) => p.socketId === targetSocketId && !isBot(p));
+    // DIQQAT: bot bu yerda CHIQARIB TASHLANMAYDI. Ilgari `&& !isBot(p)` bor edi
+    // va botga qilingan shikoyat "topilmadi" bo'lib qaytardi — ya'ni pastdagi
+    // butun maskalash mantiqiga umuman yetib bormasdi. Bot odam bilan bir xil
+    // yo'ldan o'tishi kerak, farq faqat ko'rinmaydigan qismda bo'lsin.
+    let target = (g?.players || []).find((p) => p.socketId === targetSocketId);
     if (!target) {
       const snap = endedPlayers.get(gameId);
       const t = snap?.[targetSocketId];

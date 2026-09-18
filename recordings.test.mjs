@@ -108,15 +108,19 @@ test('yo\'l bo\'ylab chiqib ketib bo\'lmaydi (path traversal)', () => {
   assert.ok(rec.filePath('g1', 'u1.webm'));
 });
 
-test("nom tozalangani uchun begona katalogga yozilmaydi", () => {
+test("xavfli KALIT bilan fayl UMUMAN yaratilmaydi", () => {
   fresh();
   rec.open('g1');
-  rec.append('g1', '../../qochdi', buf(50));
-  // Fayl faqat o'yin katalogida bo'lishi kerak
-  const inside = fs.readdirSync(path.join(TMP, 'g1'));
-  assert.equal(inside.length, 1);
-  assert.ok(!inside[0].includes('/') && !inside[0].includes('\\'));
+  // Ilgari nom tozalanardi ('../../qochdi' -> '....qochdi') va fayl baribir
+  // yaratilardi. 2026-09-18 auditidan keyin '..' tarkibidagi nom BUTUNLAY
+  // rad etiladi: shubhali kirishda hech narsa yozilmaydi.
+  const r = rec.append('g1', '../../qochdi', buf(50));
+  assert.equal(r.ok, false, 'xavfli kalit qabul qilindi');
+  assert.equal(r.code, 'badId');
+  assert.equal(fs.readdirSync(path.join(TMP, 'g1')).length, 0, 'fayl yaratilib qoldi');
   assert.equal(fs.existsSync(path.join(TMP, 'qochdi.webm')), false);
+  // Oddiy kalit esa ishlashda davom etadi
+  assert.equal(rec.append('g1', 'oddiy_kalit', buf(50)).ok, true);
 });
 
 test('JSON saqlanadi va o\'qiladi', () => {
@@ -187,4 +191,76 @@ test('LIMITS tashqariga chiqariladi (health va admin uchun)', () => {
   assert.equal(rec.LIMITS.maxUserMb, 1);
   assert.equal(rec.LIMITS.keepDays, 2);
   assert.ok(rec.LIMITS.dir.length > 0);
+});
+
+
+// ==================== YO'L TRAVERSALI (2026-09-18 auditi) ====================
+// Belgilarni filtrlashning O'ZI yetarli emas edi: nuqta ruxsat etilgan
+// belgilar ichida bo'lgani uchun safeName('..') '..' ni o'zgartirmasdan
+// qaytarardi va path.join(DIR,'..') OTA-KATALOGGA olib chiqardi:
+//   GET  /api/admin/evidence/../file/backend.env  -> sirlarni o'qish
+//   DELETE /api/admin/evidence/..                 -> butun /srv/mafia o'chishi
+
+test("'..' va uning shakllari BUTUNLAY rad etiladi", () => {
+  // Ildizdan tashqarida "o'lja" fayl qo'yamiz — unga hech qanday yo'l bilan
+  // yetib bo'lmasligi kerak.
+  const bait = path.join(TMP, '..', 'olja-' + process.pid + '.txt');
+  fs.writeFileSync(bait, 'sirli qiymat');
+  try {
+    for (const bad of ['..', '.', '../x', 'a..b', '....', '../..', './..']) {
+      assert.equal(rec.isOpen(bad), false, 'isOpen o\'tkazdi: ' + bad);
+      assert.equal(rec.filePath(bad, 'olja.txt'), null, 'filePath o\'tkazdi: ' + bad);
+      assert.equal(rec.files(bad).length, 0, 'files o\'tkazdi: ' + bad);
+      assert.equal(rec.drop(bad), false, 'drop o\'tkazdi: ' + bad);
+      assert.equal(rec.open(bad), false, 'open o\'tkazdi: ' + bad);
+      assert.equal(rec.append(bad, 'u1', buf(10)).ok, false, 'append o\'tkazdi: ' + bad);
+      assert.equal(rec.saveJson(bad, 'x', { a: 1 }), false, 'saveJson o\'tkazdi: ' + bad);
+    }
+    assert.ok(fs.existsSync(bait), 'ildizdan tashqaridagi fayl o\'chib ketdi!');
+    assert.equal(fs.readFileSync(bait, 'utf8'), 'sirli qiymat', 'fayl buzildi');
+  } finally {
+    try { fs.unlinkSync(bait); } catch {}
+  }
+});
+
+test('fayl nomi orqali ham chiqib bo\'lmaydi', () => {
+  fresh();
+  rec.open('g1');
+  rec.append('g1', 'u1', buf(50));
+  for (const bad of ['../backend.env', '..', '.', '../../etc/passwd']) {
+    assert.equal(rec.filePath('g1', bad), null, 'chiqib ketdi: ' + bad);
+  }
+  assert.ok(rec.filePath('g1', 'u1.webm'), 'oddiy nom ishlashi kerak');
+});
+
+// ==================== KENGAYTMA VA KVOTA ====================
+// Kengaytma mijozdan (X-Rec-Ext) kelardi va HAR BIRI alohida fayl bo'lgani
+// uchun o'yinchi kvotasi qayta-qayta nolga qaytardi: bitta odam 6 MB o'rniga
+// butun o'yin budjetini yeb, QOLGANLARNING ovozli dalilini yo'q qilardi.
+
+test('faqat ruxsat etilgan kengaytma yoziladi', () => {
+  fresh();
+  rec.open('g1');
+  for (const ext of ['zz9', 'a', 'exe', 'sh', 'json']) rec.append('g1', 'u1', buf(50), ext);
+  const names = rec.files('g1').map((f) => f.name);
+  assert.ok(names.every((n) => /\.(webm|mp4)$/.test(n)), 'kutilmagan kengaytma: ' + names.join(','));
+  assert.ok(rec.ALLOWED_EXT.includes('webm') && rec.ALLOWED_EXT.includes('mp4'));
+});
+
+test("kvota KALIT bo'yicha — kengaytma almashtirib chetlab bo'lmaydi", () => {
+  fresh();
+  rec.open('g1');
+  // Kengaytmani har safar almashtirib, chegaradan oshishga urinamiz
+  let wrote = 0;
+  for (let i = 0; i < 40; i++) {
+    const ext = i % 2 ? 'mp4' : 'webm';
+    const r = rec.append('g1', 'u1', buf(200 * 1024), ext);
+    if (!r.ok) { assert.equal(r.code, 'userFull', 'kutilmagan kod: ' + r.code); break; }
+    wrote += 200 * 1024;
+  }
+  // 1 MB chegara (sinov sozlamasi) — kengaytma almashsa ham oshmasligi kerak
+  assert.ok(wrote <= rec.LIMITS.maxUserMb * 1024 * 1024,
+    'kvota chetlab o\'tildi: ' + Math.round(wrote / 1024) + ' KB');
+  // Boshqa o'yinchi hali yoza olishi kerak
+  assert.equal(rec.append('g1', 'u2', buf(50 * 1024)).ok, true, 'boshqa o\'yinchi bloklandi');
 });

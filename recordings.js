@@ -44,6 +44,8 @@ const MAX_USER_MB = Math.max(1, parseInt(process.env.RECORD_USER_MB || '6'));
 const KEEP_DAYS = Math.max(1, parseInt(process.env.RECORD_KEEP_DAYS || '14'));
 // Bitta bo'lak chegarasi (nginx client_max_body_size 2m)
 export const MAX_CHUNK = 512 * 1024;
+// Ruxsat etilgan ovoz kengaytmalari. Chrome/Firefox webm, Safari mp4 beradi.
+export const ALLOWED_EXT = ['webm', 'mp4'];
 
 const MB = 1024 * 1024;
 export const LIMITS = {
@@ -64,14 +66,29 @@ export const ON = process.env.VOICE_RECORD !== '0';
 let totalBytes = 0;
 let ready = false;
 
+// Yo'l bo'ylab chiqib ketishning oldini oladi.
+//
+// DIQQAT: faqat belgilarni filtrlash YETARLI EMAS edi. Nuqta ruxsat etilgan
+// belgilar ichida bo'lgani uchun `safeName('..')` '..' ni O'ZGARTIRMASDAN
+// qaytarardi va `path.join(DIR, '..')` OTA-KATALOGGA olib chiqardi:
+//   GET  /api/admin/evidence/../file/backend.env  -> sirlarni o'qish
+//   DELETE /api/admin/evidence/..                 -> butun /srv/mafia o'chishi
+// Shuning uchun '.', '..' va tarkibida '..' bo'lgan nom BUTUNLAY rad etiladi.
 function safeName(v) {
-  // Yo'l bo'ylab chiqib ketishning oldini oladi: faqat oddiy belgilar qoladi.
-  return String(v || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64);
+  const s = String(v || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64);
+  if (!s || s === '.' || s === '..' || s.includes('..')) return '';
+  return s;
 }
+// IKKINCHI QATLAM: nom tozalangan bo'lsa ham, natija HAR DOIM ildiz katalog
+// ICHIDA ekani tekshiriladi. Bitta qatlamga ishonib bo'lmaydi — yuqoridagi
+// nuqson aynan shundan kelib chiqqan.
 function gameDir(gameId) {
   const id = safeName(gameId);
   if (!id) return null;
-  return path.join(DIR, id);
+  const root = path.resolve(DIR);
+  const p = path.resolve(root, id);
+  if (!p.startsWith(root + path.sep)) return null;
+  return p;
 }
 function dirSize(dir) {
   let n = 0;
@@ -148,7 +165,12 @@ export function append(gameId, key, buf, ext = 'webm') {
   if (buf.length > MAX_CHUNK) return { ok: false, code: 'chunkTooBig' };
   const d = gameDir(gameId);
   const k = safeName(key);
-  const e = safeName(ext).replace(/[^a-z0-9]/gi, '').slice(0, 5) || 'webm';
+  // Kengaytma QAT'IY oq ro'yxatda. Ilgari mijoz istalgan 1-5 belgili
+  // kengaytma yubora olardi va HAR BIRI alohida fayl bo'lgani uchun
+  // o'yinchi kvotasi (MAX_USER_MB) qayta-qayta nolga qaytardi: bitta odam
+  // 6 MB o'rniga butun o'yin budjetini (30 MB) yeb, QOLGANLARNING ovozli
+  // dalilini yo'q qilardi.
+  const e = ALLOWED_EXT.includes(String(ext)) ? String(ext) : 'webm';
   if (!d || !k) return { ok: false, code: 'badId' };
   if (!isOpen(gameId)) return { ok: false, code: 'notOpen' };
 
@@ -158,8 +180,17 @@ export function append(gameId, key, buf, ext = 'webm') {
   if (gSize + buf.length > MAX_GAME_MB * MB) return { ok: false, code: 'gameFull' };
 
   const file = path.join(d, k + '.' + e);
+  // Kvota FAYL emas, O'YINCHI (kalit) bo'yicha hisoblanadi: bir kalitning
+  // barcha fayllari qo'shiladi. Aks holda kengaytmani almashtirib chegarani
+  // aylanib o'tish mumkin edi.
   let uSize = 0;
-  try { uSize = fs.statSync(file).size; } catch {}
+  try {
+    for (const f of fs.readdirSync(d)) {
+      if (f === k || f.startsWith(k + '.')) {
+        try { uSize += fs.statSync(path.join(d, f)).size; } catch {}
+      }
+    }
+  } catch {}
   if (uSize + buf.length > MAX_USER_MB * MB) return { ok: false, code: 'userFull' };
 
   try {

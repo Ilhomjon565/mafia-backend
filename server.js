@@ -2335,7 +2335,10 @@ app.post('/api/voice-chunk', authMiddleware, limitByUser(600), voiceChunkBody, a
   try {
     if (!recStore.ON) return res.status(204).end();
     const gameId = String(req.headers['x-game-id'] || '');
-    const ext = String(req.headers['x-rec-ext'] || 'webm');   // Safari 'mp4' yuboradi
+    // Kengaytma OQ RO'YXATDA: mijoz uni tanlay olmaydi. Ilgari istalgan qiymat
+    // o'tardi va har biri alohida fayl bo'lib, o'yinchi kvotasini bekor qilardi.
+    const raw = String(req.headers['x-rec-ext'] || 'webm');
+    const ext = recStore.ALLOWED_EXT.includes(raw) ? raw : 'webm';
     if (!gameId || !Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'bad' });
     if (!recStore.isOpen(gameId)) return res.status(410).json({ code: 'closed' });
 
@@ -2815,6 +2818,17 @@ app.get('/api/admin/games', authMiddleware, adminMiddleware, async (req, res) =>
 app.post('/api/admin/games/:id/stop', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const id = req.params.id;
+    // DALIL SAQLANSIN: endGame chaqirilmagani uchun ilgari game.json yozilmasdi
+    // va `chat:<id>` redis.del bilan butunlay yo'q bo'lardi — diskda esa egasiz
+    // ovoz fayllari 14 kun qolib ketardi. Admin xonani AYNAN shikoyat sababli
+    // to'xtatgan bo'lishi mumkin, ya'ni dalil eng kerak bo'lgan payt.
+    {
+      const g = await getG(id).catch(() => null);
+      if (g?.recording) {
+        rememberEnded(id, g);
+        await finishRecording(id, g, g.winner || 'draw').catch((e) => console.error('adminStop/rec:', e?.stack || e));
+      }
+    }
     await prisma.game.update({ where: { id }, data: { status: 'finished', endedAt: new Date() } }).catch(() => {});
     io.to(`game:${id}`).emit('game_closed', { code: 'adminStopped', message: 'Admin tomonidan xona yopildi' });
     if (timers.has(id)) { clearTimeout(timers.get(id)); timers.delete(id); }
@@ -2830,6 +2844,14 @@ app.post('/api/admin/games/:id/stop', authMiddleware, adminMiddleware, async (re
 app.delete('/api/admin/games/:id', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const id = req.params.id;
+    {
+      // Bu yerda ham dalil yoziladi — sabab yuqoridagi bilan bir xil
+      const g = await getG(id).catch(() => null);
+      if (g?.recording) {
+        rememberEnded(id, g);
+        await finishRecording(id, g, g.winner || 'draw').catch((e) => console.error('adminDelete/rec:', e?.stack || e));
+      }
+    }
     io.to(`game:${id}`).emit('game_closed', { code: 'adminDeleted', message: 'Admin xonani o\'chirdi' });
     if (timers.has(id)) { clearTimeout(timers.get(id)); timers.delete(id); }
     const delG = await getG(id);
@@ -5854,10 +5876,22 @@ io.on('connection', (socket) => {
       const t = snap?.[targetSocketId];
       if (t) target = { userId: t.userId, username: t.username };
     }
-    if (!target || !isRealUser(target.userId) || target.userId === d.userId) {
+    // O'ZIGA shikoyat qilib bo'lmaydi (bu odam uchun ham, bot uchun ham bir xil)
+    if (!target || target.userId === d.userId) {
       socket.emit('report_result', { ok: false, code: 'reportBad', message: 'Shikoyat yuborilmadi' });
       return;
     }
+
+    // ===== BOT OSHKOR BO'LMASIN =====
+    // Ilgari botga shikoyat HAR DOIM "Shikoyat yuborilmadi" berardi, odamga esa
+    // "yuborildi". Ya'ni 🚩 tugmasi BEPUL VA CHEKSIZ BOT DETEKTORIGA aylangandi:
+    // bir necha bosishda xonadagi hamma botni aniqlab olish mumkin edi.
+    //
+    // Endi bot ODAM BILAN BIR XIL yo'ldan o'tadi: kunlik chegara hisobi ham
+    // yuritiladi (takroriy shikoyat ham bir xil javob beradi), javob ham aynan
+    // bir xil. Farqi faqat ko'rinmaydigan qismda: yozuv saqlanmaydi va admin
+    // bezovta qilinmaydi — botga qarshi chora ko'rishning ma'nosi yo'q.
+    const targetIsBot = !isRealUser(target.userId);
 
     // ===== FLOOD HIMOYASI =====
     // Bitta odamga kuniga BIR MARTA; kuniga ko'pi bilan 20 ta TURLI odamga.
@@ -5890,6 +5924,12 @@ io.on('connection', (socket) => {
       onId: target.userId, on: target.username,
       reason: why || '',
     };
+    // BOTGA qilingan shikoyat saqlanmaydi (admin uchun ma'nosi yo'q), lekin
+    // foydalanuvchi buni SEZMAYDI — javob va chegara hisobi bir xil.
+    if (targetIsBot) {
+      socket.emit('report_result', { ok: true, code: 'reportSent', message: 'Shikoyat yuborildi' });
+      return;
+    }
     try {
       await redis.rpush('reports', JSON.stringify(entry));
       await redis.ltrim('reports', -500, -1);

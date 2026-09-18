@@ -60,6 +60,21 @@ fayllar. Ular birinchi ishga tushirilganda **uchta haqiqiy nuqson** topgan
 - Kecha bosqichi ikkinchi ovozdan oldin yopilsa sinov YIQITILMAYDI —
   keyingi o‘yinga o‘tiladi (sharti qurilmagan hisoblanadi)
 
+**`07-bitta-sessiya.mjs`** (13 ta tekshiruv)
+- Ikkinchi qurilma o‘yinga kirsa eskisi `session_taken` bilan chiqariladi va
+  uziladi; **o‘yinchi xonada QOLADI** (eski ulanishning uzilishi uni chiqarib
+  yubormaydi); o‘sha qurilmaning ikkinchi varag‘i uchun sabab `otherTab`
+
+**`08-bot-chat.mjs`** (14 ta tekshiruv) — **`BOT_FILL=1` talab qiladi**
+- Kutish xonasida "salom"ga bot javob beradi
+- Kunduzda kamida 4 ta bot gapi, 2+ xil bot, takror gap yo‘q
+- Odam botni NOMI bilan ayblasa AYNAN o‘sha bot javob beradi (himoya yoki
+  qarshi ayblov) — oynasi 20 s (uzun gap 12 s gacha "yoziladi")
+- "men komissarman X mafiya" ga munosabat
+- Odam mafiya (botlar bilan o‘ynash xonasi, `E2E_URINISH` urinish): tunda
+  bot sherik mafiya kanalida gap boshlaydi; odam AFK bo‘lsa bosqichning 60% ida
+  botlar O‘ZLARI nishon tanlaydi va aytadi
+
 ## Qanday ishga tushirish
 
 Sinov **ALOHIDA** nusxaga qarshi ishlashi shart: boshqa port, boshqa Redis DB
@@ -112,6 +127,10 @@ E2E_API=http://127.0.0.1:4199 E2E_PSQL="$RAW" E2E_ADMIN_KEY=e2ekey node 03-reyti
 #  lekin ikkalasini ketma-ket ishga tushirish qulay)
 E2E_API=http://127.0.0.1:4199 E2E_REDIS="redis-cli -n 9" node 04-shikoyat-bot.mjs
 E2E_API=http://127.0.0.1:4199 E2E_ADMIN_KEY=e2ekey E2E_URINISH=24 node 06-mafiya-kelishuv.mjs
+E2E_API=http://127.0.0.1:4199 E2E_ADMIN_KEY=e2ekey node 08-bot-chat.mjs
+
+# 07 — BOT_FILL muhim emas
+E2E_API=http://127.0.0.1:4199 node 07-bitta-sessiya.mjs
 ```
 
 **Tozalash (shart):**

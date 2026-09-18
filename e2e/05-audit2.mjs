@@ -91,6 +91,10 @@ async function main() {
   let kunTest = null;
   socks.forEach((s, i) => {
     s.on('your_role', (d) => roles.set(i, d.role));
+    // Mafiya 1-kundayoq chiqarilsa o'yin `phase_change`siz tugaydi — o'limlar
+    // `game_over` dagi ochilgan ro'yxatdan ham yig'iladi (aks holda test
+    // har 5-ishga tushishda "o'lgan yo'q" deb yiqilardi).
+    if (i === 0) s.on('game_over', (d) => { for (const p of d?.players || []) if (p.isAlive === false) oldi.set(p.username, p.socketId); });
     s.on('phase_change', async (d) => {
       const st = s.last('game_state') || {};
       const hammasi = d.players || st.players || [];

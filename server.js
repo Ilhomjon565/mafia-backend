@@ -14,6 +14,8 @@ import {
   chooseDayVote, chooseNightTarget, makeFillerBots, BOT_NAMES,
   // Botlarning gapi va tungi kechikishi — ikkalasi ham sof funksiya (testlari bor)
   nightDelayMs, botChatLine, chooseChatAct, typingMs, weightedPick,
+  // Odam gapiga javob, kun boshidagi munosabat, yozish uslubi (2026-09-18)
+  styleLine, mentionedPlayers, classifyChat, chooseReaction, chooseDayOpener, pickSpeakers,
 } from './bot-ai.js';
 import { botAvatar } from './avatar.js';
 // O'yin yozuvlari (shikoyat uchun dalil) — disk chegaralari shu modulda.
@@ -3593,6 +3595,7 @@ async function onPhaseEnd(gameId, phase) {
           // Botlar uchun eng qimmatli ma'lumot: chetlatilgan odam mafiya edimi.
           // Shundan keyin ular unga ovoz berganlarni boshqacha baholaydi.
           botEvent(g, { type: 'lynched', round: g.round || 0, target: p.socketId, wasMafia: sideOf(p.role) === 'mafia' });
+          scheduleDeadTalk(gameId);   // o'liklar kanalida gap (o'lgan odam bo'lsa)
           msg = `☀️ ${p.username} ovoz bilan o'ldirildi — ${roleName(p.role)}`;
           result = { eliminated: p.username, role: p.role, reason: 'votedOut', name: p.username };
           logEvent(g, '⚖️', `${p.username} ovoz bilan chiqarildi — u ${roleName(p.role)} edi`, 'votedOut', { name: p.username, role: p.role });
@@ -3789,6 +3792,7 @@ async function processNight(gameId) {
   // Botlar uchun: tunda o'ldirilgan odam MAFIYA EMAS — unga ovoz berganlar
   // shubha tortadi (bot-ai.js dagi buildSuspicion 4-qoidasi).
   botEventDeaths(g, res.events.filter(e => e.type === 'death'));
+  scheduleDeadTalk(gameId);
   const killed = [], killedNames = [], savedNames = [];
 
   for (const ev of res.events) {
@@ -3974,7 +3978,7 @@ async function startNightStep(gameId, idx) {
     const actors = g.players.filter(p => p.isAlive && step.roles.includes(p.role));
     // uzilib qolgan odam aktyor sanalmasin — aks holda uni abadiy kutardik
     const humanActor = present && actors.some(p => !isBot(p) && p.connected !== false);
-    if (present) scheduleBotNightStep(gameId, idx, d * 1000, actors.find(isBot));
+    if (present) scheduleBotNightStep(gameId, idx, d * 1000, actors.find(isBot), g);
     // Taymer HAR DOIM qo'yiladi. Ilgari roli odamda bo'lsa taymer umuman qo'yilmasdi va
     // u harakat qilmasa (yoki uzilib qolsa) o'yin abadiy muzlab qolardi.
     //
@@ -4126,10 +4130,13 @@ function cancelBotStart(gameId) {
 
 // Bot nomidan ochiq chat xabari. Xabar oddiy o'yinchi xabari kabi saqlanadi
 // va tarqatiladi — tashqaridan farqi yo'q.
-async function botSay(gameId, bot, text) {
+// Bot nomidan xabar. `channel`: public | mafia | dead — yetkazish odam
+// xabari bilan AYNAN bir xil (chat_message ishlovchisiga qarang), shuning
+// uchun mijoz uchun farqi yo'q.
+async function botSay(gameId, bot, text, channel = 'public') {
   const payload = {
-    username: bot.username, message: text, channel: 'public',
-    isAlive: true, timestamp: Date.now(),
+    username: bot.username, message: text, channel,
+    isAlive: bot.isAlive !== false, timestamp: Date.now(),
   };
   try {
     const ck = `chat:${gameId}`;
@@ -4137,7 +4144,13 @@ async function botSay(gameId, bot, text) {
     await redis.ltrim(ck, -200, -1);
     await redis.expire(ck, 86400);
   } catch {}
-  io.to(`game:${gameId}`).emit('chat_message', payload);
+  if (channel === 'public') { io.to(`game:${gameId}`).emit('chat_message', payload); return; }
+  const g = await getG(gameId).catch(() => null);
+  if (!g) return;
+  const who = channel === 'mafia'
+    ? g.players.filter(p => p.isAlive && sideOf(p.role) === 'mafia')
+    : g.players.filter(p => !p.isAlive);
+  for (const p of who) if (!isBot(p)) io.to(p.socketId).emit('chat_message', payload);
 }
 
 // "Boshlaymizmi?" degan xabarlar. Odam shulardan birini yozsa bot javob
@@ -4400,7 +4413,9 @@ async function beginGame(gameId) {
 // ko'rsatardi, bosqich esa HAR SAFAR o'sha hisoblagichning 10-22% ida yopilardi:
 // progress-bar aynan bir joyda o'lardi va tun ~145 soniya o'rniga ~20 soniyada
 // o'tardi. Bu bot ekanini ko'rsatadigan eng aniq naqshlardan biri edi.
-function scheduleBotNightStep(gameId, idx, stepMs = 20000, actor = null) {
+function scheduleBotNightStep(gameId, idx, stepMs = 20000, actor = null, g = null) {
+  // Mafiya bosqichi: odam mafiya bilan bot sherik bo'lsa, u kanalda gapiradi
+  if (g && NIGHT_STEPS[idx]?.phase === 'night_mafia') scheduleMafiaNightChat(gameId, g, stepMs);
   let persona = actor?.persona;
   if (actor && !persona) persona = actor.persona = makePersona(actor.userId || actor.socketId);
   const delay = nightDelayMs(persona || makePersona(gameId + ':' + idx), stepMs);
@@ -4409,34 +4424,133 @@ function scheduleBotNightStep(gameId, idx, stepMs = 20000, actor = null) {
 }
 
 // ==================== BOTLARNING GAPI ====================
-// Ilgari botlar o'yin davomida chatda BIR OG'IZ ham gapirmasdi: `botSay` butun
-// serverda faqat bitta joyda — kutish xonasidagi "goo" javobida — chaqirilardi.
-// Natijada 12 "o'yinchi" ovoz taxtasida faol harakat qilib turardi, chat esa
-// mutlaqo jim edi: birorta ayblov, bahs, "men komissarman" yo'q. Mafiya
-// o'yinida bunday bo'lishi mumkin emas.
+// Ilgari botlar o'yin davomida chatda BIR OG'IZ ham gapirmasdi. Keyin har
+// kunduzda 2-5 bot bir martadan yozadigan bo'ldi — lekin odamning gapiga
+// hech qanday javob yo'q edi: odam "Aziz mafiya" desa, Aziz jim turardi;
+// kutish xonasida salomga javob yo'q; mafiya kanalida sherik jim; o'liklar
+// kanali bo'sh. Bu "faqat o'z gapini gapiradigan" o'yinchi — bot belgisi.
 //
-// Qaror `chooseChatAct` da (bot-ai.js) — ovoz berish bilan AYNI manbadan
-// (ochiq shubha ballari). Ya'ni bot aytgan gap uning keyingi ovoziga mos keladi.
+// Endi HAMMA bot gapi bitta yo'ldan (`botSayLine`) o'tadi: ibora tanlanadi
+// (takror eslanadi), botning uslubi qo'shiladi, "yozish" vaqti kutiladi,
+// yuborishdan OLDIN faza QAYTA tekshiriladi va budjet (bir fazada nechta bot
+// gapi) nazorat qilinadi — aks holda 10 bot bir-biriga javob berib chatni
+// bosib yuborardi.
+//
+// Qarorlar bot-ai.js da (sof funksiyalar, testlari bor): chooseChatAct,
+// chooseReaction, chooseDayOpener. Ular ovoz berish bilan AYNI manbaga
+// (ochiq shubha ballari) tayanadi — bot aytgan gap keyingi ovoziga mos keladi.
+
+const botChatBudget = new Map();   // gameId -> { key, n }
+const BOT_CHAT_CAP = { public: 12, mafia: 5, dead: 4, waiting: 4 };
+function chatBudgetOk(gameId, g, channel) {
+  // Kutish xonasida budjet DAQIQA bo'yicha (odam u yerda uzoq o'tirishi mumkin)
+  const key = g.status === 'waiting'
+    ? 'w:' + Math.floor(Date.now() / 60000)
+    : (g.round || 0) + ':' + String(g.phase || '').replace(/^night_.*/, 'night') + ':' + channel;
+  let b = botChatBudget.get(gameId);
+  if (!b || b.key !== key) { b = { key, n: 0 }; botChatBudget.set(gameId, b); }
+  const cap = g.status === 'waiting' ? BOT_CHAT_CAP.waiting : (BOT_CHAT_CAP[channel] || 6);
+  if (b.n >= cap) return false;
+  b.n++;
+  return true;
+}
+// Kanal shu fazada ochiqmi (odam uchun ham xuddi shu qoida)
+function botChatPhaseOk(g, channel) {
+  if (!g) return false;
+  if (channel === 'public') return g.status === 'waiting' || (g.status === 'playing' && g.phase === 'day_discussion');
+  if (channel === 'mafia') return g.status === 'playing' && String(g.phase || '').startsWith('night');
+  if (channel === 'dead') return g.status === 'playing';
+  return false;
+}
+
+// Bitta bot bitta gap: `kind` — ibora turi (bot-ai.js LINES), `targetSid` —
+// gapda tilga olinadigan o'yinchi. Qaytadi: rejalashtirildimi.
+async function botSayLine(gameId, botSid, kind, targetSid = null, opts = {}) {
+  const channel = opts.channel || 'public';
+  const g = await getG(gameId);
+  if (!g || !botChatPhaseOk(g, channel)) return false;
+  const bot = (g.players || []).find(p => p.socketId === botSid);
+  if (!isBot(bot)) return false;
+  if (channel === 'public' && g.status === 'playing' && !bot.isAlive) return false;
+  if (channel === 'dead' && bot.isAlive) return false;
+  if (channel === 'mafia' && (!bot.isAlive || sideOf(bot.role) !== 'mafia')) return false;
+  const tgt = targetSid ? g.players.find(p => p.socketId === targetSid) : null;
+  if (targetSid && !tgt) return false;
+  if (!chatBudgetOk(gameId, g, channel)) return false;
+  bot.mem = bot.mem || {};
+  if (!bot.persona) bot.persona = makePersona(bot.userId || bot.socketId);
+  // Takror gap bot ekanini darhol oshkor qiladi: bot o'zining oxirgi 12 ta
+  // iborasini VA butun xonada aytilgan oxirgi 25 tasini chetlab o'tadi —
+  // ikki bot bir xil gapni aytsa ham naqsh.
+  const avoid = [...(bot.mem.said || []), ...(g.botSaid || [])];
+  const line = botChatLine(kind, { n: tgt?.username }, avoid);
+  if (!line) return false;
+  bot.mem.said = [...(bot.mem.said || []), line.key].slice(-12);
+  g.botSaid = [...(g.botSaid || []), line.key].slice(-25);
+  // Komissar bir odamni qayta-qayta e'lon qilmaydi; da'vo botlar tarixiga
+  // ham tushadi — shunda doktor bot uni himoya qiladi, qolganlar nishonga
+  // shubha bilan qaraydi (jamoatchilik fikri).
+  if ((kind === 'claim' || kind === 'clear') && targetSid) {
+    if (kind === 'claim') bot.mem.claimedSids = [...(bot.mem.claimedSids || []), targetSid];
+    botEvent(g, { type: kind, round: g.round || 0, from: botSid, target: targetSid });
+  }
+  await saveG(gameId, g);
+
+  const text = styleLine(line.text, bot.persona);
+  // "Yozib turish" vaqti: uzunroq gap uzoqroq yoziladi. Yuborishdan OLDIN
+  // faza qayta tekshiriladi — kunduzgi gap tunda chiqib qolmasin.
+  const t = setTimeout(() => {
+    getG(gameId)
+      .then((fresh) => {
+        if (!fresh || !botChatPhaseOk(fresh, channel)) return;
+        const still = (fresh.players || []).find((x) => x.socketId === botSid);
+        if (!still) return;
+        if (channel !== 'dead' && !still.isAlive) return;
+        return botSay(gameId, still, text, channel);
+      })
+      .catch(() => {});
+  }, (opts.delayMs || 0) + typingMs(text));
+  t.unref?.();
+  return true;
+}
+// Kechiktirib gapirish (qulf ostida)
+function scheduleBotLine(gameId, sid, act, delay, channel = 'public') {
+  const t = setTimeout(() => {
+    withLock(gameId, () => botSayLine(gameId, sid, act.kind, act.targetSid, { channel })).catch(() => {});
+  }, delay);
+  t.unref?.();
+}
+
+// Kun boshida botlar nimaga munosabat bildiradi: oldingi kunning natijasi va
+// kechasi kim o'lgani. Tarixning DUMIDAN o'qiladi: ... lynched, killed*, [bugun]
+function lastEventsFor(g) {
+  const ev = g.botEvents || [];
+  const killed = [];
+  let lynched = null;
+  let i = ev.length - 1;
+  while (i >= 0 && ev[i].type === 'killed') { killed.push(ev[i].target); i--; }
+  while (i >= 0 && (ev[i].type === 'claim' || ev[i].type === 'clear')) i--;
+  if (i >= 0 && ev[i].type === 'lynched') lynched = { sid: ev[i].target, wasMafia: !!ev[i].wasMafia };
+  return { lynched, killed, anyNight: (g.round || 0) > 1 };
+}
+
+// Kunduzgi muhokama: kim, qachon gapiradi.
 function scheduleBotChat(gameId, g) {
   const phaseMs = dur(g, 'day_discussion') * 1000;
   const bots = (g.players || []).filter(p => p.isAlive && isBot(p));
   if (!bots.length || phaseMs < 15000) return;
-  // Har raundda 2-5 bot gapiradi — hammasi emas. Jonli xonada ham har
-  // muhokamada hamma yozmaydi, va "hamma har raund gapiradi" ham naqsh bo'lardi.
+  for (const b of bots) if (!b.persona) b.persona = makePersona(b.userId || b.socketId);
   const order = bots.slice();
   for (let i = order.length - 1; i > 0; i--) {
     const j = crypto.randomInt(i + 1);
     [order[i], order[j]] = [order[j], order[i]];
   }
-  const speakers = order.slice(0, Math.min(order.length, 2 + crypto.randomInt(4)));
-  // Vaqtlar faza bo'ylab TARQOQ va kamida 2.6 s oraliq bilan: ikki xabar bir
-  // vaqtda chiqsa bu ham darhol ko'zga tashlanadi.
-  //
-  // DIQQAT: xabar yozilishiga ham vaqt ketadi (typingMs, 0.9-12 s) — shuning
-  // uchun oxirgi slot faza tugashidan kamida TYPING_MAX oldin bo'lishi kerak,
-  // aks holda gap keyingi fazada (masalan tunda) chiqib qolardi.
+  // Har raundda hamma emas: kim gapirishi `chatty` xarakteriga bog'liq (2..7)
+  const speakers = pickSpeakers(order);
+  // Vaqtlar faza bo'ylab TARQOQ va kamida 2.6 s oraliq bilan. Oxirgi slot faza
+  // tugashidan kamida TYPING_MAX oldin — gap keyingi fazada chiqib qolmasin.
   const TYPING_MAX = 12000;
-  const from = 3000;
+  const from = 2500;
   const last = phaseMs - TYPING_MAX - 2000;
   if (last <= from) return;
   const to = Math.max(from + 3000, last);
@@ -4446,54 +4560,246 @@ function scheduleBotChat(gameId, g) {
   }
   speakers.forEach((bot, i) => {
     if (slots[i] > last) return;
-    const t = setTimeout(() => { withLock(gameId, () => botTalkOnce(gameId, bot.socketId)).catch(() => {}); }, slots[i]);
+    // Birinchi 1-2 gap — OLDINGI natijaga munosabat (2-raunddan): "X tinch
+    // ekan xato qildik", "kecha Y ni olishdi". Odam ham kunni shundan boshlaydi.
+    const opener = (g.round || 0) > 1 && i < 2 && crypto.randomInt(100) < 70;
+    const t = setTimeout(() => { withLock(gameId, async () => {
+      if (!opener) return botTalkOnce(gameId, bot.socketId);
+      const fresh = await getG(gameId);
+      const bb = fresh?.players?.find(p => p.socketId === bot.socketId);
+      if (!bb) return;
+      const act = chooseDayOpener({ ...botCtx(fresh, bb), last: lastEventsFor(fresh) });
+      return botTalkOnce(gameId, bot.socketId, act);
+    }).catch(() => {}); }, slots[i]);
     t.unref?.();
   });
+  // Ikkinchi to'lqin: uzun fazada ba'zi botlar yana bir marta gapiradi —
+  // muhokama fazaning oxirigacha "tirik" qoladi.
+  if (phaseMs >= 60000) {
+    const half = Math.round(phaseMs * 0.55);
+    for (const bot of speakers) {
+      if (crypto.randomInt(100) >= 35) continue;
+      const at = half + crypto.randomInt(Math.max(1000, last - half));
+      if (at > last) continue;
+      const t = setTimeout(() => { withLock(gameId, () => botTalkOnce(gameId, bot.socketId)).catch(() => {}); }, at);
+      t.unref?.();
+    }
+  }
 }
 
-// Bitta bot bitta gap yozadi.
-async function botTalkOnce(gameId, botSid) {
+// Bitta bot bitta gap yozadi. `forced` — tashqaridan berilgan qaror
+// (kun boshidagi munosabat); bo'lmasa chooseChatAct hal qiladi.
+async function botTalkOnce(gameId, botSid, forced = null) {
   const g = await getG(gameId);
   if (!g || g.status !== 'playing' || g.phase !== 'day_discussion') return;
   const bot = (g.players || []).find(p => p.socketId === botSid);
   if (!isBot(bot) || !bot.isAlive) return;
-
-  const act = chooseChatAct(botCtx(g, bot));
+  const act = forced || chooseChatAct(botCtx(g, bot));
   if (!act) return;
-  const tgt = act.targetSid ? g.players.find(p => p.socketId === act.targetSid) : null;
-  if (act.targetSid && !tgt) return;
+  const ok = await botSayLine(gameId, botSid, act.kind, act.targetSid);
+  if (!ok) return;
 
-  bot.mem = bot.mem || {};
-  // Takror gap bot ekanini darhol oshkor qiladi — oxirgi 10 ta ibora eslanadi
-  const line = botChatLine(act.kind, { n: tgt?.username }, bot.mem.said || []);
-  if (!line) return;
-  bot.mem.said = [...(bot.mem.said || []), line.key].slice(-10);
-  // Komissar bir xil odamni qayta-qayta e'lon qilmaydi
-  if (act.kind === 'claim' && act.targetSid) {
-    bot.mem.claimedSids = [...(bot.mem.claimedSids || []), act.targetSid];
+  // BOT-BOT MULOQOTI: kimnidir ayblasa, ayblangan bot o'zini himoya qiladi,
+  // yana bittasi qo'shiladi yoki qarshi chiqadi. Busiz har gap havoda qolar
+  // va chat "bir-birini eshitmaydigan" odamlar ro'yxatiga o'xshardi.
+  if ((act.kind === 'accuse' || act.kind === 'claim' || act.kind === 'agree') && act.targetSid) {
+    const tgt = g.players.find(p => p.socketId === act.targetSid);
+    if (isBot(tgt) && tgt.isAlive && crypto.randomInt(100) < 55) {
+      scheduleBotLine(gameId, tgt.socketId, { kind: 'defend', targetSid: null }, 3000 + crypto.randomInt(6000));
+    }
+    const others = g.players.filter(p => p.isAlive && isBot(p) && p.socketId !== botSid && p.socketId !== act.targetSid);
+    if (others.length && crypto.randomInt(100) < 30) {
+      const o = others[crypto.randomInt(others.length)];
+      // Mafiya bot sherigini ayblovga QO'SHILMAYDI — himoya qiladi
+      const mate = sideOf(o.role) === 'mafia' && sideOf(tgt?.role) === 'mafia';
+      const kind = mate ? (act.kind === 'claim' ? 'doubtClaim' : 'disagree') : 'agree';
+      scheduleBotLine(gameId, o.socketId, { kind, targetSid: act.targetSid }, 5000 + crypto.randomInt(7000));
+    }
   }
-  await saveG(gameId, g);
+}
 
-  // "Yozib turish" vaqti: uzunroq gap uzoqroq yoziladi. Bir zumda paydo
-  // bo'lgan 24 belgili xabar odam yozgan bo'lishi mumkin emas.
-  //
-  // Yuborishdan OLDIN faza qayta tekshiriladi: yozish 12 soniyagacha davom
-  // etishi mumkin va shu orada kunduz yopilib ulgurishi mumkin. Kunduzgi
-  // ochiq gap tunda chiqib qolsa — bu darhol ko'zga tashlanadigan xato.
-  const sid = bot.socketId;
-  const t = setTimeout(() => {
-    getG(gameId)
-      .then((fresh) => {
-        if (!fresh || fresh.status !== 'playing' || fresh.phase !== 'day_discussion') return;
-        const still = (fresh.players || []).find((x) => x.socketId === sid);
-        if (!still || !still.isAlive) return;
-        return botSay(gameId, still, line.text);
-      })
-      .catch(() => {});
-  }, typingMs(line.text));
+// ODAMNING GAPIGA JAVOB. Chat ishlovchisidan chaqiriladi (qulfsiz — faqat
+// taymer qo'yadi; gapning o'zi qulf ostida yoziladi).
+const botReactAt = new Map();   // gameId -> oxirgi javob vaqti (bosib yubormaslik)
+async function botReactToHuman(gameId, g, human, text, channel) {
+  if (!(g.players || []).some(isBot)) return;
+  const now = Date.now();
+  if (now - (botReactAt.get(gameId) || 0) < 2500) return;
+  const kind = classifyChat(text);
+  const seatsOn = g.status === 'playing';
+  const roster = (g.players || []).map((p, i) => ({ socketId: p.socketId, username: p.username, seat: i + 1 }));
+  const targets = mentionedPlayers(text, roster, { authorSid: human.socketId, seats: seatsOn });
+
+  // ----- Kutish xonasi: faqat salomga javob -----
+  if (g.status === 'waiting') {
+    if (kind !== 'greet') return;
+    const bots = g.players.filter(isBot);
+    if (!bots.length || crypto.randomInt(100) >= 70) return;
+    botReactAt.set(gameId, now);
+    const b = bots[crypto.randomInt(bots.length)];
+    scheduleBotLine(gameId, b.socketId, { kind: 'greetReply', targetSid: crypto.randomInt(100) < 40 ? human.socketId : null }, 1200 + crypto.randomInt(2500));
+    return;
+  }
+  if (g.status !== 'playing') return;
+
+  // ----- Mafiya kanali (tun): sherik bot javob beradi -----
+  if (channel === 'mafia') {
+    const mates = g.players.filter(p => p.isAlive && isBot(p) && sideOf(p.role) === 'mafia');
+    if (!mates.length) return;
+    botReactAt.set(gameId, now);
+    const b = mates[crypto.randomInt(mates.length)];
+    const tgt = targets.find(sid => { const p = g.players.find(x => x.socketId === sid); return p && p.isAlive && sideOf(p.role) !== 'mafia'; });
+    if (tgt) { scheduleBotLine(gameId, b.socketId, { kind: 'mafiaAgree', targetSid: tgt }, 1200 + crypto.randomInt(2500), 'mafia'); return; }
+    if (kind === 'question' || crypto.randomInt(100) < 45) {
+      const t = chooseNightTarget(botCtx(g, b));
+      if (t) scheduleBotLine(gameId, b.socketId, { kind: 'mafiaPropose', targetSid: t }, 1500 + crypto.randomInt(3000), 'mafia');
+    }
+    return;
+  }
+  if (channel !== 'public' || g.phase !== 'day_discussion') return;
+
+  // ----- Kunduz: nishonga olingan bot ALBATTA javob beradi, qolganlar ehtimol bilan -----
+  const bots = g.players.filter(p => p.isAlive && isBot(p));
+  if (!bots.length) return;
+  const responders = bots.filter(b => targets.includes(b.socketId));
+  const rest = bots.filter(b => !responders.includes(b));
+  const p = kind === 'other' ? 12 : kind === 'greet' ? 0 : 55;
+  if (rest.length && crypto.randomInt(100) < p) {
+    const o = weightedPick(rest.map(b => ({ v: b, w: b.persona?.chatty ?? 0.6 })));
+    if (o) responders.push(o);
+  }
+  if (!responders.length) return;
+  botReactAt.set(gameId, now);
+  responders.slice(0, 2).forEach((bot, i) => {
+    // O'qish + yozish: 1.5-5 s, ikkinchi javob yana 2.5 s kechroq
+    const delay = 1500 + crypto.randomInt(3500) + i * 2500;
+    const t = setTimeout(() => { withLock(gameId, async () => {
+      const fresh = await getG(gameId);
+      if (!fresh || fresh.status !== 'playing' || fresh.phase !== 'day_discussion') return;
+      const b = fresh.players.find(x => x.socketId === bot.socketId);
+      if (!b || !b.isAlive) return;
+      const c = botCtx(fresh, b);
+      const act = chooseReaction({
+        kind, targets, authorSid: human.socketId, me: c.me, mates: c.mates, iAmMafia: c.iAmMafia,
+        alive: c.alive, suspicion: c.suspicion, persona: c.persona, phase: 'day_discussion',
+      });
+      if (!act) return;
+      await botSayLine(gameId, b.socketId, act.kind, act.targetSid);
+    }).catch(() => {}); }, delay);
+    t.unref?.();
+  });
+  // Odamning komissar da'vosi botlar tarixiga tushadi: ular buni keyingi
+  // ovozda hisobga oladi (haqiqiy o'yinchi ham "kom" gapini eshitadi).
+  if (kind === 'claim' && targets.length) {
+    withLock(gameId, async () => {
+      const fresh = await getG(gameId);
+      if (!fresh || fresh.status !== 'playing') return;
+      botEvent(fresh, { type: 'claim', round: fresh.round || 0, from: human.socketId, target: targets[0] });
+      await saveG(gameId, fresh);
+    }).catch(() => {});
+  }
+}
+
+// KUTISH XONASI: odam kirganda salomlashish (35%) va vaqti-vaqti bilan
+// bekorchi gap ("necha kishi kutamiz", "mikrofon bormi") — faqat odam
+// xonada bo'lsa; bo'sh xonada gapirishning ma'nosi yo'q.
+const waitTalkTimers = new Map();
+function scheduleWaitingChatter(gameId, human) {
+  if (crypto.randomInt(100) < 35) {
+    const t = setTimeout(() => { withLock(gameId, async () => {
+      const g = await getG(gameId);
+      if (!g || g.status !== 'waiting') return;
+      const bots = g.players.filter(isBot);
+      if (!bots.length) return;
+      const b = bots[crypto.randomInt(bots.length)];
+      await botSayLine(gameId, b.socketId, 'greet', crypto.randomInt(100) < 50 ? human.socketId : null);
+    }).catch(() => {}); }, 2500 + crypto.randomInt(4500));
+    t.unref?.();
+  }
+  if (waitTalkTimers.has(gameId)) return;
+  let at = 0;
+  for (let i = 0; i < 3; i++) {
+    at += 20000 + crypto.randomInt(30000);
+    const t = setTimeout(() => { withLock(gameId, async () => {
+      const g = await getG(gameId);
+      if (!g || g.status !== 'waiting') return;
+      if (!g.players.some(p => !isBot(p) && p.connected !== false)) return;
+      const bots = g.players.filter(isBot);
+      if (!bots.length) return;
+      const b = bots[crypto.randomInt(bots.length)];
+      await botSayLine(gameId, b.socketId, 'waitTalk');
+    }).catch(() => {}); }, at);
+    t.unref?.();
+  }
+  waitTalkTimers.set(gameId, true);
+  setTimeout(() => waitTalkTimers.delete(gameId), at + 1000).unref?.();
+}
+
+// O'LIKLAR KANALI: o'lgan bot gapiradi — lekin faqat uni O'QIYDIGAN o'lgan
+// odam bo'lsa (aks holda behuda). Tiriklar uchun ko'rinmaydi.
+function scheduleDeadTalk(gameId) {
+  const t = setTimeout(() => { withLock(gameId, async () => {
+    const g = await getG(gameId);
+    if (!g || g.status !== 'playing') return;
+    if (!g.players.some(p => !p.isAlive && !isBot(p) && p.connected !== false)) return;
+    const deadBots = g.players.filter(p => !p.isAlive && isBot(p));
+    if (!deadBots.length || crypto.randomInt(100) < 35) return;
+    const b = deadBots[crypto.randomInt(deadBots.length)];
+    const c = botCtx(g, b);
+    const top = c.alive.filter(p => p.socketId !== b.socketId && !c.mates.includes(p.socketId))
+      .map(p => ({ sid: p.socketId, sc: c.suspicion[p.socketId] || 0 })).sort((x, y) => y.sc - x.sc)[0];
+    await botSayLine(gameId, b.socketId, 'deadTalk', top && top.sc > 0.5 && crypto.randomInt(100) < 50 ? top.sid : null, { channel: 'dead' });
+  }).catch(() => {}); }, 6000 + crypto.randomInt(14000));
   t.unref?.();
 }
 
+// MAFIYA KANALI (tun): odam mafiya bilan bir jamoada bot sherik bo'lsa,
+// sherik jim turmaydi — so'raydi yoki taklif qiladi. Odam bosqichning 60%
+// igacha tanlamasa, botlar O'ZLARI tanlab, aytadi: ilgari odam AFK bo'lsa
+// mafiya butun kecha hech narsa qilmasdi.
+function scheduleMafiaNightChat(gameId, g, stepMs) {
+  const alive = (g.players || []).filter(p => p.isAlive);
+  const voters = alive.filter(p => MAFIA_VOTERS.includes(p.role));
+  const humans = voters.filter(p => !isBot(p) && p.connected !== false);
+  const bots = voters.filter(isBot);
+  const readers = alive.filter(p => sideOf(p.role) === 'mafia' && !isBot(p) && p.connected !== false);
+  if (!bots.length || !readers.length) return;
+  const b = bots[crypto.randomInt(bots.length)];
+  const t1 = setTimeout(() => { withLock(gameId, async () => {
+    const fresh = await getG(gameId);
+    if (!fresh || fresh.phase !== 'night_mafia') return;
+    const bb = fresh.players.find(p => p.socketId === b.socketId);
+    if (!bb || !bb.isAlive) return;
+    if (Object.keys(fresh.nightActions?.mafiaVotes || {}).length) return;   // allaqachon tanlangan
+    if (crypto.randomInt(100) < 45) return botSayLine(gameId, bb.socketId, 'mafiaAsk', null, { channel: 'mafia' });
+    const t = chooseNightTarget(botCtx(fresh, bb));
+    if (!t) return;
+    fresh.mafiaProposal = t;
+    await saveG(gameId, fresh);
+    return botSayLine(gameId, bb.socketId, 'mafiaPropose', t, { channel: 'mafia' });
+  }).catch(() => {}); }, 2500 + crypto.randomInt(3500));
+  t1.unref?.();
+  if (!humans.length) return;
+  const t2 = setTimeout(() => { withLock(gameId, async () => {
+    const fresh = await getG(gameId);
+    if (!fresh || fresh.phase !== 'night_mafia') return;
+    const na = fresh.nightActions = fresh.nightActions || {};
+    na.mafiaVotes = na.mafiaVotes || {};
+    const hv = fresh.players.filter(p => p.isAlive && MAFIA_VOTERS.includes(p.role) && !isBot(p));
+    if (hv.some(p => na.mafiaVotes[p.socketId])) return;   // odam tanlagan — ergashish boshqa yerda
+    const bs = fresh.players.filter(p => p.isAlive && isBot(p) && MAFIA_VOTERS.includes(p.role));
+    if (!bs.length || bs.some(x => na.mafiaVotes[x.socketId])) return;
+    const lead = bs[0];
+    const prop = fresh.mafiaProposal && fresh.players.find(p => p.socketId === fresh.mafiaProposal && p.isAlive && sideOf(p.role) !== 'mafia');
+    const t = prop ? prop.socketId : chooseNightTarget(botCtx(fresh, lead));
+    if (!t) return;
+    for (const x of bs) na.mafiaVotes[x.socketId] = t;
+    await saveG(gameId, fresh);
+    emitMafiaVotes(gameId, fresh);
+    await botSayLine(gameId, lead.socketId, prop ? 'mafiaAgree' : 'mafiaPropose', t, { channel: 'mafia' });
+  }).catch(() => {}); }, Math.round(stepMs * 0.6));
+  t2.unref?.();
+}
 // Chiqarilgan BOT ham oxirgi so'zini yozadi. Ilgari faqat odam yozardi va
 // bot chiqarilgan har raundda o'sha o'rin bo'sh — takrorlanadigan jimlik — edi.
 function scheduleBotLastWord(gameId, sid) {
@@ -4584,6 +4890,8 @@ function scheduleBotMafiaFollow(gameId, humanSid) {
       na.mafiaVotes[waiting[0].socketId] = targetSid;
       await saveG(gameId, g);
       emitMafiaVotes(gameId, g);
+      // Sherik ovoz berganini AYTADI ham ("ok Aziz") — kanal jim qolmasin
+      if (crypto.randomInt(100) < 55) scheduleBotLine(gameId, waiting[0].socketId, { kind: 'mafiaAgree', targetSid }, 200, 'mafia');
       if (nightStepComplete(g, step)) await endNightStep(gameId, g.nightStep);
     }).catch(() => {}); }, 1500 + i * (1200 + crypto.randomInt(2200)));
     t.unref?.();
@@ -4643,7 +4951,9 @@ async function runBotNightStep(gameId, idx) {
   const alive = g.players.filter(p => p.isAlive);
   const actors = alive.filter(p => step.roles.includes(p.role));
   const botActors = actors.filter(isBot);
-  const humanActor = actors.some(p => !isBot(p));
+  // Uzilib qolgan odam kutilmaydi: ilgari odam mafiya offline bo'lsa botlar
+  // butun kecha "uni kutib" hech narsa qilmasdi.
+  const humanActor = actors.some(p => !isBot(p) && p.connected !== false);
 
   if (step.phase === 'night_mafia') {
     if (humanActor) return; // human mafia — botlar uni kutadi (u ovoz berganda nusxalanadi)
@@ -4698,6 +5008,10 @@ async function botDayVoteOne(gameId, botSid) {
   g.dayVotes[botSid] = choice;
   botEvent(g, { type: 'vote', round: g.round || 0, from: botSid, to: choice });
   await saveG(gameId, g);
+  // Ba'zan ovozini e'lon ham qiladi — AYNAN bergan ovozi (gap bilan ovoz
+  // mos kelmasa kuzatuvchi buni sezadi)
+  if (choice !== 'skip' && crypto.randomInt(100) < 30) scheduleBotLine(gameId, botSid, { kind: 'vote', targetSid: choice }, 300 + crypto.randomInt(1500));
+  else if (choice === 'skip' && crypto.randomInt(100) < 20) scheduleBotLine(gameId, botSid, { kind: 'skip', targetSid: null }, 300 + crypto.randomInt(1500));
   const counts = {}; Object.values(g.dayVotes).forEach(t => { counts[t] = (counts[t] || 0) + 1; });
   const aliveCount = g.players.filter(p => p.isAlive).length;
   const activeVoters = g.players.filter(p => p.isAlive && p.connected !== false).length;
@@ -5440,6 +5754,8 @@ io.on('connection', (socket) => {
       io.to(key).emit('game_state', publicGame(g));
       io.to(key).emit('player_joined', { username: player.username, total: g.players.length });
       tgRoomTouch(gameId); // guruhdagi e'londa o'yinchilar sonini yangilash
+      // Botli xonaga odam kirdi — kimdir salom beradi, vaqti-vaqti bilan gap bo'ladi
+      if (g.status === 'waiting' && (g.players || []).some(isBot)) scheduleWaitingChatter(gameId, player);
 
       // 🤖 "Botlar bilan o'ynash" — foydalanuvchi kirishi bilan boshlanadi
       if (g.vsBots && g.status === 'waiting') {
@@ -5807,6 +6123,9 @@ io.on('connection', (socket) => {
       // faqat o'liklar bir-biri bilan
       for (const dpl of g.players.filter(p => !p.isAlive)) io.to(dpl.socketId).emit('chat_message', payload);
     }
+    // Botlar odamning gapini "eshitadi": ayblangan bot javob beradi, salomga
+    // salom, komissar da'vosiga savol, mafiya kanalida sherik rozilik.
+    botReactToHuman(gameId, g, player, text, channel).catch(() => {});
   });
 
   // ===== Do'st bot-o'yiniga qo'shilish so'rovi =====
@@ -6311,7 +6630,7 @@ async function recoverTimers() {
       // bermaydi, tunda hech kim harakat qilmaydi. Foydalanuvchi buni "hamma
       // birdan AFK bo'lib qoldi" deb ko'radi.
       if ((g.players || []).some(isBot)) {
-        if (step) scheduleBotNightStep(gameId, stepIdx, dur(g, step.dur) * 1000);
+        if (step) scheduleBotNightStep(gameId, stepIdx, dur(g, step.dur) * 1000, null, g);
         else if (phase === 'day_discussion') { scheduleBotDay(gameId, g); scheduleBotChat(gameId, g); }
       }
       recovered++;

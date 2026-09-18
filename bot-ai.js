@@ -66,14 +66,25 @@ export function makePersona(seed) {
   const a = hashStr(seed + ':a'), b = hashStr(seed + ':b');
   const c = hashStr(seed + ':c'), d = hashStr(seed + ':d');
   const e = hashStr(seed + ':e');
+  const f = hashStr(seed + ':f'), gg = hashStr(seed + ':g');
   return {
     speed: clamp(0.15 + a * 0.85, 0.15, 1),
-    activity: clamp(0.86 + b * 0.14, 0.86, 1),
+    // 0.86 -> 0.9: "faol o'ynasin" talabi. AFK ehtimoli 14% dan 10% ga tushdi;
+    // butunlay 1 qilinmadi — hech qachon ovoz o'tkazib yubormaydigan 12
+    // o'yinchi ham naqsh.
+    activity: clamp(0.9 + b * 0.1, 0.9, 1),
     bandwagon: clamp(0.15 + c * 0.6, 0.15, 0.75),
     noise: clamp(0.04 + d * 0.16, 0.04, 0.2),
     // Real o'yinchilarning pingi: ko'pchiligi 25-90 ms, ba'zilari mobil
     // internetda 150-260 ms. Shu taqsimotni takrorlaymiz.
     ping: e < 0.72 ? Math.round(24 + e * 90) : Math.round(140 + (e - 0.72) * 430),
+    // chatty  0.3..1  chatda qanchalik ko'p yozadi. Hamma bir xil yozsa —
+    //                 naqsh; jonli xonada ham kimdir ko'p, kimdir kam yozadi.
+    chatty: clamp(0.3 + f * 0.7, 0.3, 1),
+    // style   0|1|2   yozish uslubi: 0 oddiy, 1 ba'zan ")" qo'shadi,
+    //                 2 ba'zan "..." qo'shadi. Butun xona bir xil uslubda
+    //                 yozsa ham ko'zga tashlanadi.
+    style: gg < 0.5 ? 0 : gg < 0.8 ? 1 : 2,
   };
 }
 
@@ -449,6 +460,9 @@ const LINES = {
     'qani gapiringlar', 'kecha kim nima kordi', 'hozircha tinchmi',
     'menimcha shoshmaymiz', 'kim bor kim yoq', 'gapiringlar ergashaman',
     'birinchi kun qiyin bolad', 'hech kim gapirmiyaptida', 'nima qilamiz',
+    'kimda info bor', 'jim otirmaylik gapiringla', 'komissar bormi ochilsin',
+    'kim kimga shubha qilyapti', 'bugun kimni chiqaramiz', 'men eshitaman gapiringla',
+    'hali erta menimcha', 'sizlar nima deysizla', 'kimdir bir narsa desin',
   ],
   // Kimnidir shubha ostiga olish
   accuse: [
@@ -456,53 +470,153 @@ const LINES = {
     '{n} ga qaranglar', 'menimcha {n} mafiya', '{n} kecha gapirmadi ham',
     '{n} ni tekshirish kerak', '{n} dan shubhalanyapman', 'menimcha {n}',
     '{n} ozini chetga oladi', '{n} nima deysan ozing haqingda',
+    '{n} nega jimsan', '{n} ga ovoz beraman', '{n} bugun gapi boshqacha',
+    '{n} ni chiqaramiz keyin koramiz', '{n} hamma narsaga qoshilyapti shubhali',
+    '{n} sen kimsan gapir', 'men {n} deyman', '{n} ga qarab turibman',
   ],
   // Boshqa birovning fikriga qo'shilish
   agree: [
     'ha {n} shubhali', 'menam {n} ga', 'togri aytasla {n} bolishi mumkin',
     'men ham {n} deb oylayman', 'ok {n} bolsin', 'menam qoshilaman {n}',
-    'ha shunaqa {n}', 'menam shu fikrda {n}',
+    'ha shunaqa {n}', 'menam shu fikrda {n}', 'togri {n} ni chiqaramiz',
+    'ha {n} menga ham yoqmagan', '{n} bolsa bolsin menam', 'roziman {n}',
+  ],
+  // Birovning fikriga QARSHI chiqish
+  disagree: [
+    'yoq {n} tinch menimcha', '{n} emas', '{n} ga bekorga tegyapsizla',
+    'men {n} ga bermayman', '{n} kecha togri gapirgan edi', 'nega {n}',
+    '{n} ni chiqarsak xato boladi', 'menimcha {n} emas boshqa birov',
   ],
   // O'z ovozini e'lon qilish
   vote: [
     '{n} ga berdim', 'men {n} ni tanladim', 'ovozim {n} ga',
-    '{n} ga beryapman', 'men {n}', 'mayli {n} bolsin',
+    '{n} ga beryapman', 'men {n}', 'mayli {n} bolsin', 'berdim {n} ga',
+    'men {n} ga bosdim', '{n} bolsin', 'ovoz {n}',
   ],
-  // O'ziga ovoz kelganda himoyalanish
+  // O'ziga ovoz yoki ayblov kelganda himoyalanish
   defend: [
     'men tinch aholiman', 'nega menga', 'men emasman ishoninglar',
     'meni bekorga chiqarasla', 'men mafiya emasman', 'nega menga berdila',
-    'xato qilyapsizla', 'menga berma men tinchman',
+    'xato qilyapsizla', 'menga berma men tinchman', 'men tinchman qaranglar',
+    'isbot bormi menga', 'nega men shubhali', 'meni chiqarsangla mafiya qoladi',
+    'men emas yana bir oylab koringla', 'kim aytdi meni', 'yoq yoq men tinch',
+  ],
+  // Ayblovga javoban ayblovchining o'zini shubha ostiga olish
+  counter: [
+    '{n} ozing shubhalisan', 'nega {n} meni aybla yapti', '{n} ozini yashiryapti',
+    'menimcha {n} ning ozi mafiya', '{n} sen nega meni', 'qaranglar {n} meni chiqarmoqchi',
+    '{n} ga qaranglar men emas', '{n} mendan boshqasini topmadingmi',
   ],
   // Komissar ochilishi — o'yinning eng muhim mexanikasi
   claim: [
     'men komissarman {n} mafiya', 'tekshirdim {n} mafiya chiqdi',
     'men kom man {n} qora', 'ochilaman men komissar {n} mafiya',
     'menda info bor {n} mafiya', '{n} mafiya men tekshirdim',
+    'komissarman kecha {n} ni tekshirdim mafiya', '{n} qora chiqdi men kom',
   ],
   // Komissar: toza chiqqan odam
   clear: [
     '{n} toza men tekshirdim', '{n} ga tegmanglar toza',
-    'tekshirdim {n} tinch', '{n} oq chiqdi',
+    'tekshirdim {n} tinch', '{n} oq chiqdi', '{n} ni tekshirdim tinch ekan',
+    '{n} ga bermanglar u toza',
+  ],
+  // Kimdir komissar deb ochilganda — savol/ishonch
+  askClaim: [
+    'kimni tekshirding', 'isbot bormi', 'ok ishonaman senga', 'qachon tekshirding',
+    'yana kimni tekshirgansan', 'agar rost bosa {n} ni chiqaramiz', 'komissar bosang gapir',
+    'ok kom ni eshitamiz', 'ishonsak boladimi', 'unda {n} ga beramiz',
+  ],
+  // Kimdir komissar deb ochilganda — shubha (mafiya bot ko'proq shunday deydi)
+  doubtClaim: [
+    'soxta kom bomasin', 'kecha ham kimdir shunday degan edi', 'hamma komissar boldi',
+    'ishonmayman', 'men bunga ishonmayman {n} tinch', 'komissar ozi kim ekan',
+    'isbotsiz gap', 'balki ozi mafiyadir',
+  ],
+  // Savolga javob
+  answer: [
+    'menimcha {n}', 'bilmadim hali', '{n} bolishi mumkin', 'hozircha {n} ga qarayapman',
+    'aniq emas lekin {n}', 'men {n} deb oylayman', 'hali malumot yoq',
   ],
   // Hech kimni chiqarmaslik taklifi
   skip: [
     'bugun otkazamiz', 'hech kimni chiqarmaylik', 'malumot yoq otkazamiz',
-    'bekorga odam yoqotmaylik', 'menimcha skip',
+    'bekorga odam yoqotmaylik', 'menimcha skip', 'otkazib yuboramiz',
+    'birinchi kun skip qilaylik', 'hali erta chiqarishga',
   ],
   // Chiqarilgan o'yinchining oxirgi so'zi
   lastWord: [
     'men tinch edim eh', 'xato qildinglar', 'mafiya emasman edim',
     'omad sizlarga', 'yomon oynadingla', 'men tinch aholi edim qaranglar',
-    'eh mayli', 'men ketdim omad',
+    'eh mayli', 'men ketdim omad', 'buni eslab qolingla', 'mafiya orangizda',
+    'kim meni aybladi osha shubhali', 'xayr',
+  ],
+  // Chetlatilgan odam TINCH chiqdi — ertasi kun reaksiya
+  afterLynchTown: [
+    '{n} tinch ekan xato qildik', 'eh {n} ni bekorga chiqardik', '{n} ga kim berdi',
+    'kecha {n} tinch edi endi ehtiyot bolamiz', '{n} ni chiqarganlar shubhali',
+    'xato boldi {n} bilan', 'kim {n} ni aybladi esla',
+  ],
+  // Chetlatilgan odam MAFIYA chiqdi
+  afterLynchMafia: [
+    '{n} mafiya ekan zor', 'bitta ketdi yana bor', '{n} ni togri chiqardik',
+    'zor {n} mafiya edi', '{n} ni himoya qilganlar kim edi', 'davom etamiz shunaqa',
+    'kim {n} ga bermagan edi', 'yana bittasi qoldi',
+  ],
+  // Tunda kimdir o'ldirildi
+  afterKill: [
+    '{n} ni olishdi kecha', '{n} ketdi endi kim', 'eh {n}', 'nega {n} ni oldi ekan',
+    '{n} ni oldi demak u tinch edi', '{n} kecha kimga bergan edi', 'doktor {n} ni qutqarmadi',
+    'kecha {n} ketdi kim gapirgan edi', '{n} ni olganlar kim ekan',
+  ],
+  // Tunda hech kim o'lmadi
+  noKill: [
+    'kecha hech kim olmadi doktor zor', 'tinch otdi kecha', 'doktor togri topibdi',
+    'hech kim olmadi zor', 'kecha tinch endi kimni chiqaramiz', 'doktor ishladi',
+  ],
+  // MAFIYA KANALI: sherigidan so'rash
+  mafiaAsk: [
+    'kimni olamiz', 'sen kimni deysan', 'kimni olaylik bugun', 'nima qilamiz kimni',
+    'kim xavfli', 'komissar kim ekan', 'qaysi birini', 'sen tanla men qoshilaman',
+  ],
+  // MAFIYA KANALI: taklif
+  mafiaPropose: [
+    '{n} ni olaylik', 'menimcha {n} xavfli', '{n} ni olamiz', '{n} kop gapiryapti olaylik',
+    '{n} komissar bolishi mumkin', '{n} bizni sezdi', 'men {n} deyman', '{n} ni olsak boladi',
+  ],
+  // MAFIYA KANALI: rozilik
+  mafiaAgree: [
+    'ok {n}', 'ha {n} ni olamiz', 'mayli {n}', 'roziman {n}', 'ok {n} ni', 'ha {n}',
+    'kettik {n}', 'men ham {n} ga',
+  ],
+  // O'LIKLAR KANALI
+  deadTalk: [
+    'eh chiqib ketdim', 'kim mafiya ekan kordingizmi', 'endi tomosha qilamiz',
+    'meni kim oldi ekan', 'sen ham keldingmi', 'bu yerdan hammasi korinadi',
+    'menimcha {n} mafiya', 'yuqoridagilar {n} ga qarasin', 'eh bekor ketdim',
+    'kim gpirsa osha mafiya', '{n} mafiya menimcha koryapman', 'tomosha zor',
+  ],
+  // KUTISH XONASI: salomlashish
+  greet: [
+    'salom', 'salom {n}', 'assalomu alaykum', 'salom hammaga', 'salomlar', 'kirdik',
+    'salom {n} xush kelibsan', 'oo {n} keldi', 'salom qani boshlaymizmi',
+  ],
+  // KUTISH XONASI: salomga javob
+  greetReply: [
+    'salom', 'valeykum', 'salom salom', 'va alaykum assalom', 'salom {n}', 'salom kel',
+    'salom hozir boshlaymiz', 'salomm',
+  ],
+  // KUTISH XONASI: bekorchi gap
+  waitTalk: [
+    'necha kishi kutamiz', 'mikrofon bormi', 'boshlaymizmi', 'yana kim keladi',
+    'kutamizmi yana', 'tez boshlaylik', 'hamma tayyormi', 'kimda mikrofon bor',
+    'ovozli oynaymizmi', 'yana 2 kishi kerak', 'kim host', 'boshlang endi',
   ],
   // Tun tushishidan oldin
   night: [
     'tinch kecha bolsin', 'omon qolaylik', 'korishguncha',
-    'kechasi kim oladi ekan',
+    'kechasi kim oladi ekan', 'doktor meni davola', 'xayrli tun',
   ],
 };
-
 // Bitta ibora tanlaydi. `avoid` — shu bot allaqachon aytgan iboralar:
 // takror gap bot ekanini darhol oshkor qiladi.
 export function botChatLine(kind, vars = {}, avoid = [], rnd = Math.random) {
@@ -575,6 +689,160 @@ export function typingMs(text, rnd = Math.random) {
   // ~4 belgi/sekund (telefonda shosha-pisha) + o'ylash vaqti
   return Math.round(clamp(700 + len * (190 + rnd() * 150), 900, 12000));
 }
+
+// ---------- yozish uslubi ----------
+
+// Tanlangan iboraga botning shaxsiy uslubini qo'shadi. Ibora KALITI
+// o'zgarmaydi (takrorni eslash o'sha kalit bo'yicha), faqat matn.
+export function styleLine(text, persona, rnd = Math.random) {
+  let t = String(text || '');
+  if (!t) return t;
+  const st = persona?.style ?? 0;
+  if (st === 1 && rnd() < 0.3) t += rnd() < 0.5 ? ')' : '))';
+  else if (st === 2 && rnd() < 0.25) t += '...';
+  return t;
+}
+
+// ---------- odam xabarini tushunish ----------
+
+// Xabarda kim tilga olingan. Ism bo'yicha (to'liq yoki 4+ harfli ildizi)
+// va — o'yin davomida — o'rin RAQAMI bo'yicha ("3 mafiya", "5 ga beraman"):
+// mafiyada odamlar bir-birini raqam bilan chaqiradi.
+//
+// players: [{ socketId, username, seat }] — seat 1 dan boshlanadi.
+// seats=false bo'lsa raqam hisobga olinmaydi (kutish xonasida "2 kishi
+// kerak" degan gap kimnidir chaqirish emas).
+const nameBase = (u) => String(u || '').toLowerCase().replace(/[^a-z\u0400-\u04ff\u02bb\u02bc']/g, '');
+export function mentionedPlayers(text, players = [], { authorSid = null, seats = true } = {}) {
+  const words = String(text || '').toLowerCase().replace(/[^\p{L}\p{N}_\s]/gu, ' ').split(/\s+/).filter(Boolean);
+  if (!words.length) return [];
+  const out = [];
+  for (const p of players) {
+    if (!p || p.socketId === authorSid) continue;
+    const full = String(p.username || '').toLowerCase();
+    const base = nameBase(p.username);
+    const hit = words.some(w =>
+      w === full
+      || (base.length >= 4 && w === base)
+      || (base.length >= 5 && w.startsWith(base))
+      || (seats && p.seat && /^\d{1,2}$/.test(w) && Number(w) === p.seat));
+    if (hit) out.push(p.socketId);
+  }
+  return out;
+}
+
+// Xabarning turi: salomlashish, komissar da'vosi, savol, skip, ayblov, boshqa.
+const RX = {
+  greet: /(^|\s)(salom\w*|assalom\w*|alaykum|hello|hi|privet|привет|салом)(\s|$)/i,
+  claim: /(komissar|\bkom\b|kom\s?man|tekshirdim|sherif|шериф|комиссар|проверил)/i,
+  skip: /(\bskip\b|otkaz\w*|o'tkaz\w*|oʻtkaz\w*|chiqarmaylik|пропус)/i,
+  accuse: /(mafiya|mafia|мафия|shubha\w*|chiqar\w*|\bberaman\b|\bberamiz\b|ovoz|голос|qora|подозр)/i,
+  question: /\?|(^|\s)(kim|kimni|nima deysan|nima deysizla|кто)(\s|$)/i,
+};
+export function classifyChat(text) {
+  const t = String(text || '').trim();
+  if (!t) return 'other';
+  if (RX.greet.test(t)) return 'greet';
+  if (RX.claim.test(t)) return 'claim';
+  if (RX.skip.test(t)) return 'skip';
+  // Savol ayblovdan OLDIN: "kim mafiya?" — bu savol, ayblov emas
+  if (RX.question.test(t)) return 'question';
+  if (RX.accuse.test(t)) return 'accuse';
+  return 'other';
+}
+
+// Odamning gapiga bot QANDAY javob beradi. Qaytadi { kind, targetSid } yoki
+// null (jim turadi — aksariyat xabarga hech kim javob bermaydi, bu tabiiy).
+//
+// ctx: { kind, targets, authorSid, me, mates, iAmMafia, alive, suspicion,
+//        persona, phase }
+export function chooseReaction(ctx, rnd = Math.random) {
+  const { kind, targets = [], authorSid, me, mates = [], iAmMafia = false, alive = [] } = ctx;
+  const p = ctx.persona || makePersona(me?.socketId || 'x');
+  const sus = ctx.suspicion || {};
+  const others = alive.filter(x => x.socketId !== me.socketId);
+  const meHit = targets.includes(me.socketId);
+
+  // Kutish xonasi: faqat salomga javob
+  if (ctx.phase === 'waiting') {
+    if (kind === 'greet' && rnd() < 0.7) return { kind: 'greetReply', targetSid: authorSid };
+    return null;
+  }
+
+  // 1) Meni aybladi — DOIM javob beradi: himoya yoki qarshi ayblov.
+  //    Mafiya bot ko'proq hujumga o'tadi (odam mafiya ham shunday qiladi).
+  if (meHit && (kind === 'accuse' || kind === 'claim' || kind === 'question' || kind === 'other')) {
+    const counterP = iAmMafia ? 0.45 : 0.25;
+    if (authorSid && rnd() < counterP) return { kind: 'counter', targetSid: authorSid };
+    return { kind: 'defend', targetSid: null };
+  }
+
+  // 2) Komissar da'vosi
+  if (kind === 'claim') {
+    const tgt = targets.find(t => t !== me.socketId) || null;
+    const mateHit = tgt && mates.includes(tgt);
+    // Mafiya bot sherigi ayblansa da'voni shubha ostiga oladi
+    if (iAmMafia && (mateHit || rnd() < 0.5)) return { kind: 'doubtClaim', targetSid: tgt };
+    if (tgt && rnd() < 0.45) return { kind: 'agree', targetSid: tgt };
+    if (rnd() < 0.6) return { kind: 'askClaim', targetSid: tgt };
+    return null;
+  }
+
+  // 3) Kimnidir aybladi
+  if (kind === 'accuse' && targets.length) {
+    const tgt = targets[0];
+    if (mates.includes(tgt)) return rnd() < 0.6 ? { kind: 'disagree', targetSid: tgt } : null;
+    const sc = sus[tgt] || 0;
+    const agreeP = 0.2 + p.bandwagon * 0.4 + Math.min(0.3, sc * 0.3);
+    if (rnd() < agreeP) return { kind: 'agree', targetSid: tgt };
+    if (rnd() < 0.18) return { kind: 'disagree', targetSid: tgt };
+    return null;
+  }
+
+  // 4) Savol — o'z shubhasini aytadi
+  if (kind === 'question' && rnd() < 0.5) {
+    const cand = others.filter(o => !mates.includes(o.socketId))
+      .map(o => ({ sid: o.socketId, sc: sus[o.socketId] || 0 })).sort((a, b) => b.sc - a.sc);
+    return { kind: 'answer', targetSid: cand[0]?.sid || null };
+  }
+  if (kind === 'skip' && rnd() < 0.35) return { kind: rnd() < 0.5 ? 'skip' : 'open', targetSid: null };
+  return null;
+}
+
+// Kun boshidagi gap: oldingi natijaga munosabat. `last` — oxirgi voqealar:
+// { lynched: { sid, wasMafia } | null, killed: [sid], anyNight: bool }
+export function chooseDayOpener(ctx, rnd = Math.random) {
+  const { last, me, mates = [], iAmMafia = false } = ctx;
+  if (!last) return { kind: 'open', targetSid: null };
+  const opts = [];
+  if (last.lynched) {
+    // Mafiya bot chetlatilgan sherigi haqida "zo'r" demaydi — lekin jim ham
+    // turmaydi: "xato" deb boshqa tomonga buradi (odam mafiya ham shunday).
+    if (last.lynched.wasMafia && !mates.includes(last.lynched.sid)) opts.push({ kind: 'afterLynchMafia', targetSid: last.lynched.sid, w: 3 });
+    if (!last.lynched.wasMafia) opts.push({ kind: 'afterLynchTown', targetSid: last.lynched.sid, w: 3 });
+  }
+  for (const sid of last.killed || []) {
+    if (sid !== me.socketId) opts.push({ kind: 'afterKill', targetSid: sid, w: iAmMafia ? 1.5 : 2.5 });
+  }
+  if (last.anyNight && !(last.killed || []).length) opts.push({ kind: 'noKill', targetSid: null, w: 2 });
+  opts.push({ kind: 'open', targetSid: null, w: 1.2 });
+  const v = weightedPick(opts.map(o => ({ v: o, w: o.w })), rnd);
+  return v || { kind: 'open', targetSid: null };
+}
+
+// Nechta bot gapiradi: xonadagi tirik botlar soniga va har birining
+// `chatty` xarakteriga qarab. Har doim kamida 2 (bo'lsa), ko'pi bilan 7.
+export function pickSpeakers(bots = [], rnd = Math.random) {
+  const chosen = bots.filter(b => rnd() < 0.35 + (b.persona?.chatty ?? 0.6) * 0.5);
+  const min = Math.min(2, bots.length);
+  if (chosen.length < min) {
+    for (const b of bots) { if (chosen.length >= min) break; if (!chosen.includes(b)) chosen.push(b); }
+  }
+  return chosen.slice(0, 7);
+}
+
+// Barcha ibora turlari — server budjet hisobida va testlarda ishlatiladi
+export const LINE_KINDS = Object.keys(LINES);
 
 // ---------- xonani to'ldiruvchi botlar ----------
 

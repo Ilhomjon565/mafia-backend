@@ -7,6 +7,7 @@ import {
   buildVoteWeight, chooseDayVote, chooseNightTarget, weightedPick,
   makeFillerBots, BOT_NAMES,
   nightDelayMs, botChatLine, chooseChatAct, typingMs,
+  styleLine, mentionedPlayers, classifyChat, chooseReaction, chooseDayOpener, pickSpeakers, LINE_KINDS,
 } from './bot-ai.js';
 
 const P = (sid, role) => ({ socketId: sid, username: sid, role });
@@ -535,5 +536,170 @@ test('doktor bot o\'zini davolash huquqini ikki marta ishlatmaydi', () => {
   };
   for (let i = 0; i < 300; i++) {
     assert.notEqual(chooseNightTarget(ctx, Math.random), 'a', 'o\'zini qayta davoladi');
+  }
+});
+
+
+// ==================== ODAM GAPIGA JAVOB (2026-09-18) ====================
+// Talab: botlar chatda "o'z gapini gapirib" turmasin — odamning gapini
+// eshitsin. Ayblangan bot javob bersin, salomga salom, komissar da'vosiga
+// savol, mafiya kanalida sherik rozilik bildirsin.
+
+const ROSTER = [
+  { socketId: 'a', username: 'Aziz', seat: 1 },
+  { socketId: 'b', username: 'bobur7', seat: 2 },
+  { socketId: 'c', username: 'Shahnoza', seat: 3 },
+  { socketId: 'h', username: 'ilhom', seat: 4 },
+];
+
+test('xabarda tilga olingan o\'yinchi topiladi — ism va o\'rin raqami bilan', () => {
+  const m = (t, o) => mentionedPlayers(t, ROSTER, { authorSid: 'h', ...o });
+  assert.deepEqual(m('Aziz mafiya'), ['a']);
+  assert.deepEqual(m('aziz shubhali'), ['a'], 'katta-kichik harf');
+  assert.deepEqual(m('menimcha 2 mafiya'), ['b'], "o'rin raqami");
+  assert.deepEqual(m('3 ga beraman'), ['c']);
+  assert.deepEqual(m('bobur mafiya'), ['b'], 'taxallusning ildizi (bobur7 -> bobur)');
+  assert.deepEqual(m('ilhom men emasman'), [], "muallifning o'zi hisoblanmaydi");
+  assert.deepEqual(m('salom hammaga'), []);
+  // Kutish xonasida raqam kimnidir chaqirish emas
+  assert.deepEqual(m('2 kishi kerak', { seats: false }), []);
+  // Ikki kishi birga
+  assert.deepEqual(m('Aziz va 3 shubhali').sort(), ['a', 'c']);
+});
+
+test('xabar turi tasniflanadi', () => {
+  const T = { 'salom': 'greet', 'Assalomu alaykum': 'greet', 'men komissarman Aziz mafiya': 'claim',
+    'tekshirdim 3 qora': 'claim', 'skip qilaylik': 'skip', 'Aziz mafiya': 'accuse',
+    '3 ga beraman': 'accuse', 'kim mafiya?': 'question', 'nima gap': 'other', 'goo': 'other' };
+  for (const [t, k] of Object.entries(T)) assert.equal(classifyChat(t), k, t);
+});
+
+const alive = ROSTER.map(r => ({ socketId: r.socketId, username: r.username }));
+const base = (over = {}) => ({
+  kind: 'accuse', targets: ['a'], authorSid: 'h', me: { socketId: 'a', role: 'civil' },
+  mates: [], iAmMafia: false, alive, suspicion: {}, persona: makePersona('a'), phase: 'day_discussion', ...over,
+});
+
+test('AYBLANGAN bot hech qachon jim turmaydi: himoya yoki qarshi ayblov', () => {
+  const seen = new Set();
+  for (let i = 0; i < 300; i++) {
+    const r = chooseReaction(base());
+    assert.ok(r, 'jim turdi');
+    assert.ok(['defend', 'counter'].includes(r.kind), r.kind);
+    if (r.kind === 'counter') assert.equal(r.targetSid, 'h', 'qarshi ayblov ayblovchiga qaratilmadi');
+    seen.add(r.kind);
+  }
+  assert.ok(seen.has('defend') && seen.has('counter'), 'ikkala javob turi ham uchrashi kerak');
+});
+
+test('mafiya bot sherigi ayblanganda unga QO\'SHILMAYDI', () => {
+  for (let i = 0; i < 300; i++) {
+    const r = chooseReaction(base({ targets: ['b'], me: { socketId: 'a', role: 'mafia' }, mates: ['a', 'b'], iAmMafia: true }));
+    if (r) assert.notEqual(r.kind, 'agree', 'sherigiga qarshi qo\'shildi');
+    if (r) assert.equal(r.kind, 'disagree');
+  }
+});
+
+test('komissar da\'vosi sherigiga tegsa mafiya bot shubha bildiradi', () => {
+  for (let i = 0; i < 200; i++) {
+    const r = chooseReaction(base({ kind: 'claim', targets: ['b'], me: { socketId: 'a', role: 'mafia' }, mates: ['a', 'b'], iAmMafia: true }));
+    assert.ok(r && r.kind === 'doubtClaim', JSON.stringify(r));
+  }
+});
+
+test("tinch bot komissar da'vosiga savol beradi yoki qo'shiladi", () => {
+  const kinds = new Set();
+  for (let i = 0; i < 400; i++) {
+    const r = chooseReaction(base({ kind: 'claim', targets: ['b'] }));
+    if (r) kinds.add(r.kind);
+  }
+  assert.ok(kinds.has('askClaim') || kinds.has('agree'), [...kinds].join(','));
+  assert.ok(!kinds.has('doubtClaim'), 'tinch bot da\'voga shubha bildirmaydi');
+});
+
+test('kutish xonasida faqat salomga javob', () => {
+  for (let i = 0; i < 200; i++) {
+    const r = chooseReaction(base({ kind: 'greet', targets: [], phase: 'waiting' }));
+    if (r) assert.equal(r.kind, 'greetReply');
+    assert.equal(chooseReaction(base({ kind: 'accuse', targets: ['a'], phase: 'waiting' })), null, 'kutish xonasida ayblovga javob');
+  }
+});
+
+test('hech kimga tegmagan oddiy gapga bot jim turadi', () => {
+  for (let i = 0; i < 200; i++) assert.equal(chooseReaction(base({ kind: 'other', targets: [] })), null);
+});
+
+test('kun boshidagi gap OLDINGI natijaga qaraydi', () => {
+  const me = { socketId: 'a', role: 'civil' };
+  let town = 0, maf = 0, kill = 0, none = 0;
+  for (let i = 0; i < 300; i++) {
+    const r1 = chooseDayOpener({ me, mates: [], last: { lynched: { sid: 'b', wasMafia: false }, killed: [], anyNight: true } });
+    if (r1.kind === 'afterLynchTown') { town++; assert.equal(r1.targetSid, 'b'); }
+    const r2 = chooseDayOpener({ me, mates: [], last: { lynched: { sid: 'b', wasMafia: true }, killed: [], anyNight: true } });
+    if (r2.kind === 'afterLynchMafia') maf++;
+    const r3 = chooseDayOpener({ me, mates: [], last: { lynched: null, killed: ['c'], anyNight: true } });
+    if (r3.kind === 'afterKill') { kill++; assert.equal(r3.targetSid, 'c'); }
+    const r4 = chooseDayOpener({ me, mates: [], last: { lynched: null, killed: [], anyNight: true } });
+    if (r4.kind === 'noKill') none++;
+  }
+  // lynched + tinch tun bo'lsa 'noKill' ham raqobatlashadi (3 : 2 : 1.2), shuning uchun ~48%
+  assert.ok(town > 100 && maf > 100 && kill > 150 && none > 150, [town, maf, kill, none].join(','));
+  assert.equal(chooseDayOpener({ me, mates: [], last: null }).kind, 'open');
+});
+
+test("mafiya bot chetlatilgan SHERIGI haqida \"zo'r\" demaydi", () => {
+  for (let i = 0; i < 200; i++) {
+    const r = chooseDayOpener({ me: { socketId: 'a', role: 'mafia' }, mates: ['a', 'b'], iAmMafia: true,
+      last: { lynched: { sid: 'b', wasMafia: true }, killed: [], anyNight: true } });
+    assert.notEqual(r.kind, 'afterLynchMafia');
+  }
+});
+
+test('yozish uslubi: kalit o\'zgarmaydi, faqat matn', () => {
+  assert.equal(styleLine('men tinchman', { style: 0 }, () => 0.01), 'men tinchman');
+  const s1 = styleLine('men tinchman', { style: 1 }, () => 0.01);
+  assert.ok(/^men tinchman\)+$/.test(s1), s1);
+  const s2 = styleLine('men tinchman', { style: 2 }, () => 0.01);
+  assert.equal(s2, 'men tinchman...');
+  // Uslub HAR DOIM emas — aks holda u ham naqsh bo'lardi
+  assert.equal(styleLine('men tinchman', { style: 1 }, () => 0.9), 'men tinchman');
+});
+
+test('har ibora turida yetarli xilma-xillik bor', () => {
+  for (const k of LINE_KINDS) {
+    const keys = new Set();
+    for (let i = 0; i < 400; i++) { const l = botChatLine(k, { n: 'Aziz' }); if (l) keys.add(l.key); }
+    assert.ok(keys.size >= 6, k + ': faqat ' + keys.size + ' ta ibora');
+    for (const key of keys) {
+      assert.equal(key[0], key[0].toLowerCase(), 'bosh harf: ' + key);
+      assert.ok(!/[.!?]$/.test(key), 'tinish belgisi bilan tugadi: ' + key);
+    }
+  }
+});
+
+test('nechta bot gapiradi: kamida 2, ko\'pi bilan 7', () => {
+  const bots = (n) => Array.from({ length: n }, (_, i) => ({ persona: makePersona('sp' + i) }));
+  for (let i = 0; i < 100; i++) {
+    const a = pickSpeakers(bots(12));
+    assert.ok(a.length >= 2 && a.length <= 7, 'soni: ' + a.length);
+    assert.equal(pickSpeakers(bots(1)).length, 1);
+    assert.equal(pickSpeakers([]).length, 0);
+  }
+  // Gapdon bot ko'proq tanlanadi
+  const quiet = { persona: { chatty: 0.3 } }, loud = { persona: { chatty: 1 } };
+  let q = 0, l = 0;
+  for (let i = 0; i < 2000; i++) {
+    const r = pickSpeakers([quiet, loud, { persona: { chatty: 0.6 } }, { persona: { chatty: 0.6 } }]);
+    if (r.includes(quiet)) q++; if (r.includes(loud)) l++;
+  }
+  assert.ok(l > q * 1.3, 'gapdon bot kamgap botdan ko\'p tanlanmadi: ' + l + ' vs ' + q);
+});
+
+test('xarakter: chatty va style chegarada, faollik oshdi', () => {
+  for (let i = 0; i < 200; i++) {
+    const p = makePersona('x' + i);
+    assert.ok(p.chatty >= 0.3 && p.chatty <= 1, 'chatty: ' + p.chatty);
+    assert.ok([0, 1, 2].includes(p.style), 'style: ' + p.style);
+    assert.ok(p.activity >= 0.9, 'activity: ' + p.activity);
   }
 });

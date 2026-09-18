@@ -588,6 +588,11 @@ const LINES = {
     'ok {n}', 'ha {n} ni olamiz', 'mayli {n}', 'roziman {n}', 'ok {n} ni', 'ha {n}',
     'kettik {n}', 'men ham {n} ga',
   ],
+  // MAFIYA KANALI: o'zi tanlaganini aytish (sherik javob bermaganda)
+  mafiaGo: [
+    '{n} ni olaman', 'boldi {n} ni olamiz', 'men {n} ni tanladim', 'kettik {n}',
+    'ok men {n} ni olaman', '{n} ga bosdim', 'vaqt ketyapti {n} ni olaman', 'unda {n}',
+  ],
   // O'LIKLAR KANALI
   deadTalk: [
     'eh chiqib ketdim', 'kim mafiya ekan kordingizmi', 'endi tomosha qilamiz',

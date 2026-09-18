@@ -4775,6 +4775,7 @@ function scheduleMafiaNightChat(gameId, g, stepMs) {
     const t = chooseNightTarget(botCtx(fresh, bb));
     if (!t) return;
     fresh.mafiaProposal = t;
+    fresh.mafiaProposalBy = bb.socketId;
     await saveG(gameId, fresh);
     return botSayLine(gameId, bb.socketId, 'mafiaPropose', t, { channel: 'mafia' });
   }).catch(() => {}); }, 2500 + crypto.randomInt(3500));
@@ -4796,7 +4797,10 @@ function scheduleMafiaNightChat(gameId, g, stepMs) {
     for (const x of bs) na.mafiaVotes[x.socketId] = t;
     await saveG(gameId, fresh);
     emitMafiaVotes(gameId, fresh);
-    await botSayLine(gameId, lead.socketId, prop ? 'mafiaAgree' : 'mafiaPropose', t, { channel: 'mafia' });
+    // O'zi taklif qilgan bot o'ziga "rozi" bo'lmaydi — "tanladim" deydi;
+    // boshqa bot taklif qilgan bo'lsa unga qo'shiladi; taklif bo'lmasa taklif.
+    const kind = !prop ? 'mafiaPropose' : fresh.mafiaProposalBy === lead.socketId ? 'mafiaGo' : 'mafiaAgree';
+    await botSayLine(gameId, lead.socketId, kind, t, { channel: 'mafia' });
   }).catch(() => {}); }, Math.round(stepMs * 0.6));
   t2.unref?.();
 }

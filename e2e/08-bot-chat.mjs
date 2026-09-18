@@ -126,7 +126,8 @@ async function main() {
   const target = bots[0];
   const t3 = Date.now();
   s.emit('chat_message', { gameId, message: `${target.username} mafiya` });
-  const reply = await waitMsg(s, u.username, t3, (m) => m.username === target.username && m.channel === 'public', 14000);
+  // O'qish (1.5-5 s) + yozish (uzun gap 12 s gacha) — 20 s oynasi kerak
+  const reply = await waitMsg(s, u.username, t3, (m) => m.username === target.username && m.channel === 'public', 20000);
   log('\n=== 3. Ayblangan bot javob beradi ===');
   ok(!!reply, `"${target.username} mafiya" ga AYNAN ${target.username} javob berdi`, reply ? reply.message : 'javob yo\'q');
 
@@ -170,7 +171,8 @@ async function main() {
     if (!keldi) { log('  night_mafia kelmadi'); sm.disconnect(); continue; }
     const nAt = Date.now();
     // Odam HECH NARSA qilmaydi (AFK). Sherik gapirishi va 60% da tanlashi kerak.
-    const msg = await waitMsg(sm, m.username, nAt, (mm) => mm.channel === 'mafia', 9000);
+    // Birinchi gap 2.5-6 s kechikish + 3-5 s "yozish" — 11 s gacha cho'zilishi mumkin.
+    const msg = await waitMsg(sm, m.username, nAt, (mm) => mm.channel === 'mafia', 15000);
     ok(!!msg, 'bot sherik mafiya kanalida gap boshladi', msg ? msg.username + ': ' + msg.message : 'yo\'q');
     // 20 s * 0.6 = 12 s dan keyin bot ovozlari paydo bo'ladi
     let votes = null;
@@ -182,6 +184,12 @@ async function main() {
       if ((sm.last('phase_change')?.phase || '') !== 'night_mafia') break;
     }
     ok(!!votes, 'odam AFK — botlar o\'zlari nishon tanladi', JSON.stringify(votes || sm.last('mafia_vote_update')));
+    // Tanlaganini AYTADI ham ("Aziz ni olaylik") — kanal jim qolmasin
+    await sleep(6000);
+    const mafiaMsgs = botMsgs(sm, m.username, nAt, (mm) => mm.channel === 'mafia');
+    ok(mafiaMsgs.length >= 1, 'mafiya kanalida kamida bitta bot gapi bor',
+      mafiaMsgs.map((x) => x.username + ': ' + x.message).join(' | ') || 'yo\'q');
+    log('  mafiya kanali: ' + (mafiaMsgs.map((x) => x.username + ': ' + x.message).join(' | ') || '—'));
     sinaldi = true;
     sm.disconnect();
   }

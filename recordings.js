@@ -159,7 +159,12 @@ export function isOpen(gameId) {
 // MediaRecorder bo'laklari KETMA-KET ulanadi: birinchisida sarlavha bor,
 // qolganlari davomi. Shuning uchun tartib muhim — mijoz ularni navbat bilan,
 // bittalab yuboradi.
-export function append(gameId, key, buf, ext = 'webm') {
+// `seg` — yozuv QAYTA BOSHLANGANidagi bo'lak raqami. MediaRecorder har
+// safar yangi webm SARLAVHASI bilan boshlaydi; uni eski faylning oxiriga
+// qo'shsak fayl umuman ochilmay qoladi, ya'ni dalil yo'qoladi. Shuning
+// uchun har bo'lak alohida faylga (`kalit.2.webm`) yoziladi — lekin KVOTA
+// baribir bitta kalit (o'yinchi) hisobiga boradi.
+export function append(gameId, key, buf, ext = 'webm', seg = 0) {
   if (!ON || !ready) return { ok: false, code: 'off' };
   if (!Buffer.isBuffer(buf) || !buf.length) return { ok: false, code: 'empty' };
   if (buf.length > MAX_CHUNK) return { ok: false, code: 'chunkTooBig' };
@@ -179,7 +184,9 @@ export function append(gameId, key, buf, ext = 'webm') {
   const gSize = dirSize(d);
   if (gSize + buf.length > MAX_GAME_MB * MB) return { ok: false, code: 'gameFull' };
 
-  const file = path.join(d, k + '.' + e);
+  const sn = Number.isFinite(+seg) && +seg > 0 ? Math.min(30, Math.floor(+seg)) : 0;
+  const base = sn > 0 ? k + '.' + (sn + 1) : k;
+  const file = path.join(d, base + '.' + e);
   // Kvota FAYL emas, O'YINCHI (kalit) bo'yicha hisoblanadi: bir kalitning
   // barcha fayllari qo'shiladi. Aks holda kengaytmani almashtirib chegarani
   // aylanib o'tish mumkin edi.

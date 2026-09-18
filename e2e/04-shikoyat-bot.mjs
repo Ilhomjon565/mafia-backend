@@ -117,6 +117,37 @@ async function main() {
   ok(last.on === human.username, 'saqlangan shikoyat — odam haqida', 'on=' + last.on);
   ok(last.type === 'chat_abuse', 'tur saqlandi', 'type=' + last.type);
 
+  // ================================================================
+  // 2026-09-18 auditi: tez o'yin SANOQ BOSHLANGAN xonaga yuborardi va
+  // o'yinchi kirib ulgurmay "O'yin boshlangan" halokatli ekraniga tushardi.
+  log('\n=== 5. Tez o\'yin BOSHLANAYOTGAN xonaga yubormaydi ===');
+  const c = await reg('e2e_rep_c');
+  const dd = await reg('e2e_rep_d');
+  const mk2 = await http('/api/games', {
+    method: 'POST', token: c.token,
+    body: { name: 'sanoq sinovi', totalPlayers: 6, isPrivate: false },
+  });
+  const g2 = mk2.json?.id;
+  ok(!!g2, 'ikkinchi xona yaratildi', mk2.status + ' ' + mk2.text.slice(0, 120));
+  const sc = connect(c);
+  await sc.waitFor('connect').catch(() => null);
+  sc.emit('join_game', { gameId: g2, userId: c.userId, username: c.username });
+
+  // Botlar to'lgach server sanoqni qurollaydi va jurnalga 'startingSoon' yozadi
+  let sanoq = false, boshlandi = false;
+  for (let i = 0; i < 45; i++) {
+    await sleep(600);
+    const st = sc.last('game_state');
+    if ((st?.log || []).some((e) => e?.kind === 'startingSoon' || e?.code === 'startingSoon'
+        || String(e?.text || '').includes('boshlanmoqda'))) { sanoq = true; break; }
+    if (st?.status === 'playing') { boshlandi = true; break; }
+  }
+  ok(sanoq || boshlandi, 'xonada sanoq boshlandi', 'sanoq=' + sanoq + ' playing=' + boshlandi);
+
+  const q = await http('/api/games/quick', { method: 'POST', token: dd.token });
+  ok(q.status === 200 && !!q.json?.id, 'tez o\'yin javob berdi', q.status + ' ' + q.text.slice(0, 140));
+  ok(q.json?.id !== g2, 'tez o\'yin boshlanayotgan xonani BERMADI', 'qaytdi: ' + q.json?.id + ' (xona: ' + g2 + ')');
+  sc.disconnect();
   sa.disconnect(); sb.disconnect();
   log(`\n===== NATIJA: ${pass} ta o'tdi, ${fail} ta yiqildi =====\n`);
   process.exit(fail ? 1 : 0);

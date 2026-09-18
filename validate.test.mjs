@@ -235,3 +235,36 @@ test('bo\'sh xabar o\'tmaydi', () => {
   assert.equal(checkChat('   ').code, 'empty');
   assert.equal(checkChat(null).code, 'empty');
 });
+
+
+// ==================== RAQAM RO'YXATI (2026-09-18 auditi) ====================
+// Mafiyada odamlar bir-birini RAQAM bilan chaqiradi va "kim kimga shubha
+// qilyapti" degan javob ko'pincha shunchaki raqamlar ro'yxati bo'ladi.
+// Telefon filtri faqat raqamlar SONINI sanagani uchun bunday xabarlarni
+// ham to'sardi — ya'ni o'yinning eng ko'p uchraydigan gapi bloklanardi.
+
+test("RAQAM RO'YXATI telefon deb hisoblanmaydi", () => {
+  for (const good of [
+    '1 2 3 4 5 6 7 8 9',
+    '1,2,3,4,5,6,7,8,9,10',
+    '2 4 5 tinch, 1 3 6 7 8 9 shubhali',
+    '1-2-3 emas 4 5 6 7 8 9 10 11',
+  ]) {
+    const r = checkChat(good);
+    assert.equal(r.ok, true, "bekorga to'sdi: " + good + ' (' + r.code + ')');
+  }
+});
+
+test('lekin HAQIQIY raqam shakllari baribir to\'siladi', () => {
+  for (const bad of [
+    '+998 90 123 45 67',
+    '998901234567',
+    '90-123-45-67 raqamim',
+    '(90) 123 45 67',
+    'tel 901234567',
+  ]) {
+    const r = checkChat(bad);
+    assert.equal(r.ok, false, "o'tkazib yubordi: " + bad);
+    assert.equal(r.code, 'phone', 'kod: ' + r.code + ' (' + bad + ')');
+  }
+});

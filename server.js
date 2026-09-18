@@ -1954,7 +1954,10 @@ app.post('/api/games/:id/open', authMiddleware, limitByUser(25), async (req, res
       // o'yinchi yangi boshlovchilar orasiga tushib qolardi.
       const rating = await myRating(req.user.userId);
       const best = await pickRoomForRating(rating, { userId: req.user.userId });
-      return res.json({ id: best || waiting[0].id });
+      // Ilgari bu yerda `best || waiting[0].id` edi: `pickRoomForRating` RAD
+      // ETGAN xona (to'lgan, boshlanayotgan yoki bizni chiqarib yuborgan)
+      // baribir qaytarilardi. Mos xona bo'lmasa yangisini ochgan ma'qul.
+      if (best) return res.json({ id: best });
     }
 
     const id = await startBotGame({ name: room.name, totalPlayers: room.totalPlayers, quick: true });
@@ -2218,6 +2221,18 @@ const repGameKey = (gameId) => `rep:game:${gameId}`;
 // Shikoyatsiz o'yin yozuvi shuncha vaqtdan keyin o'chadi. Darhol emas:
 // o'yinchi NATIJA EKRANIDAN ham shikoyat qilishi mumkin.
 const REC_GRACE_MS = Math.max(30000, parseInt(process.env.RECORD_GRACE_MS || '180000'));
+// Chat takrorini tekshirish uchun oxirgi xabarlar. Ilgari bu `g.chatRecent`
+// ichida turardi, lekin `g` har xabarda Redis'dan QAYTA o'qilardi va bu
+// maydon hech qachon `saveG` bilan saqlanmasdi — ya'ni takror qoidasi
+// umuman ishlamasdi. Ma'lumot o'tkinchi, holatga yozilishi shart emas.
+const chatRecent = new Map();   // userId -> oxirgi 3 ta xabar
+function recentOf(userId) { return chatRecent.get(userId) || []; }
+function pushRecent(userId, text) {
+  chatRecent.set(userId, [...recentOf(userId), text].slice(-3));
+  // Xotira cheksiz o'smasin: eng eski yozuvdan boshlab qisqartiramiz
+  while (chatRecent.size > 5000) chatRecent.delete(chatRecent.keys().next().value);
+}
+
 const recDropTimers = new Map();
 
 // Tugagan o'yinning o'yinchilari — natija ekranidan kelgan shikoyat uchun
@@ -2252,6 +2267,26 @@ function scheduleRecDrop(gameId) {
   }, REC_GRACE_MS);
   t.unref?.();
   recDropTimers.set(gameId, t);
+}
+
+// `recDropTimers` faqat XOTIRADA yashaydi: server qayta ishga tushsa
+// shikoyatsiz yozuvlar 14 kun osilib qolardi va diskni behuda egallardi.
+// Shuning uchun ishga tushishda va soatiga bir marta "egasiz" yozuvlarni
+// topib o'chiramiz.
+async function sweepOrphanRecordings() {
+  let n = 0;
+  for (const r of recStore.list(500)) {
+    if (timers.has(r.gameId)) continue;            // ketayotgan o'yin
+    if (recDropTimers.has(r.gameId)) continue;     // taymeri bor
+    const ended = !!recStore.readJson(r.gameId, 'game');
+    // Tugagan o'yinga muhlat REC_GRACE_MS; game.json yo'q bo'lsa bu server
+    // qulaganidan qolgan chala yozuv — unga 1 soat beramiz.
+    if (Date.now() - r.at < (ended ? REC_GRACE_MS : 3600000)) continue;
+    if (await gameReportCount(r.gameId) > 0) continue;   // shikoyat bor — saqlanadi
+    if (recStore.drop(r.gameId)) n++;
+  }
+  if (n) console.log(`\u{1F9F9} ${n} ta shikoyatsiz yozuv o'chirildi (restart qoldig'i)`);
+  return n;
 }
 
 // O'yin tugadi: tarixni yozuvga tushiramiz va taqdirini hal qilamiz.
@@ -2340,6 +2375,11 @@ app.post('/api/voice-chunk', authMiddleware, limitByUser(600), voiceChunkBody, a
     // o'tardi va har biri alohida fayl bo'lib, o'yinchi kvotasini bekor qilardi.
     const raw = String(req.headers['x-rec-ext'] || 'webm');
     const ext = recStore.ALLOWED_EXT.includes(raw) ? raw : 'webm';
+    // Bo'lak raqami: mijoz yozuvni qayta boshlagan bo'lsa (mikrofon uzilib
+    // qayta ulandi, MediaRecorder xato berdi) bo'lak YANGI faylga yoziladi.
+    // Aks holda ikkinchi webm sarlavhasi eski faylga yopishib, dalil
+    // ochilmaydigan bo'lib qolardi.
+    const seg = Math.min(30, Math.max(0, parseInt(req.headers['x-rec-seg'] || '0', 10) || 0));
     if (!gameId || !Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'bad' });
     if (!recStore.isOpen(gameId)) return res.status(410).json({ code: 'closed' });
 
@@ -2350,7 +2390,7 @@ app.post('/api/voice-chunk', authMiddleware, limitByUser(600), voiceChunkBody, a
 
     // Fayl nomi — MASKALANGAN publicId (haqiqiy userId fayl tizimida qolmasin)
     const key = me.publicId || me.userId;
-    const r = recStore.append(gameId, key, req.body, ext);
+    const r = recStore.append(gameId, key, req.body, ext, seg);
     if (!r.ok) {
       // Chegaraga yetdi — mijoz yozishni to'xtatadi. Bu XATO emas: o'yin
       // davom etaveradi, faqat bu o'yinchining ovozi boshqa yozilmaydi.
@@ -2608,10 +2648,13 @@ app.get('/api/admin/evidence/:gameId', authMiddleware, adminMiddleware, async (r
     const audio = files
       .filter((f) => /\.(webm|mp4|ogg|m4a)$/i.test(f.name))
       .map((f) => {
-        const key = f.name.replace(/\.[^.]+$/, '');
+        // `abc.webm` -> `abc`; `abc.2.webm` -> `abc` (2 — yozuv qayta
+        // boshlangandagi bo'lak raqami, u o'yinchini almashtirmaydi).
+        const key = f.name.replace(/\.[^.]+$/, '').replace(/\.\d+$/, '');
+        const qism = /\.(\d+)\.[^.]+$/.exec(f.name)?.[1] || null;
         const marks = recStore.readJson(id, key + '.marks');
         return {
-          file: f.name, size: f.size,
+          file: f.name, size: f.size, qism,
           player: byId.get(key)?.username || '?',
           role: byId.get(key)?.role || null,
           marks: marks?.marks || [],
@@ -2957,6 +3000,9 @@ async function pickRoomForRating(rating, { excludeId = null, userId = null } = {
     if (!g || g.status !== 'waiting') continue;
     if (userId && g.kicked?.[userId]) continue;          // chiqarib yuborilgan
     if (g.vsBots) continue;                              // "botlar bilan" xonasi shaxsiy
+    // Sanoq boshlangan xona: o'yinchi kirguncha o'yin boshlanib ketadi va u
+    // "O'yin boshlangan" ekraniga tushadi — tez o'yin uchun eng yomon tajriba.
+    if (botStartTimers.has(row.id)) continue;
     const cap = g.totalPlayers || row.totalPlayers || 8;
     const free = cap - (g.players || []).length;
     if (free <= 0) continue;
@@ -4506,7 +4552,11 @@ function scheduleBotRevenge(gameId, sid) {
 // nishon tanlamaydi. Kelishuv paneli har kecha bo'sh turadi va
 // `nightStepComplete` hech qachon rost bo'lmay, night_mafia har tunda to'liq
 // 25 soniyani yondiradi — boshqa bosqichlar bir necha soniyada o'tayotganda.
-function scheduleBotMafiaFollow(gameId, targetSid) {
+// `humanSid` — nishon EMAS, odam mafiyaning socketId'si. Sababi: odam
+// fikrini o'zgartirishi mumkin. Ilgari bu yerga nishon uzatilardi va
+// sheriklar BIRINCHI bosilgan odamga ovoz berib qolardi — mafiya kelisha
+// olmay, kecha bo'sh ketardi. Endi taymer ichida joriy ovoz qayta o'qiladi.
+function scheduleBotMafiaFollow(gameId, humanSid) {
   // Darhol emas va hammasi birga emas: sherik ham "o'ylab" turadi.
   for (let i = 0; i < 4; i++) {
     const t = setTimeout(() => { withLock(gameId, async () => {
@@ -4514,13 +4564,23 @@ function scheduleBotMafiaFollow(gameId, targetSid) {
       if (!g || g.status !== 'playing') return;
       const step = nightStepByPhase(g.phase);
       if (!step || step.phase !== 'night_mafia') return;
-      const tgt = g.players.find(p => p.socketId === targetSid);
-      if (!tgt || !tgt.isAlive || sideOf(tgt.role) === 'mafia') return;
       const na = g.nightActions = g.nightActions || {};
       na.mafiaVotes = na.mafiaVotes || {};
+      const targetSid = na.mafiaVotes[humanSid];   // JORIY tanlov
+      if (!targetSid) return;                      // odam ovozini qaytarib olgan
+      const tgt = g.players.find(p => p.socketId === targetSid);
+      if (!tgt || !tgt.isAlive || sideOf(tgt.role) === 'mafia') return;
       const waiting = g.players.filter(p =>
         p.isAlive && isBot(p) && MAFIA_VOTERS.includes(p.role) && !na.mafiaVotes[p.socketId]);
-      if (!waiting.length) return;
+      // Fikri o'zgargan bo'lsa ALLAQACHON ovoz bergan botlar ham ko'chadi,
+      // aks holda kecha hech qachon yakunlanmay qolishi mumkin.
+      for (const p of g.players) {
+        if (p.isAlive && isBot(p) && MAFIA_VOTERS.includes(p.role) &&
+            na.mafiaVotes[p.socketId] && na.mafiaVotes[p.socketId] !== targetSid) {
+          na.mafiaVotes[p.socketId] = targetSid;
+        }
+      }
+      if (!waiting.length) { await saveG(gameId, g); emitMafiaVotes(gameId, g); return; }
       na.mafiaVotes[waiting[0].socketId] = targetSid;
       await saveG(gameId, g);
       emitMafiaVotes(gameId, g);
@@ -5427,7 +5487,7 @@ io.on('connection', (socket) => {
           // har biri o'z kechikishi bilan (scheduleBotMafiaFollow). Shart ilgari
           // `g.vsBots` edi va oddiy xonada umuman ishlamasdi: sheriklar hech
           // qachon nishon tanlamay, panel har kecha bo'sh turardi.
-          if ((g.players || []).some(isBot)) scheduleBotMafiaFollow(gameId, targetSocketId);
+          if ((g.players || []).some(isBot)) scheduleBotMafiaFollow(gameId, socket.id);
           socket.emit('action_confirmed', { code: 'mafiaVote', name: target.username, message: `🔫 Ovozingiz: ${target.username}` });
           // mafiya sheriklarga joriy ovozlarni ko'rsatamiz (kelishish uchun)
           emitMafiaVotes(gameId, g);
@@ -5587,7 +5647,7 @@ io.on('connection', (socket) => {
     }
 
     // Tarkib tekshiruvi (validate.js — sof funksiya, testlari bor)
-    const recent = (g.chatRecent && g.chatRecent[player.userId]) || [];
+    const recent = recentOf(player.userId);
     const chk = checkChat(text, recent);
     if (!chk.ok) {
       const MSG = {
@@ -5601,8 +5661,7 @@ io.on('connection', (socket) => {
       return;
     }
     // Oxirgi 3 ta xabar eslanadi (takror tekshiruvi uchun)
-    g.chatRecent = g.chatRecent || {};
-    g.chatRecent[player.userId] = [...recent, text].slice(-3);
+    pushRecent(player.userId, text);
 
     // 🗣️ Oxirgi so'z — chiqarilgan o'yinchi day_results davomida bitta OCHIQ xabar yozadi.
     // Holatni o'zgartirgani uchun qulf ostida bajaramiz (aks holda bir vaqtda ketayotgan
@@ -5902,22 +5961,30 @@ io.on('connection', (socket) => {
     // Bitta odamga kuniga BIR MARTA; kuniga ko'pi bilan 20 ta TURLI odamga.
     const dayKey = repDayKey(d.userId);
     try {
-      if (await redis.sismember(dayKey, String(target.userId))) {
+      // DIQQAT: bu yerda POYGA bo'lmasligi kerak. Ilgari `sismember` bilan
+      // tekshirilib, keyin `sadd` qilinardi — ikkisi orasida bir nechta
+      // shikoyat o'tib ketardi va bitta odam bitta nishonga daqiqasiga
+      // o'nlab shikoyat yozardi. `sadd` ning O'ZI atomik: 1 qaytarsa nishon
+      // yangi, 0 qaytarsa bugun allaqachon shikoyat qilingan.
+      const yangi = await redis.sadd(dayKey, String(target.userId));
+      await redis.expire(dayKey, 36 * 3600);
+      if (yangi === 0) {
         socket.emit('report_result', {
           ok: false, code: 'reportDup',
           message: 'Siz bu o\'yinchiga bugun allaqachon shikoyat qilgansiz',
         });
         return;
       }
-      if (await redis.scard(dayKey) >= REPORT_DAILY_TARGETS) {
+      // Chegara qo'shilgandan KEYIN tekshiriladi; oshib ketgan bo'lsa
+      // o'zimiz qo'shgan a'zoni qaytarib olamiz (hisob buzilmasin).
+      if (await redis.scard(dayKey) > REPORT_DAILY_TARGETS) {
+        try { await redis.srem(dayKey, String(target.userId)); } catch {}
         socket.emit('report_result', {
           ok: false, code: 'reportDaily', n: REPORT_DAILY_TARGETS,
           message: `Kuniga ko'pi bilan ${REPORT_DAILY_TARGETS} ta o'yinchiga shikoyat qilish mumkin`,
         });
         return;
       }
-      await redis.sadd(dayKey, String(target.userId));
-      await redis.expire(dayKey, 36 * 3600);
     } catch {
       // Redis uzilgan bo'lsa shikoyatni BLOKLAMAYMIZ — u chegaradan muhimroq
     }
@@ -6231,10 +6298,13 @@ httpServer.listen(PORT, BIND_HOST, () => {
           if (res.ochirildi) console.log(`\u{1F9F9} ${res.ochirildi} ta eski yozuv o'chirildi (${res.hajmMb} MB qoldi)`);
           recStore.resync();   // xotiradagi hisob haqiqiy holatdan uzoqlashmasin
         } catch (e) { console.error('recSweep:', e?.message || e); }
+        sweepOrphanRecordings().catch(() => {});
       }, 3600000);
       sweepTimer.unref?.();
       // Ishga tushgandan 1 daqiqa keyin birinchi tozalash
       setTimeout(() => { try { recStore.sweep(new Set(timers.keys())); } catch {} }, 60000).unref?.();
+      // Restart qoldiqlari: o'yinlar tiklanib ulgurishi uchun 90 soniyadan keyin
+      setTimeout(() => { sweepOrphanRecordings().catch(() => {}); }, 90000).unref?.();
     } else if (recStore.ON) {
       console.warn('Yozuvlar o\'chirilgan holatda ishlayapti:', r.reason);
     }

@@ -82,13 +82,28 @@ const LINKY = /(https?:\/\/|www\.|t\.me\/|telegram\.me\/|wa\.me\/|\b[a-z0-9-]{2,
 // 9 ta raqam — O'zbekiston raqamining uzunligi (901234567). 7 chegarasi
 // haqiqiy raqamni to'sish uchun kerak emas edi, lekin o'yindagi oddiy uzun
 // sonni (sana, hisob, xona raqami) to'sib qo'yardi.
-const PHONE = /(?:\+?\d[\s\-().]*){9,}/;
+// Vergul ham ajratuvchi sifatida qabul qilinadi ("1,2,3..."). Ilgari u
+// olib tashlanardi va raqamlar YOPISHIB qolib soxta "telefon" hosil bo'lardi.
+const PHONE = /(?:\+?\d[\s\-().,]*){9,}/;
+
+// Faqat raqam SONINI sanash telefonni o'yin gapidan ajrata olmasdi:
+// "1 2 3 4 5 6 7 8 9" ham 9 ta raqam (kim kimga shubha qilayotgani shunday
+// aytiladi) va u ham bloklanardi. Farqi guruhlar sonida — haqiqiy raqam kam
+// guruhga bo'linadi (+998 90 123 45 67 = 5 guruh), ro'yxat esa har raqamni
+// alohida yozadi (9 guruh).
+function looksLikePhone(t) {
+  const m = String(t).match(PHONE);
+  if (!m) return false;
+  const groups = m[0].match(/\d+/g) || [];
+  if (groups.join('').length < 9) return false;
+  return groups.length <= 5;
+}
 
 export function checkChat(text, recent = []) {
   const t = String(text || '').trim();
   if (!t) return { ok: false, code: 'empty' };
   if (LINKY.test(t)) return { ok: false, code: 'link' };
-  if (PHONE.test(t.replace(/[^\d+\s\-().]/g, ''))) return { ok: false, code: 'phone' };
+  if (looksLikePhone(t)) return { ok: false, code: 'phone' };
   // Bir xil xabarni qayta-qayta yozish — eng oddiy spam shakli
   const norm = t.toLowerCase().replace(/\s+/g, ' ');
   if (recent.some((r) => String(r).toLowerCase().replace(/\s+/g, ' ') === norm)) {

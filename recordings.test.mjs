@@ -264,3 +264,46 @@ test("kvota KALIT bo'yicha — kengaytma almashtirib chetlab bo'lmaydi", () => {
   // Boshqa o'yinchi hali yoza olishi kerak
   assert.equal(rec.append('g1', 'u2', buf(50 * 1024)).ok, true, 'boshqa o\'yinchi bloklandi');
 });
+
+
+// ==================== BO'LAK (SEGMENT) — 2026-09-18 auditi ====================
+// MediaRecorder qayta ishga tushganda YANGI webm sarlavhasi bilan boshlaydi.
+// Ilgari hamma bo'lak bitta faylga qo'shilardi va ikkinchi sarlavhadan keyin
+// fayl hech bir pleyerda ochilmasdi — ya'ni shikoyat bo'lsa ham dalil yo'q edi.
+
+test("qayta boshlangan yozuv ALOHIDA faylga tushadi", () => {
+  fresh();
+  rec.open('g1');
+  assert.equal(rec.append('g1', 'u1', buf(100), 'webm', 0).ok, true);
+  assert.equal(rec.append('g1', 'u1', buf(100), 'webm', 1).ok, true);
+  assert.equal(rec.append('g1', 'u1', buf(100), 'webm', 2).ok, true);
+  const names = rec.files('g1').map((f) => f.name).sort();
+  assert.deepEqual(names, ['u1.2.webm', 'u1.3.webm', 'u1.webm'],
+    'fayllar: ' + names.join(','));
+});
+
+test("bo'lak raqami KVOTANI aylanib o'tishga yo'l bermaydi", () => {
+  fresh();
+  rec.open('g1');
+  let wrote = 0, oxirgi = null;
+  for (let i = 0; i < 60; i++) {
+    // Har safar YANGI bo'lak raqami — eski xatoda bu kvotani nolga qaytarardi
+    const r = rec.append('g1', 'u1', buf(200 * 1024), 'webm', i);
+    if (!r.ok) { oxirgi = r.code; break; }
+    wrote += 200 * 1024;
+  }
+  assert.equal(oxirgi, 'userFull', 'kvota ishlamadi, kod: ' + oxirgi);
+  assert.ok(wrote <= rec.LIMITS.maxUserMb * 1024 * 1024,
+    "kvota aylanib o'tildi: " + Math.round(wrote / 1024) + ' KB');
+});
+
+test("bo'lak raqami xavfli qiymatda ham faylni katalogdan chiqarmaydi", () => {
+  fresh();
+  rec.open('g1');
+  for (const bad of ['../x', -5, 1e9, NaN, '2; rm -rf /']) {
+    rec.append('g1', 'u1', buf(50), 'webm', bad);
+  }
+  for (const f of rec.files('g1')) {
+    assert.ok(/^u1(\.\d+)?\.webm$/.test(f.name), 'kutilmagan fayl: ' + f.name);
+  }
+});

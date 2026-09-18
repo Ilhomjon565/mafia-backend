@@ -739,8 +739,10 @@ const WAIT_ASK = [
   /(подожд|погод|не начина|не нажим|ещё (один|одна|человек|друг)|еще (один|одна|человек|друг)|сейчас (придёт|придет|зайдёт|зайдет)|минут(у|ку)|стоп)/,
 ];
 // Xona egasi "kiradimi?" deb so'raganidan keyingi "ha, kutamiz" javoblari
+// DIQQAT: kirill harflari `\b` uchun "so'z" emas (u=flag'siz) — kirill
+// so'zlariga chegara sifatida (\s|$) ishlatiladi.
 const WAIT_YES = [
-  /^(xa|ha|a|aha|xop|hop|ok|okey|okay|da|yes|yeah|ага|да)\b/,
+  /^(xa|ha|a|aha|xop|hop|ok|okey|okay|da|yes|yeah)\b|^(ага|да)(\s|$)/,
   /\b(kiradi|kradi|kiryapti|kirvotti|kirmoqchi|keladi|kelyapti|kelvotti|kelmoqchi|kiradilar|keladilar|kelishadi|kirishadi|kelyabdi|kiryabdi)\b/,
   /\b(hoz|hozir|hozi|hozr|hoziroq|zamon|birpas|bir pas|sal|biroz)\b/,
   /\b(kut|kuting|kutila|kutib tur|kutamiz|sabr|chaqir|yozdim|aytdim|xabar ber|bor|keladi deb)\b/,
@@ -749,7 +751,7 @@ const WAIT_YES = [
 ];
 // "yo'q, kelmaydi" — boshlash mumkin
 const WAIT_NO = [
-  /^(yoq|yo q|yuq|net|нет|no|nope)\b/,
+  /^(yoq|yo q|yuq|net|no|nope)\b|^нет(\s|$)/,
   /\b(kelmaydi|kirmaydi|kelmadi|kirmadi|kelmas ekan|kirmas ekan|boshlang|boshla|bosing|bos)\b/,
 ];
 export function isWaitAsk(text) { const t = normChat(text); return !!t && WAIT_ASK.some((r) => r.test(t)); }

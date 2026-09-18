@@ -4890,6 +4890,61 @@ const socketData = new Map();
 //      ikkilantirish mumkin edi.
 const userRooms = new Map();
 
+// ==================== BITTA HISOB = BITTA FAOL SESSIYA ====================
+// userId -> hozir o'yin o'ynayotgan socket. Ikkinchi qurilmadan (yoki
+// ikkinchi varaqdan) o'yinga kirilsa, ESKI ulanish o'yindan chiqariladi.
+//
+// Ilgari eski socket xonada QOLIB KETARDI: `remapSocketId` o'yinchini yangi
+// socketga ko'chirar, eskisi esa `game:<id>` xonasida qolib `game_state`
+// oqimini olib turardi. Natijada ekranda o'yin "tirik" ko'rinar, lekin
+// hech bir tugma ishlamasdi (server o'yinchini socketId bo'yicha topadi) —
+// foydalanuvchi uchun bu "o'yin qotib qoldi" bo'lib ko'rinardi.
+const userSockets = new Map();
+
+// Bitta eski sessiyani o'yindan chiqarish. `newSid` — o'rnini egallagan
+// yangi socket (xabar matnini tanlash uchun: o'sha qurilmami yoki boshqasi).
+function kickSession(sid, newSid) {
+  const eski = socketData.get(sid);
+  socketData.delete(sid);   // disconnect ishlovchisi bu socketni endi KO'RMAYDI
+  // Ovozli chatdagi izi tozalansin — aks holda qolganlarda jimjit peer osilib qolardi
+  if (eski?.gameId) {
+    try { voiceLeave(eski.gameId, sid); } catch {}
+    io.to(`game:${eski.gameId}`).emit('voice_peer_leave', { socketId: sid });
+  }
+  const s = io.sockets.sockets.get(sid);
+  if (!s) return;
+  const yangi = newSid ? io.sockets.sockets.get(newSid) : null;
+  // Qurilma barmoq izi (tokendagi `dvc`) mos kelsa — bu o'sha qurilmaning
+  // boshqa varag'i; aks holda haqiqatan boshqa qurilma.
+  const boshqaQurilma = !yangi || !s.data?.dvc || !yangi.data?.dvc || s.data.dvc !== yangi.data.dvc;
+  try {
+    for (const r of [...s.rooms]) if (String(r).startsWith('game:')) s.leave(r);
+    s.emit('session_taken', {
+      code: boshqaQurilma ? 'otherDevice' : 'otherTab',
+      message: boshqaQurilma
+        ? 'Hisobingizga boshqa qurilmadan kirildi'
+        : 'O\'yin boshqa oynada ochildi',
+    });
+  } catch {}
+  // Mijoz xabarni ko'rsatib ulgursin, keyin uzamiz
+  const t = setTimeout(() => { try { s.disconnect(true); } catch {} }, 2000);
+  t.unref?.();
+}
+
+// O'yinga kirish MUVAFFAQIYATLI bo'lgach chaqiriladi: shu userId ga tegishli
+// boshqa hamma ulanish o'yindan chiqariladi va sessiya yangisiga bog'lanadi.
+function bindSession(socket, userId, username, gameId) {
+  const eskiSid = userSockets.get(userId);
+  if (eskiSid && eskiSid !== socket.id) kickSession(eskiSid, socket.id);
+  // Zaxira: `userSockets` biror sababga ko'ra yangilanmay qolgan bo'lsa ham
+  // shu hisobning boshqa socketlari qolib ketmasin (arvoh sessiya bo'lmasin).
+  for (const [sid, d] of [...socketData]) {
+    if (sid !== socket.id && d?.userId === userId) kickSession(sid, socket.id);
+  }
+  userSockets.set(userId, socket.id);
+  socketData.set(socket.id, { userId, username, gameId });
+}
+
 // ==================== PING (ulanish sifati) ====================
 // Ping SERVERDA o'lchanadi, mijoz o'zi xabar qilmaydi: past ping "yaxshi
 // ulanish" belgisi bo'lgani uchun uni soxtalashtirishga sabab bor edi.
@@ -5144,7 +5199,7 @@ io.use((socket, next) => {
         // qurilmaga bog'langan token — qurilma mos kelsagina ishonamiz
         if (p.dvc) {
           const dev = socket.handshake.auth?.deviceId;
-          if (dev && deviceHash(dev) === p.dvc) socket.data.auth = p;
+          if (dev && deviceHash(dev) === p.dvc) { socket.data.auth = p; socket.data.dvc = p.dvc; }
           // mos kelmasa — auth o'rnatilmaydi (boshqa nomidan kira olmaydi)
         } else socket.data.auth = p;
       } catch {}
@@ -5288,7 +5343,7 @@ io.on('connection', (socket) => {
           remapSocketId(g, existing.socketId, socket.id); // ovoz/harakatlarni yangi socketga ko'chiramiz
           existing.socketId = socket.id;
           existing.connected = true;
-          clearIdle(socket); pingSoon(); socketData.set(socket.id, { userId, username: existing.username, gameId });
+          clearIdle(socket); pingSoon(); bindSession(socket, userId, existing.username, gameId);
           joinRoomOnly(socket, key);
           await saveG(gameId, g);
           socket.emit('game_state', publicGame(g));
@@ -5329,7 +5384,7 @@ io.on('connection', (socket) => {
         remapSocketId(g, existing.socketId, socket.id);
         existing.socketId = socket.id;
         existing.connected = true;
-        clearIdle(socket); pingSoon(); socketData.set(socket.id, { userId, username: existing.username, gameId });
+        clearIdle(socket); pingSoon(); bindSession(socket, userId, existing.username, gameId);
         joinRoomOnly(socket, key);
         await saveG(gameId, g);
         socket.emit('game_state', publicGame(g));
@@ -5379,7 +5434,7 @@ io.on('connection', (socket) => {
       if (!Array.isArray(g.everPlayers)) g.everPlayers = [];
       if (!g.everPlayers.includes(player.username)) g.everPlayers.push(player.username);
       await saveG(gameId, g);
-      clearIdle(socket); pingSoon(); socketData.set(socket.id, { userId: player.userId, username: player.username, gameId });
+      clearIdle(socket); pingSoon(); bindSession(socket, player.userId, player.username, gameId);
       joinRoomOnly(socket, key);
 
       io.to(key).emit('game_state', publicGame(g));
@@ -6105,6 +6160,9 @@ io.on('connection', (socket) => {
     if (ip && isPublicIp(ip)) { const n = (ipConns.get(ip) || 1) - 1; if (n <= 0) ipConns.delete(ip); else ipConns.set(ip, n); }
     const data = socketData.get(socket.id);
     socketData.delete(socket.id);
+    // Sessiya reestri: faqat O'ZIMIZNIKI bo'lsa o'chiramiz. Boshqa qurilma
+    // allaqachon o'rnimizni egallagan bo'lsa, uning yozuvi tegilmasligi shart.
+    if (data?.userId && userSockets.get(data.userId) === socket.id) userSockets.delete(data.userId);
     // ovozli chatdan chiqaramiz
     if (data?.gameId) { voiceLeave(data.gameId, socket.id); socket.to(`game:${data.gameId}`).emit('voice_peer_leave', { socketId: socket.id }); }
     if (!data?.gameId) return;

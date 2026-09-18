@@ -133,13 +133,25 @@ async function main() {
   await sc.waitFor('connect').catch(() => null);
   sc.emit('join_game', { gameId: g2, userId: c.userId, username: c.username });
 
-  // Botlar to'lgach server sanoqni qurollaydi va jurnalga 'startingSoon' yozadi
-  let sanoq = false, boshlandi = false;
-  for (let i = 0; i < 45; i++) {
-    await sleep(600);
+  // Botlar bittalab qo'shiladi — kamida `minPlayers` (5) bo'lishini kutamiz.
+  let toldi = false;
+  for (let i = 0; i < 100; i++) {
+    await sleep(1200);
     const st = sc.last('game_state');
-    if ((st?.log || []).some((e) => e?.kind === 'startingSoon' || e?.code === 'startingSoon'
-        || String(e?.text || '').includes('boshlanmoqda'))) { sanoq = true; break; }
+    if ((st?.players || []).length >= 5) { toldi = true; break; }
+    if (st && st.status !== 'waiting') break;
+  }
+  ok(toldi, 'xonaga botlar to\'ldi (>=5)', 'o\'yinchilar: ' + (sc.last('game_state')?.players || []).length);
+
+  // "goo" — odam boshlashni so'raydi: bot javob beradi va server 7-13
+  // soniyalik sanoqni QUROLLAYDI. Aynan shu oynada tez o'yin bu xonani
+  // bermasligi kerak.
+  sc.emit('chat_message', { gameId: g2, message: 'goo' });
+  let sanoq = false, boshlandi = false;
+  for (let i = 0; i < 30; i++) {
+    await sleep(500);
+    const st = sc.last('game_state');
+    if ((st?.log || []).some((e) => e?.code === 'startingSoon')) { sanoq = true; break; }
     if (st?.status === 'playing') { boshlandi = true; break; }
   }
   ok(sanoq || boshlandi, 'xonada sanoq boshlandi', 'sanoq=' + sanoq + ' playing=' + boshlandi);

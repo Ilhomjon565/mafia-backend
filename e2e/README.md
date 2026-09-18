@@ -28,6 +28,38 @@ fayllar. Ular birinchi ishga tushirilganda **uchta haqiqiy nuqson** topgan
 - Disk kvotasi: chegaraga yetganda `507`, boshqa oʻyinchi taʼsirlanmaydi,
   juda katta boʻlak rad etiladi, **oʻyinning oʻzi buzilmaydi**
 
+**`03-reyting-moslashtirish.mjs`** (15 ta tekshiruv)
+- Tez o‘yin har kimni O‘Z ligasiga tushiradi; xona reytingi yangi
+  o‘yinchi bilan yangilanadi; odamsiz xona hammaga bir xil mos
+- **Talab:** `E2E_PSQL` — toza ulanish satri (`?schema=` BO‘LMASIN, psql uni
+  qabul qilmaydi; skript SQL ichida `SET search_path TO mafia_test` qiladi)
+
+**`04-shikoyat-bot.mjs`** (17 ta tekshiruv) — **`BOT_FILL=1` talab qiladi**
+- Botga qilingan shikoyat odamnikidan AYNAN farq qilmaydi (bot detektori yo‘q)
+- Bot shikoyati adminga yozilmaydi, lekin kunlik hisobga kiradi
+- **Tez o‘yin sanoq boshlangan xonani bermaydi** (odam "goo" yozadi →
+  server 7-13 soniyalik sanoqni quradi → shu oynada `/api/games/quick`
+  o‘sha xonani qaytarmasligi kerak)
+
+**`05-audit2.mjs`** (22 ta tekshiruv)
+- **Chat takrori** qoidasi ishlaydi (ilgari `g.chatRecent` saqlanmasdi)
+- **Raqam ro‘yxati** ("1 2 3 4 5 6 7 8 9") telefon deb hisoblanmaydi
+- **Yozuv bo‘laklari**: `X-Rec-Seg` bilan har qayta boshlash ALOHIDA faylga
+  (`kalit.2.webm`), har fayl aynan bitta bo‘lak — sarlavhalar qo‘shilmaydi;
+  admin dalilida uchalasi BITTA o‘yinchiga bog‘lanadi
+- **Kunlik chegara atomik**: bir vaqtda yuborilgan 6 ta shikoyatdan AYNAN
+  bittasi o‘tadi; 21-chi nishonda to‘plam hajmi 20 da qoladi
+- **O‘lgan o‘yinchiga** shikoyat qabul qilinadi
+
+**`06-mafiya-kelishuv.mjs`** (6 ta tekshiruv)
+- Odam mafiya A ni bosib, darhol B ga o‘tsa, bot sherigi **JORIY** tanlovga
+  (B) qo‘shiladi — ilgari taymerga eski nishon yopilib qolardi va mafiya
+  kelisha olmasdi
+- "Botlar bilan o‘ynash" xonasi ishlatiladi (bir zumda to‘ladi); odam mafiya
+  bo‘lguncha bir necha o‘yin sinab ko‘riladi (`E2E_URINISH`, sukut 16)
+- Kecha bosqichi ikkinchi ovozdan oldin yopilsa sinov YIQITILMAYDI —
+  keyingi o‘yinga o‘tiladi (sharti qurilmagan hisoblanadi)
+
 ## Qanday ishga tushirish
 
 Sinov **ALOHIDA** nusxaga qarshi ishlashi shart: boshqa port, boshqa Redis DB
@@ -69,6 +101,17 @@ cp e2e/*.mjs /srv/mafia/frontend/
 cd /srv/mafia/frontend
 E2E_API=http://127.0.0.1:4199 E2E_REC=/srv/mafia/rec-test E2E_ADMIN_KEY=e2ekey node 01-yozuv-shikoyat-jazo.mjs
 E2E_API=http://127.0.0.1:4199 E2E_REC=/srv/mafia/rec-test E2E_ADMIN_KEY=e2ekey node 02-chegaralar.mjs
+E2E_API=http://127.0.0.1:4199 E2E_REC=/srv/mafia/rec-test E2E_ADMIN_KEY=e2ekey \
+  E2E_REDIS="redis-cli -n 9" node 05-audit2.mjs
+
+# 03 uchun psql ulanish satri (?schema= BO‘LMAGAN holda!)
+E2E_API=http://127.0.0.1:4199 E2E_PSQL="$RAW" E2E_ADMIN_KEY=e2ekey node 03-reyting-moslashtirish.mjs
+
+# 04 va 06 uchun serverni BOT_FILL=1 bilan qayta ko‘tarish kerak
+# (06 "botlar bilan o‘ynash" xonasidan foydalanadi — unga BOT_FILL shart emas,
+#  lekin ikkalasini ketma-ket ishga tushirish qulay)
+E2E_API=http://127.0.0.1:4199 E2E_REDIS="redis-cli -n 9" node 04-shikoyat-bot.mjs
+E2E_API=http://127.0.0.1:4199 E2E_ADMIN_KEY=e2ekey E2E_URINISH=24 node 06-mafiya-kelishuv.mjs
 ```
 
 **Tozalash (shart):**
@@ -76,7 +119,7 @@ E2E_API=http://127.0.0.1:4199 E2E_REC=/srv/mafia/rec-test E2E_ADMIN_KEY=e2ekey n
 kill $(ss -ltnp | grep ':4199' | grep -oP 'pid=\K[0-9]+')
 psql "$RAW" -c 'DROP SCHEMA IF EXISTS mafia_test CASCADE'
 redis-cli -n 9 flushdb
-rm -rf /srv/mafia/backend-e2e /srv/mafia/rec-test /srv/mafia/frontend/0*.mjs
+rm -rf /srv/mafia/backend-e2e /srv/mafia/rec-test /srv/mafia/frontend/0*.mjs /tmp/e2e-*
 ```
 
 ## Birinchi ishga tushirishda topilgan nuqsonlar

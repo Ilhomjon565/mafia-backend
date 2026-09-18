@@ -86,20 +86,30 @@ async function main() {
 
   // Har bir mijoz navbati kelganda harakat qiladi — o'yin tez yakunlanadi
   const roles = new Map();
+  const oldi = new Map();   // o'yin davomida o'lganlar: username -> socketId
   let kun = 0;
-  let kunTest = null, kun2Test = null;
+  let kunTest = null;
   socks.forEach((s, i) => {
     s.on('your_role', (d) => roles.set(i, d.role));
     s.on('phase_change', async (d) => {
       const st = s.last('game_state') || {};
-      const alive = (d.players || st.players || []).filter((p) => p.isAlive);
+      const hammasi = d.players || st.players || [];
+      if (i === 0) {
+        // Ikki manba: holatdagi `isAlive` va serverning o'z xabari
+        for (const p of hammasi) if (p.isAlive === false) oldi.set(p.username, p.socketId);
+        const chiqdi = d?.result?.eliminated;
+        if (chiqdi) {
+          const sid = (st.players || hammasi).find((p) => p.username === chiqdi)?.socketId;
+          if (sid) oldi.set(chiqdi, sid);
+        }
+      }
+      const alive = hammasi.filter((p) => p.isAlive);
       if (!alive.some((p) => p.socketId === s.id)) return;   // men o'ldim
       const others = alive.filter((p) => p.socketId !== s.id);
       if (d.phase === 'day_discussion') {
         if (i === 0) {
           kun++;
           if (kun === 1 && kunTest) { try { await kunTest(); } catch (e) { log('  1-kun xatosi:', e.message); } }
-          if (kun === 2 && kun2Test) { try { await kun2Test(); } catch (e) { log('  2-kun xatosi:', e.message); } }
         }
         await sleep(i === 0 ? 9000 : 700 + i * 120);
         s.emit('day_vote', { gameId, targetSocketId: others.length ? others[0].socketId : 'skip' });
@@ -116,9 +126,9 @@ async function main() {
 
     log('\n=== 1. Chat takrori ENDI ishlaydi ===');
     s.evts.delete('game_error');
-    s.emit('send_message', { gameId, message: 'menimcha bu odam mafiya' });
+    s.emit('chat_message', { gameId, message: 'menimcha bu odam mafiya' });
     await sleep(600);
-    s.emit('send_message', { gameId, message: 'menimcha bu odam mafiya' });
+    s.emit('chat_message', { gameId, message: 'menimcha bu odam mafiya' });
     await sleep(900);
     const err = s.all('game_error').find((e) => e?.code === 'chat_repeat');
     ok(!!err, 'bir xil xabar ikkinchi marta o\'tmadi', JSON.stringify(s.all('game_error')));
@@ -126,7 +136,7 @@ async function main() {
     log('\n=== 2. RAQAM RO\'YXATI to\'silmaydi ===');
     s.evts.delete('game_error');
     const oldMsgs = s.all('chat_message').length;
-    s.emit('send_message', { gameId, message: '1 2 3 4 5 6 7 8 9 tekshirdim' });
+    s.emit('chat_message', { gameId, message: '1 2 3 4 5 6 7 8 9 tekshirdim' });
     await sleep(900);
     const phoneErr = s.all('game_error').find((e) => e?.code === 'chat_phone');
     ok(!phoneErr, 'raqam ro\'yxati telefon deb hisoblanmadi', JSON.stringify(phoneErr));
@@ -172,17 +182,8 @@ async function main() {
     ok(newRep - oldRep === 1, 'adminga aynan bitta shikoyat tushdi', 'qo\'shilgan: ' + (newRep - oldRep));
   };
 
-  // ---------- 2-kun: O'LGAN o'yinchiga shikoyat ----------
-  kun2Test = async () => {
-    const s = socks[0];
-    const st = s.last('game_state') || {};
-    const dead = (st.players || []).find((p) => p.isAlive === false && p.username !== users[0].username);
-    if (!dead) { log('  (o\'lgan o\'yinchi topilmadi — bu tekshiruv o\'tkazib yuborildi)'); return; }
-    s.evts.delete('report_result');
-    s.emit('report_player', { gameId, targetSocketId: dead.socketId, type: 'voice_abuse', reason: 'o\'lganlar chatida so\'kindi' });
-    const r = await s.waitFor('report_result', 8000).catch(() => null);
-    ok(r?.ok === true, 'O\'LGAN o\'yinchiga shikoyat qabul qilindi', JSON.stringify(r));
-  };
+  // O'lganga shikoyat o'yin tugagach tekshiriladi (pastda) — 5 kishilik
+  // o'yin 2-kunga yetmasligi mumkin.
 
   log('\n=== O\'yin boshlanmoqda ===');
   socks[0].emit('start_game', { gameId });
@@ -193,6 +194,23 @@ async function main() {
   ]);
   ok(over === 'over', 'o\'yin yakunlandi', over);
   await sleep(2500);
+
+  log('\n=== 4b. O\'LGAN o\'yinchiga ham shikoyat qilinadi ===');
+  // Mijozda tugma `p.isAlive` sharti bilan yashirilgandi, holbuki o'liklarning
+  // ALOHIDA chati va ovozli kanali aynan yozib olinadi.
+  {
+    // Shikoyatchi — hali hech kimga shikoyat qilmagan o'yinchi (socks[4]),
+    // aks holda javob `reportDup` bo'lib, tekshiruv ma'nosini yo'qotadi.
+    const s = socks[4];
+    const juft = [...oldi.entries()].find(([nom]) => nom !== users[4].username);
+    ok(!!juft, "o'yinda kamida bitta o'yinchi o'ldi", "o'lganlar: " + JSON.stringify([...oldi.keys()]));
+    if (juft) {
+      s.evts.delete('report_result');
+      s.emit('report_player', { gameId, targetSocketId: juft[1], type: 'voice_abuse', reason: 'o\'liklar chatida so\'kindi' });
+      const r = await s.waitFor('report_result', 9000).catch(() => null);
+      ok(r?.ok === true, 'O\'LGAN o\'yinchiga shikoyat qabul qilindi', JSON.stringify(r) + ' (nishon: ' + juft[0] + ')');
+    }
+  }
 
   log('\n=== 5. Admin dalilida bo\'laklar BITTA o\'yinchiga bog\'lanadi ===');
   const ev = await http(`/api/admin/evidence/${gameId}`, { token: admin.token, headers: { 'X-Admin-Key': ADMIN_KEY } });

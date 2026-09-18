@@ -169,6 +169,15 @@ async function main() {
     log(`  ${i}-urinish: rol ${rol.role}`);
     const keldi = await kutFaza(sm, 'night_mafia', 120000);
     if (!keldi) { log('  night_mafia kelmadi'); sm.disconnect(); continue; }
+    // Sinov sharti: odam ham, bot sherigi ham TIRIK bo'lishi kerak. Jim turgan
+    // odamni botlar 1-kundayoq chiqarib yuborishi mumkin — shunda kanalni
+    // o'qiydigan odam yo'q va hech narsa bo'lmasligi TO'G'RI xatti-harakat.
+    const holat = sm.last('game_state') || {};
+    const menTirik = (holat.players || []).some((p) => p.username === m.username && p.isAlive !== false);
+    const mates = (sm.last('mafia_team')?.mates || []).filter((x) => x.username !== m.username);
+    const sherikTirik = mates.some((x) => (holat.players || []).some((p) => p.username === x.username && p.isAlive !== false));
+    log(`  tirikman=${menTirik} sherik=${mates.map((x) => x.username).join(',') || '-'} sherikTirik=${sherikTirik}`);
+    if (!menTirik || !sherikTirik) { log('  shart qurilmadi (kimdir 1-kunda chiqarilgan) — keyingi urinish'); sm.disconnect(); continue; }
     const nAt = Date.now();
     // Odam HECH NARSA qilmaydi (AFK). Sherik gapirishi va 60% da tanlashi kerak.
     // Birinchi gap 2.5-6 s kechikish + 3-5 s "yozish" — 11 s gacha cho'zilishi mumkin.
